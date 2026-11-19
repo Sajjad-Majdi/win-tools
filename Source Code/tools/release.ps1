@@ -48,6 +48,9 @@ foreach ($a in $apps) {
     $sig = Get-AuthenticodeSignature $ev
     if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notlike "CN=voidtools*") { throw "Everything setup signature is not voidtools: $($sig.Status)" }
     $extra += "/DEVERYTHING=$ev"
+    # the Win+E helper (Windows 11 no longer reads the registry for Win+E)
+    Copy-Item (Join-Path $bin "RustFileExplorerWinE.exe") $stage
+    $extra += "/DHELPER=RustFileExplorerWinE.exe"
   }
   & $nsis /V2 "/DVERSION=$Version" "/DSTAGE=$stage" "/DOUTFILE=$setup" "/DAPPID=$($a.Id)" "/DAPPNAME=$($a.Name)" `
       "/DEXE=$($a.Exe)" "/DCLI=$($a.Cli)" "/DOLDEXE=$($a.OldExe)" "/DOLDNAME=$($a.OldName)" "/DICON=$(Join-Path $src ('installer\' + $a.Icon))" @extra (Join-Path $src "installer\wintools.nsi")

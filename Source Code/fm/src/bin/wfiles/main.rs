@@ -8,6 +8,7 @@
 //! A crash writes %TEMP%\wfiles-crash.log (there is no console to print to).
 mod ai;
 mod app;
+mod ask;
 mod dnd;
 mod ficons;
 mod fmt;
@@ -22,27 +23,9 @@ mod outproc;
 mod models;
 mod paint;
 mod preview;
+mod rank;
 mod sicons;
 mod theme;
-
-/// Plain HTTP GET to a local server (semsearch on 127.0.0.1), short timeout.
-pub fn ai_http_get(url: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    let rest = url.strip_prefix("http://").ok_or("http only")?;
-    let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap_or((rest, "/".into()));
-    let addr: std::net::SocketAddr = host.parse().map_err(|_| "bad host".to_string())?;
-    let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).map_err(|e| e.to_string())?;
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(60)));
-    write!(s, "GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").map_err(|e| e.to_string())?;
-    let mut buf = vec![];
-    s.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").ok_or("bad reply")?;
-    if !head.starts_with("HTTP/1.") || !head.split_whitespace().nth(1).map(|c| c == "200").unwrap_or(false) {
-        return Err("HTTP error".into());
-    }
-    Ok(body.to_string())
-}
 
 fn main() {
     std::panic::set_hook(Box::new(|info| {

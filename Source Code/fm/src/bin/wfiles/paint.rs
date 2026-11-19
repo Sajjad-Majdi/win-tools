@@ -319,7 +319,7 @@ impl App {
             self.anim();
         }
         // caret blink only while a text field has focus
-        let field = self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.accent_field.is_some();
+        let field = self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some();
         if field && !self.caret_timer {
             self.caret_timer = true;
             self.timer(T_CARET, 530);
@@ -704,14 +704,17 @@ impl App {
             let focus = self.search_focus;
             self.field_text(&f, Rect::new(o.x + 37.0, o.y, o.w - 37.0 - 36.0, o.h), 13.0, focus, t, &[]);
             if f.text.is_empty() {
-                self.gfx.text("Search", Rect::new(o.x + 38.0, o.y, 200.0, o.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
+                // with AI on, say that plain words work too
+                let hint = if self.ai_on { "Search, or describe what you need in your own words (Shift+Enter)" } else { "Search" };
+                self.gfx.text(hint, Rect::new(o.x + 38.0, o.y, o.w - 80.0, o.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
             }
             let cr = Rect::new(o.r() - 32.0, o.y + 4.0, 26.0, 26.0);
             self.icon_btn(cr, 0xE711, 10.0, t.text2, Hit::OmniClear, R_SMALL, t);
         } else {
             // Settings has nothing to search: no Search button there
             let settings = self.pane().loc == Loc::Settings;
-            let sw = if settings { 4.0 } else if narrow || o.w < 300.0 { 34.0 } else { 86.0 };
+            // the full "Search" button stays until the address box is really short (only the icon then)
+            let sw = if settings { 4.0 } else if o.w < 230.0 { 34.0 } else { 86.0 };
             let sr = Rect::new(o.r() - sw, o.y + 4.0, sw - 4.0, 26.0);
             if !settings {
                 self.gfx.fill_round(sr, R_SMALL, t.hover.a(t.hover.3 * self.hk(Hit::OmniSearch)));
@@ -1101,21 +1104,26 @@ impl App {
     fn paint_strip(&mut self, s: Rect, p: usize, t: &Theme) {
         let pane = &self.tabs[self.cur].panes[p];
         let Some(se) = pane.search.as_ref() else { return };
-        let (pc, ft, fs, fd, total, busy, meaning) = (se.pc, se.ftype, se.fsize, se.fdate, se.total, se.busy, se.meaning);
+        let (pc, ft, fs, fd, total, busy) = (se.pc, se.ftype, se.fsize, se.fdate, se.total, se.busy);
         let note = se.note.clone();
+        let ai = se.ai.clone();
         let here = pane.loc.title();
+        let only_pc = pane.loc == Loc::ThisPc || pane.dir().is_none();
         let searching = pane.searching();
         self.gfx.fill(Rect::new(s.x, s.b() - 1.0, s.w, 1.0), t.divider);
-        // scope segmented control
-        let w1 = self.gfx.measure(&here, Font::Ui, 13.0, 400).min(160.0) + 28.0;
+        // scope segmented control (one chip when the place IS This PC)
+        let w1 = if only_pc { 0.0 } else { self.gfx.measure(&here, Font::Ui, 13.0, 400).min(160.0) + 28.0 };
         let w2 = self.gfx.measure("This PC", Font::Ui, 13.0, 600) + 28.0;
-        let seg = Rect::new(s.x + 16.0, s.y + 8.0, w1 + w2 + 6.0, 32.0);
+        let seg = Rect::new(s.x + 16.0, s.y + 8.0, w1 + w2 + if only_pc { 4.0 } else { 6.0 }, 32.0);
         self.gfx.fill_round(seg, R_CTRL, t.layer2);
         self.gfx.stroke_round(seg, R_CTRL, t.stroke, 1.0);
         for (i, (label, w)) in [(here.as_str(), w1), ("This PC", w2)].iter().enumerate() {
-            let x = seg.x + 2.0 + if i == 0 { 0.0 } else { w1 + 2.0 };
+            if only_pc && i == 0 {
+                continue;
+            }
+            let x = seg.x + 2.0 + if i == 0 || only_pc { 0.0 } else { w1 + 2.0 };
             let r = Rect::new(x, seg.y + 2.0, *w, 28.0);
-            let on = (i == 1) == pc;
+            let on = only_pc || (i == 1) == pc;
             if on {
                 self.gfx.fill_round(r, R_SMALL, t.card);
                 self.gfx.stroke_round(r, R_SMALL, t.stroke, 1.0);
@@ -1144,32 +1152,41 @@ impl App {
             self.hit(r, Hit::Filter(i as u8));
             x = r.r() + 8.0;
         }
+        // system & temp places: Settings > Search only (the hint row in the results still shows them for one search)
         let count = if !searching {
             String::new()
+        } else if busy && !note.is_empty() {
+            // "Asking AI..."
+            note
         } else if busy && total == 0 {
             "Searching...".into()
         } else if !note.is_empty() {
             note
+        } else if total == 0 && ai.is_none() && self.ai_on {
+            // nothing by name: point at the plain-words search
+            "No results  \u{00b7}  try AI Search (Shift+Enter)".into()
+        } else if let Some(a) = &ai {
+            // what the AI looked for, then the count
+            // the count first: a Persian note at the end keeps its own direction
+            format!("{} result{}  \u{00b7}  AI: {a}", fmt::thousands(total as u64), if total == 1 { "" } else { "s" })
         } else {
             format!("{} result{}", fmt::thousands(total as u64), if total == 1 { "" } else { "s" })
         };
         let mut right = s.r() - 16.0;
-        if self.meaning_on {
-            let mw = 14.0 + 13.0 + 8.0 + self.gfx.measure("By meaning", Font::Ui, 13.0, 400) + 12.0;
-            let r = Rect::new(right - mw, s.y + 8.0, mw, 32.0);
-            if meaning {
-                self.gfx.fill_round(r, R_CTRL, t.sel);
-                self.gfx.stroke_round(r, R_CTRL, t.sel_stroke, 1.0);
-            } else {
-                self.gfx.fill_round(r, R_CTRL, t.card);
-                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
-            }
-            if self.hov(Hit::Meaning) {
+        // AI Search: plain words become up to three searches (only with AI features on)
+        if self.ai_on {
+            let label = "AI Search";
+            let aw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 12.0;
+            let r = Rect::new(right - aw, s.y + 8.0, aw, 32.0);
+            let on = ai.is_some();
+            self.gfx.fill_round(r, R_CTRL, if on { t.sel } else { t.card });
+            self.gfx.stroke_round(r, R_CTRL, if on { t.sel_stroke } else { t.stroke }, 1.0);
+            if self.hov(Hit::Ask) {
                 self.gfx.fill_round(r, R_CTRL, t.hover);
             }
             self.gfx.glyph(0xF4A5, Rect::new(r.x + 13.0, r.y, 14.0, r.h), 13.0, t.accent_text);
-            self.gfx.text("By meaning", Rect::new(r.x + 35.0, r.y, mw - 40.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
-            self.hit(r, Hit::Meaning);
+            self.gfx.text(label, Rect::new(r.x + 35.0, r.y, aw - 40.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
+            self.hit(r, Hit::Ask);
             right = r.x - 8.0;
         }
         self.gfx.text(&count, Rect::new(x + 6.0, s.y, (right - x - 6.0).max(0.0), s.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
@@ -1313,7 +1330,7 @@ impl App {
                     ""
                 } else if s.map(|s| s.ftype + s.fsize + s.fdate > 0).unwrap_or(false) {
                     "Try fewer filters"
-                } else if !s.map(|s| s.pc).unwrap_or(true) {
+                } else if !s.map(|s| s.pc).unwrap_or(true) && self.tabs[cur].panes[p].loc != Loc::ThisPc {
                     "Try This PC to search everywhere"
                 } else {
                     "Check the spelling or try fewer words"
@@ -1325,6 +1342,19 @@ impl App {
             };
             if !hint.is_empty() {
                 self.gfx.text(hint, Rect::new(list.x, list.y + 64.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text3.a(0.8));
+            }
+            // nothing by name: describe it in your own words with AI Search (or turn AI on first)
+            let no_hits = pane_searching && self.tabs[cur].panes[p].search.as_ref().map(|s| !s.busy && s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false);
+            if no_hits && error.is_none() && !loading {
+                let (line, label) = if self.ai_on {
+                    ("Or describe what you need in your own words, in any language", "AI Search")
+                } else {
+                    ("Turn on AI features to search in your own words, in any language", "Turn on AI Search")
+                };
+                self.gfx.text(line, Rect::new(list.x, list.y + 96.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text2);
+                let bw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 14.0;
+                let br = Rect::new(list.x + (list.w - bw) / 2.0, list.y + 124.0, bw, 32.0);
+                self.button(br, label, 0xF4A5, Btn::Accent, if self.ai_on { Hit::Ask } else { Hit::AiOffer }, t);
             }
         }
         let menu_rows: Vec<std::path::PathBuf> = self.menu.as_ref().map(|m| m.paths.clone()).unwrap_or_default();
@@ -1729,6 +1759,127 @@ impl App {
         }
     }
 
+    /// Settings > Search: the rules for This PC searches (system & temp, kinds, only-in and never-in folders).
+    /// Returns the y below the card.
+    fn paint_search_rules(&mut self, x: f32, y: f32, w: f32, t: &Theme) -> f32 {
+        let sp = self.sp.clone();
+        // the kind chips wrap inside the card
+        let (cx0, cmax) = (x + 46.0, x + w - 16.0);
+        let mut chips = vec![];
+        let (mut cx, mut cy) = (cx0, 0.0f32);
+        for (i, name) in crate::model::KINDS.iter().enumerate() {
+            let cw = self.gfx.measure(name, Font::Ui, 12.0, 400) + 40.0;
+            if cx + cw > cmax && cx > cx0 {
+                cx = cx0;
+                cy += 36.0;
+            }
+            chips.push((i, *name, cx, cy, cw));
+            cx += cw + 6.0;
+        }
+        let chips_h = cy + 30.0 + 12.0;
+        // the folder tree: drives, then the folders opened below them
+        let mut rows: Vec<(std::path::PathBuf, usize)> = vec![];
+        fn walk(a: &App, p: &std::path::PathBuf, depth: usize, rows: &mut Vec<(std::path::PathBuf, usize)>) {
+            rows.push((p.clone(), depth));
+            if a.place_open.contains(p)
+                && let Some(kids) = a.place_kids.get(p)
+            {
+                for k in kids {
+                    walk(a, k, depth + 1, rows);
+                }
+            }
+        }
+        let roots: Vec<std::path::PathBuf> = self.drives.iter().filter(|d| d.ready && d.kind != "cdrom").map(|d| std::path::PathBuf::from(&d.root)).collect();
+        for r in &roots {
+            walk(self, r, 0, &mut rows);
+        }
+        let tree_h = 30.0 + 22.0 + 32.0 * rows.len() as f32 + 10.0;
+        let h = 30.0 + 30.0 + chips_h + tree_h + 52.0 + 4.0;
+        let r = Rect::new(x, y, w, h);
+        self.set_card(r, t);
+        self.gfx.text("Search", Rect::new(r.x + 16.0, r.y + 12.0, 120.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
+        self.gfx.text("For searches of This PC", Rect::new(r.x + 80.0, r.y + 12.0, r.w - 96.0, 20.0), Font::Ui, 12.0, 400, Align::Right, t.text3);
+        let mut ry = r.y + 30.0;
+        let sub = |a: &mut App, ry: &mut f32, title: &str| {
+            // the first section sits right under the card title: no line there
+            if *ry > r.y + 31.0 {
+                a.gfx.fill(Rect::new(r.x, *ry, r.w, 1.0), t.divider);
+            }
+            a.gfx.text(title, Rect::new(r.x + 46.0, *ry + 8.0, r.w - 62.0, 20.0), Font::Ui, 12.0, 600, Align::Left, t.text3);
+            *ry += 30.0;
+        };
+        sub(self, &mut ry, "Kinds of results");
+        for (i, name, cx, cy, cw) in chips {
+            let cr = Rect::new(cx, ry + cy, cw, 30.0);
+            let h = Hit::Set(101 + i as u8);
+            let on = sp.kind_on(i);
+            let hk = self.hk(h);
+            if on {
+                self.gfx.fill_round(cr, R_CTRL, t.sel);
+                self.gfx.glyph(0xE73E, Rect::new(cr.x + 10.0, cr.y, 14.0, cr.h), 11.0, t.accent_text);
+            } else {
+                self.gfx.fill_round(cr, R_CTRL, t.layer2.a(0.4 + 0.4 * hk));
+            }
+            self.gfx.stroke_round(cr, R_CTRL, if on { t.accent_text.a(0.35) } else { t.stroke }, 1.0);
+            self.gfx.text(name, Rect::new(cr.x + 28.0, cr.y, cw - 32.0, cr.h), Font::Ui, 12.0, 400, Align::Left, if on { t.text } else { t.text2 });
+            self.hit(cr, h);
+        }
+        ry += chips_h;
+        // places: tick the drives and folders to search (like Windows' Indexing Options)
+        sub(self, &mut ry, "Places to search");
+        self.gfx.text("Ticked folders are searched. Open a drive to pick single folders.", Rect::new(r.x + 46.0, ry - 6.0, r.w - 62.0, 18.0), Font::Ui, 12.0, 400, Align::Left, t.text3);
+        ry += 22.0;
+        self.place_rows = rows.iter().map(|r| r.0.clone()).collect();
+        for (i, (p, depth)) in rows.iter().enumerate() {
+            let rx0 = r.x + 16.0 + 20.0 * *depth as f32;
+            let row = Rect::new(r.x + 8.0, ry, r.w - 16.0, 32.0);
+            let open = self.place_open.contains(p);
+            let has_kids = self.place_kids.get(p).map(|k| !k.is_empty()).unwrap_or(true);
+            if has_kids {
+                let er = Rect::new(rx0, ry + 4.0, 24.0, 24.0);
+                let hk = self.hk(Hit::PlaceExp(i));
+                if hk > 0.0 {
+                    self.gfx.fill_round(er, R_SMALL, t.hover.a(t.hover.3 * hk));
+                }
+                self.gfx.glyph(if open { 0xE70D } else { 0xE76C }, er, 9.0, t.text2);
+                self.hit(er, Hit::PlaceExp(i));
+            }
+            // tick box: ticked, part ticked (a folder below differs) or empty
+            let cb = Rect::new(rx0 + 28.0, ry + 8.0, 16.0, 16.0);
+            let (on, mixed) = (sp.searched(p), sp.mixed(p));
+            let hk = self.hk(Hit::PlaceChk(i));
+            if on && !mixed {
+                self.gfx.fill_round(cb, 4.0, t.accent);
+                self.gfx.glyph(0xE73E, cb, 10.0, t.on_accent);
+            } else {
+                self.gfx.fill_round(cb, 4.0, t.field.a(0.6 + 0.4 * hk));
+                self.gfx.stroke_round(cb, 4.0, if hk > 0.0 { t.text2 } else { t.field_border }, 1.0);
+                if mixed {
+                    self.gfx.fill_round(Rect::new(cb.x + 4.0, cb.y + 4.0, 8.0, 8.0), 2.0, t.accent);
+                }
+            }
+            let name = match p.file_name() {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => {
+                    let root = p.to_string_lossy().trim_end_matches('\\').to_string();
+                    let label = self.drives.iter().find(|d| d.root.trim_end_matches('\\').eq_ignore_ascii_case(&root)).map(|d| d.label.clone()).unwrap_or_default();
+                    if label.is_empty() { format!("Local Disk ({root})") } else { format!("{label} ({root})") }
+                }
+            };
+            self.gfx.glyph(if *depth == 0 { 0xEDA2 } else { 0xE8B7 }, Rect::new(cb.r() + 10.0, ry, 16.0, 32.0), 14.0, t.text2);
+            let tx = cb.r() + 34.0;
+            self.gfx.text(&name, Rect::new(tx, ry, row.r() - tx - 8.0, 32.0), Font::Ui, 13.0, 400, Align::Left, if on || mixed { t.text } else { t.text3 });
+            // the name ticks too
+            self.hit(Rect::new(cb.x - 4.0, ry, row.r() - cb.x + 4.0, 32.0), Hit::PlaceChk(i));
+            ry += 32.0;
+        }
+        // rarely wanted, so it sits last
+        ry += 10.0;
+        self.set_row(r.x, ry, r.w, 52.0, 0xE770, "Show system and temp files", "Windows, Program Files, AppData, temp, caches", false, t);
+        self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, 52.0), sp.junk, Hit::Set(100), t);
+        r.b() + 12.0
+    }
+
     fn paint_settings(&mut self, t: &Theme) {
         let c = content_rect(self);
         self.hit(c, Hit::ListBg(0));
@@ -1751,7 +1902,7 @@ impl App {
         let sub = if all {
             "Rust File Explorer opens folders, This PC and Win+E"
         } else if any {
-            "Partly set: press Set again to add the rest (This PC)"
+            "Partly set: press Set again to add the rest (Win+E)"
         } else {
             "Windows Explorer opens folders and Win+E now"
         };
@@ -1903,39 +2054,22 @@ impl App {
         let start_label = self.start_options().into_iter().find(|o| o.1 == lk.start).map(|o| o.0).unwrap_or_else(|| "This PC".into());
         dd(self, ry, 0xE80F, "Start page", &start_label, 33, false);
         y = r.b() + 12.0;
-        // Files and folders
-        let rows: [(u32, &str, &str, bool, u8); 4] = [
-            (0xE8B7, "Show folder sizes", "", self.ui.sizes, 4),
-            (0xE8AC, "Show file extensions", "", self.ui.ext, 5),
-            (0xE7B3, "Show hidden files", "", self.ui.hidden, 6),
-            (0xE74D, "Ask before delete", "Delete goes to the Recycle Bin and can be undone", self.ui.ask_delete, 7),
-        ];
-        let r = Rect::new(lx, y, colw, 38.0 + 3.0 * 48.0 + 52.0 + 4.0);
-        self.set_card(r, t);
-        self.gfx.text("Files and folders", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
-        let mut ry = r.y + 38.0;
-        for (i, (g, title, sub, on, id)) in rows.iter().enumerate() {
-            let h = if sub.is_empty() { 48.0 } else { 52.0 };
-            self.set_row(r.x, ry, r.w, h, *g, title, sub, i == 0, t);
-            self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, h), *on, Hit::Set(*id), t);
-            ry += h;
-        }
         // right column: search and AI (below the left one on a narrow window)
-        let left_end = r.b() + 12.0;
+        let left_end = y;
         let mut y = if one { left_end } else { c.y + 16.0 - scroll };
         let ev = match self.set.ev_running {
             None => "Checking...".to_string(),
             Some(true) => format!("Running · {} items", fmt::thousands(self.set.ev_total as u64)),
             Some(false) => "Not running (search walks the folder instead)".into(),
         };
-        let sem = crate::models::semsearch_detect();
-        let sem_on = crate::models::switch_on(crate::models::Section::Semsearch) && sem.is_some();
-        let ai_switch = crate::ai::switch_on() && crate::ai::has_key();
+        let ai_switch = crate::ai::switch_on();
         let has_key = crate::ai::has_key();
-        let lang = crate::ai::lang();
+
         let note_h = self.gfx.para_height(crate::ai::SENT_NOTE, colw - 46.0 - 72.0, Font::Ui, 12.0, 16.0, false);
         let ai_h = 30.0 + note_h + 12.0;
-        let rows_h = 38.0 + 52.0 * 2.0 + ai_h + 96.0 + 52.0 + 4.0;
+        // the key and relay rows show only once AI Search is switched on (they are what it needs)
+        let ai_rows = crate::ai::switch_on();
+        let rows_h = 38.0 + 52.0 + ai_h + if ai_rows { 96.0 + 122.0 } else { 0.0 } + 4.0;
         let r = Rect::new(rx, y, colw, rows_h);
         self.set_card(r, t);
         self.gfx.text("Search and AI", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
@@ -1947,27 +2081,18 @@ impl App {
         self.gfx.ellipse(r.x + 50.0, ry + 35.0, 4.0, dot_c, true, 1.0);
         self.gfx.text(&ev, Rect::new(r.x + 60.0, ry + 27.0, r.w - 80.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
         ry += 52.0;
-        // meaning search: its own switch; uses the semsearch already installed on this PC
-        let sem_sub = match &sem {
-            Some(p) => format!("Already installed · {}", p.parent().map(|d| d.display().to_string()).unwrap_or_default()),
-            None => "Not installed on this PC".to_string(),
-        };
-        self.set_row(r.x, ry, r.w, 52.0, 0xF4A5, "Search by meaning", &sem_sub, false, t);
-        if sem.is_some() {
-            self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, 52.0), sem_on, Hit::Set(8), t);
-        }
-        ry += 52.0;
-        // AI features: switch + exactly what is sent
+        // AI Search: switch + what it does and exactly what is sent
         self.gfx.fill(Rect::new(r.x, ry, r.w, 1.0), t.divider);
         self.gfx.glyph(0xF4A5, Rect::new(r.x + 16.0, ry + 8.0, 18.0, 20.0), 16.0, t.text2);
-        self.gfx.text("AI features", Rect::new(r.x + 46.0, ry + 8.0, r.w - 120.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+        self.gfx.text("AI Search", Rect::new(r.x + 46.0, ry + 8.0, r.w - 120.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
         self.gfx.para(crate::ai::SENT_NOTE, Rect::new(r.x + 46.0, ry + 30.0, r.w - 46.0 - 72.0, note_h + 2.0), Font::Ui, 12.0, 400, Align::Left, t.text2, 16.0, false, 0);
         self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry + 4.0, 40.0, 28.0), ai_switch, Hit::Set(9), t);
         ry += ai_h;
+        if ai_rows {
         // API key (masked) + Save + Test key + link
         self.gfx.fill(Rect::new(r.x, ry, r.w, 1.0), t.divider);
         self.gfx.glyph(0xE8D7, Rect::new(r.x + 16.0, ry + 8.0, 18.0, 20.0), 16.0, t.text2);
-        self.gfx.text("API key", Rect::new(r.x + 46.0, ry + 8.0, 120.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+        self.gfx.text("Gemini API key", Rect::new(r.x + 46.0, ry + 8.0, 200.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
         let lw = self.gfx.measure("Get a free key", Font::Ui, 12.0, 400);
         let lr = Rect::new(r.r() - 16.0 - lw - 18.0, ry + 8.0, lw + 18.0, 20.0);
         self.gfx.text("Get a free key", Rect::new(lr.x, lr.y, lw + 2.0, lr.h), Font::Ui, 12.0, 400, Align::Left, if self.hov(Hit::Set(14)) { t.accent2 } else { t.accent_text });
@@ -1985,71 +2110,67 @@ impl App {
         mf.anchor = mf.caret;
         self.field_text(&mf, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
         if masked.is_empty() && !focus {
-            self.gfx.text("Paste your key", Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
+            self.gfx.text("Paste your Gemini API key", Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
         }
         self.hit(fr, Hit::Set(15));
         let can_save = !self.key_field.text.trim().is_empty();
         self.button(Rect::new(fr.r() + 8.0, fy, sw_, 32.0), "Save", 0, if can_save { Btn::Accent } else { Btn::Disabled }, Hit::Set(16), t);
         self.button(Rect::new(fr.r() + 8.0 + sw_ + 8.0, fy, tw_, 32.0), "Test key", 0, if has_key || can_save { Btn::Std } else { Btn::Disabled }, Hit::Set(17), t);
-        let status = self.set.msg.clone().unwrap_or_else(|| if has_key { "Key saved (encrypted for this Windows user)".into() } else { "No key saved".into() });
+        let status = self.set.msg.clone().unwrap_or_else(|| if crate::ai::key_from_env() { "Using the key from GEMINI_API_KEY (environment)".into() } else if has_key { "Key saved (encrypted for this Windows user)".into() } else { "No key saved".into() });
         let sc = if self.set.msg_ok { t.ok } else if self.set.msg.is_some() { t.warn } else { t.text3 };
         self.gfx.text(&status, Rect::new(r.x + 46.0, fy + 36.0, r.w - 62.0, 18.0), Font::Ui, 12.0, 400, Align::Left, sc);
         ry += 96.0;
-        self.set_row(r.x, ry, r.w, 52.0, 0xF2B7, "AI answer language", "", false, t);
-        let (lab, font) = if lang == "fa" { ("فارسی", Font::Fa) } else { ("English", Font::Ui) };
-        self.dropdown(Rect::new(r.r() - 16.0 - 120.0, ry + 10.0, 120.0, 32.0), lab, Hit::Set(11), t, font);
-        y = r.b() + 12.0;
-        // Default apps: Rust File Explorer's own "always open .ext with" choices (Windows' defaults are untouched)
-        let defs: Vec<(String, String)> = self.own_defaults.iter().map(|(k, v)| (k.clone(), v.0.clone())).take(20).collect();
-        let rows_n = defs.len().max(1) as f32;
-        let r = Rect::new(rx, y, colw, 38.0 + 40.0 * rows_n + 6.0);
-        self.set_card(r, t);
-        self.gfx.text("Default apps", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
-        let mut ry = r.y + 38.0;
-        if defs.is_empty() {
-            self.gfx.text("None set", Rect::new(r.x + 46.0, ry, r.w - 62.0, 40.0), Font::Ui, 13.0, 400, Align::Left, t.text3);
+        // relay (optional): where Google is blocked, the address of a relay that keeps Google's paths, the header
+        // that carries its secret, and the secret (masked)
+        self.gfx.fill(Rect::new(r.x, ry, r.w, 1.0), t.divider);
+        self.gfx.glyph(0xE774, Rect::new(r.x + 16.0, ry + 8.0, 18.0, 20.0), 16.0, t.text2);
+        self.gfx.text("Relay (optional)", Rect::new(r.x + 46.0, ry + 8.0, 160.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+        self.gfx.text("Where Google is blocked", Rect::new(r.x + 200.0, ry + 8.0, r.w - 216.0, 20.0), Font::Ui, 12.0, 400, Align::Right, t.text3);
+        let (_, _, has_secret) = crate::ai::relay_saved();
+        let fx = r.x + 46.0;
+        let fw = r.w - 46.0 - 16.0;
+        let rf = self.relay_fields.clone();
+        let rfocus = self.relay_focus;
+        let field = |a: &mut App, fr: Rect, i: usize, shown: &crate::fmt::Field, hint: &str| {
+            let focus = rfocus == i as u8 + 1;
+            a.field_box(fr, focus, t);
+            a.field_text(shown, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
+            if shown.text.is_empty() && !focus {
+                a.gfx.text(hint, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
+            }
+            a.hit(fr, Hit::Set(90 + i as u8));
+        };
+        field(self, Rect::new(fx, ry + 34.0, fw, 32.0), 0, &rf[0], "https://your-relay.example.com");
+        let sw2 = self.gfx.measure("Save", Font::Ui, 13.0, 400) + 26.0;
+        let hw = 140.0f32.min(fw * 0.35);
+        field(self, Rect::new(fx, ry + 74.0, hw, 32.0), 1, &rf[1], "x-relay-secret");
+        let masked: String = if rf[2].text.is_empty() && rfocus != 3 && has_secret { "\u{2022}".repeat(16) } else { "\u{2022}".repeat(rf[2].text.chars().count()) };
+        let mut mf = crate::fmt::Field::new(&masked);
+        mf.caret = masked.chars().count();
+        mf.anchor = mf.caret;
+        let sx = fx + hw + 8.0;
+        field(self, Rect::new(sx, ry + 74.0, fw - hw - 8.0 - sw2 - 8.0, 32.0), 2, &mf, "Secret");
+        self.button(Rect::new(fx + fw - sw2, ry + 74.0, sw2, 32.0), "Save", 0, Btn::Std, Hit::Set(93), t);
+        let _ = ry + 122.0;
         }
-        for (i, (ext, app)) in defs.iter().enumerate() {
-            self.gfx.fill(Rect::new(r.x, ry, r.w, 1.0), t.divider);
-            self.gfx.glyph(0xE7AC, Rect::new(r.x + 16.0, ry, 18.0, 40.0), 16.0, t.text2);
-            self.gfx.text(ext, Rect::new(r.x + 46.0, ry, 90.0, 40.0), Font::Ui, 13.0, 600, Align::Left, t.text);
-            self.gfx.text(app, Rect::new(r.x + 140.0, ry, r.w - 140.0 - 52.0, 40.0), Font::Ui, 13.0, 400, Align::Left, t.text2);
-            self.icon_btn(Rect::new(r.r() - 16.0 - 32.0, ry + 4.0, 32.0, 32.0), 0xE711, 11.0, t.text2, Hit::Set(60 + i as u8), R_CTRL, t);
-            ry += 40.0;
-        }
         y = r.b() + 12.0;
-        // command line for agents
-        // only commands wfm really has (checked against `wfm help`)
-        let cli: [(&str, &str, &str); 10] = [
-            ("wfm open", " <path>", "Open a file or folder"),
-            ("wfm ls", " <path> --json", "List a folder"),
-            ("wfm search", " <words>", "Search with Everything"),
-            ("wfm copy", " <src…> <dest>", "Copy (undo: wfm undo)"),
-            ("wfm move", " <src…> <dest>", "Move (undo: wfm undo)"),
-            ("wfm rename", " <path> <name>", "Rename one item"),
-            ("wfm delete", " <path…>", "Move to the Recycle Bin"),
-            ("wfm undo", "", "Undo the last change"),
-            ("wfm info", " <path>", "Size, dates, version, target"),
-            ("wfm dialog save", " --path <p>", "Fill an open Save As dialog"),
+        y = self.paint_search_rules(rx, y, colw, t);
+        // Files and folders (right column, below Search)
+        let rows: [(u32, &str, &str, bool, u8); 4] = [
+            (0xE8B7, "Show folder sizes", "", self.ui.sizes, 4),
+            (0xE8AC, "Show file extensions", "", self.ui.ext, 5),
+            (0xE7B3, "Show hidden files", "", self.ui.hidden, 6),
+            (0xE74D, "Ask before delete", "Delete goes to the Recycle Bin and can be undone", self.ui.ask_delete, 7),
         ];
-        let r = Rect::new(rx, y, colw, 44.0 + 12.0 + 25.0 * cli.len() as f32 + 12.0);
+        let r = Rect::new(rx, y, colw, 38.0 + 3.0 * 48.0 + 52.0 + 4.0);
         self.set_card(r, t);
-        self.gfx.text("Command line for agents", Rect::new(r.x + 16.0, r.y + 12.0, 240.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
-        let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join("wfm.exe").is_file())).unwrap_or(false);
-        let st = if on_path { "wfm is on PATH" } else { "wfm.exe is next to RustFileExplorer.exe" };
-        let sw = self.gfx.measure(st, Font::Ui, 12.0, 400);
-        self.gfx.ellipse(r.r() - 16.0 - sw - 10.0, r.y + 22.0, 4.0, if on_path { t.ok } else { t.text3 }, true, 1.0);
-        self.gfx.text(st, Rect::new(r.r() - 16.0 - sw - 1.0, r.y + 12.0, sw + 2.0, 20.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
-        let box_ = Rect::new(r.x + 12.0, r.y + 44.0, r.w - 24.0, 12.0 + 25.0 * cli.len() as f32);
-        self.gfx.fill_round(box_, R_CTRL, t.code_bg);
-        self.gfx.stroke_round(box_, R_CTRL, t.stroke, 1.0);
-        let mut cy = box_.y + 6.0;
-        for (cmd, args, what) in cli {
-            let cwid = self.gfx.measure(cmd, Font::Mono, 12.0, 600);
-            self.gfx.text(cmd, Rect::new(box_.x + 12.0, cy, cwid + 2.0, 25.0), Font::Mono, 12.0, 600, Align::Left, t.text);
-            self.gfx.text(args, Rect::new(box_.x + 12.0 + cwid, cy, 186.0 - cwid, 25.0), Font::Mono, 12.0, 400, Align::Left, t.text3);
-            self.gfx.text(what, Rect::new(box_.x + 12.0 + 196.0, cy, box_.w - 220.0, 25.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
-            cy += 25.0;
+        self.gfx.text("Files and folders", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
+        let mut ry = r.y + 38.0;
+        for (i, (g, title, sub, on, id)) in rows.iter().enumerate() {
+            let h = if sub.is_empty() { 48.0 } else { 52.0 };
+            self.set_row(r.x, ry, r.w, h, *g, title, sub, i == 0, t);
+            self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, h), *on, Hit::Set(*id), t);
+            ry += h;
         }
         // the longer column decides how far Settings scrolls
         self.settings_h = r.b().max(left_end - 12.0) + 16.0 + scroll - c.y;
@@ -2624,7 +2745,8 @@ impl App {
         self.gfx.text(&format!("Rename {n} item{}", if n == 1 { "" } else { "s" }), Rect::new(r.x + 24.0, r.y + 20.0, 300.0, 44.0), Font::Display, 20.0, 600, Align::Left, t.text);
         // mode segmented + suggest names
         let mut x = r.r() - 24.0;
-        if self.ai_on {
+        // AI is only for AI Search now (Sajjad, 2026-11-20): no "Suggest names" here
+        if false {
             let sw = 12.0 + 14.0 + 8.0 + self.gfx.measure("Suggest names", Font::Ui, 13.0, 400) + 12.0;
             x -= sw;
             let br = Rect::new(x, r.y + 22.0, sw, 32.0);

@@ -334,11 +334,16 @@ impl App {
         let hw = self.gfx.text_at("Command line", rx, ry, 28.0, 300.0, Font::Display, 20.0, 600, t.t1);
         self.gfx.text_at("wtm.exe", rx + hw + 10.0, ry + 2.0, 28.0, 100.0, Font::Ui, 13.0, 400, t.t2);
         ry += 28.0 + 12.0;
-        let card = Rect::new(rx, ry, rw2, 34.0 * CLI.len() as f32);
+        // the command column is as wide as the widest command; when the description does not fit beside it,
+        // each row puts the description under its command (no "..." at any width)
+        let cmd_need = CLI.iter().map(|(c, _, n)| self.gfx.measure(c, Font::Mono, 12.0, 400) + if *n { 36.0 } else { 0.0 }).fold(0.0f32, f32::max).ceil();
+        let desc_need = CLI.iter().map(|(_, d, _)| self.gfx.measure(d, Font::Ui, 12.5, 400)).fold(0.0f32, f32::max).ceil();
+        let side = 15.0 + cmd_need + 16.0 + desc_need + 44.0 <= rw2;
+        let row_h = if side { 34.0 } else { 52.0 };
+        let card = Rect::new(rx, ry, rw2, row_h * CLI.len() as f32);
         self.gfx.card(card, 8.0, t.card, t.card_s);
-        let cmd_w = if rw2 < 520.0 { 230.0 } else { 276.0 };
         for (i, (cmd, desc, new)) in CLI.iter().enumerate() {
-            let r = Rect::new(rx + 1.0, ry + i as f32 * 34.0, rw2 - 2.0, 34.0);
+            let r = Rect::new(rx + 1.0, ry + i as f32 * row_h, rw2 - 2.0, row_h);
             if i > 0 {
                 self.gfx.hline(r.x, r.r(), r.y, t.line);
             }
@@ -349,15 +354,19 @@ impl App {
                 self.gfx.fill(Rect::new(r.x, r.y + if i > 0 { 1.0 } else { 0.0 }, r.w, r.h - if i > 0 { 1.0 } else { 0.0 }), t.hov.fade(hv));
             }
             self.hit(r, h);
-            self.tip(r, format!("{cmd}
-{desc}
-Click to copy"));
-            let cw = self.gfx.text_at(cmd, r.x + 15.0, r.y, 34.0, cmd_w, Font::Mono, 12.0, 400, t.t1);
+            self.tip(r, format!("{cmd}\n{desc}\nClick to copy"));
+            let text_w = r.w - 15.0 - 44.0;
+            let (cy, ch) = if side { (r.y, 34.0) } else { (r.y + 6.0, 22.0) };
+            let cw = self.gfx.text_at(cmd, r.x + 15.0, cy, ch, if side { cmd_need } else { text_w }, Font::Mono, 12.0, 400, t.t1);
             if *new {
-                self.gfx.text_at("new", r.x + 15.0 + cw + 6.0, r.y, 34.0, 40.0, Font::Ui, 10.5, 600, t.acc_t);
+                self.gfx.text_at("new", r.x + 15.0 + cw + 6.0, cy, ch, 40.0, Font::Ui, 10.5, 600, t.acc_t);
             }
-            self.gfx.text(desc, Rect::new(r.x + 15.0 + cmd_w + 12.0, r.y, r.w - 15.0 - cmd_w - 12.0 - 44.0, 34.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
-            self.gfx.glyph(0xE8C8, Rect::new(r.r() - 12.0 - 20.0, r.y, 20.0, 34.0), 12.0, if hov { t.t1 } else { t.t3 });
+            if side {
+                self.gfx.text(desc, Rect::new(r.x + 15.0 + cmd_need + 16.0, r.y, text_w - cmd_need - 16.0, 34.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
+            } else {
+                self.gfx.text(desc, Rect::new(r.x + 15.0, r.y + 27.0, text_w, 18.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
+            }
+            self.gfx.glyph(0xE8C8, Rect::new(r.r() - 12.0 - 20.0, r.y, 20.0, row_h), 12.0, if hov { t.t1 } else { t.t3 });
         }
         ry = card.b() + 10.0;
         self.gfx.glyph(0xE756, Rect::new(rx, ry, 14.0, 20.0), 12.0, t.t2);

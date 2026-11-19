@@ -97,14 +97,16 @@ pub struct Status {
     pub drives: bool,
     pub win_e: bool,
     pub this_pc: bool,
+    /// the Win+E helper (RustFileExplorerWinE.exe) starts at sign-in; always true for a test root
+    pub win_e_key: bool,
 }
 
 impl Status {
     pub fn all(&self) -> bool {
-        self.folders && self.drives && self.win_e && self.this_pc
+        self.folders && self.drives && self.win_e && self.this_pc && self.win_e_key
     }
-    pub fn parts(&self) -> [(&'static str, bool); 4] {
-        [("folders", self.folders), ("drives", self.drives), ("win_e", self.win_e), ("this_pc", self.this_pc)]
+    pub fn parts(&self) -> [(&'static str, bool); 5] {
+        [("folders", self.folders), ("drives", self.drives), ("win_e", self.win_e), ("this_pc", self.this_pc), ("win_e_key", self.win_e_key)]
     }
 }
 
@@ -136,7 +138,35 @@ pub fn status_in(root: &str) -> Status {
         drives: verb("Drive"),
         win_e: get_value(&format!(r"{root}\{WIN_E}"), MARK).is_some(),
         this_pc: clsid(THIS_PC),
+        win_e_key: root != CLASSES || get_value(RUN, HELPER_NAME).is_some(),
     }
+}
+
+/// Windows 11 (Nov 2026 builds) opens Explorer on Win+E without reading the registry verb: a tiny helper next to
+/// RustFileExplorer.exe takes the key instead. It starts at sign-in from this Run value.
+const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const HELPER_NAME: &str = "RustFileExplorerWinE";
+
+fn helper_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    exe.parent().map(|d| d.join("RustFileExplorerWinE.exe")).filter(|p| p.is_file())
+}
+
+fn delete_value(path: &str, name: &str) {
+    let p = wide(path);
+    let n = wide(name);
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(p.as_ptr()), None, KEY_SET_VALUE, &mut key) == ERROR_SUCCESS {
+            let _ = RegDeleteValueW(key, PCWSTR(n.as_ptr()));
+            let _ = RegCloseKey(key);
+        }
+    }
+}
+
+/// Start (or with `--quit` stop) the helper, hidden, without waiting.
+fn run_helper(helper: &std::path::Path, args: &[&str]) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new(helper).args(args).creation_flags(0x0800_0000 | 0x0000_0008).spawn();
 }
 
 /// Is Rust File Explorer the per-user default for folders right now? (read only)
@@ -146,7 +176,22 @@ pub fn is_default() -> bool {
 
 /// Make `exe` (full path of RustFileExplorer.exe) the default for folders, drives, Win+E and This PC.
 pub fn set(exe: &std::path::Path) -> Res<()> {
-    set_in(CLASSES, exe)
+    let r = set_in(CLASSES, exe);
+    assoc_changed();
+    if r.is_ok()
+        && let Some(h) = helper_of(exe)
+    {
+        set_value(RUN, HELPER_NAME, &format!("\"{}\"", h.display()))?;
+        run_helper(&h, &[]);
+    }
+    r
+}
+
+/// Tell the shell that handlers changed: the running Explorer drops its cached verbs (Win+E kept the old handler
+/// until the next sign-in without this).
+fn assoc_changed() {
+    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
 pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
@@ -192,7 +237,17 @@ pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
 
 /// Undo `set`: Explorer opens folders, Win+E, This PC and the Recycle Bin again.
 pub fn restore() -> Res<()> {
-    restore_in(CLASSES)
+    let r = restore_in(CLASSES);
+    assoc_changed();
+    // the Win+E helper stops and no longer starts at sign-in
+    if let Some(cmd) = get_value(RUN, HELPER_NAME) {
+        let h = std::path::PathBuf::from(cmd.trim_matches('"'));
+        if h.is_file() {
+            run_helper(&h, &["--quit"]);
+        }
+        delete_value(RUN, HELPER_NAME);
+    }
+    r
 }
 
 pub fn restore_in(root: &str) -> Res<()> {

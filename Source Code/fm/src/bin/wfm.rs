@@ -51,9 +51,9 @@ Change (every change can be undone with `wfm undo`)
 Open
   open <path> [--verb VERB]               default app (VERB: edit, print, runas, ...)
   open --select <path>                    like `explorer /select,`: prints the folder and the item to select
-  openwith <path> [--all]                 the apps that can open it (Windows default, our own default)
+  openwith <path> [--all]                 the apps that can open it (the Windows default is marked)
   openwith <path> <app>                   open it with one of them (also: --app NAME; old name: open-with)
-  openwith default <.ext> [<app>|--clear] Rust File Explorer's own default app for a type (Windows' is untouched)
+  openwith default <.ext>                 the Windows default app for a type
   reveal <path>                           show it selected in a folder window
   menu <path...> [--extended]             the right-click menu, with app extensions (7-Zip, Terminal, ...)
   menu <path...> --invoke VERB            run one entry (by verb or by its text)
@@ -715,35 +715,17 @@ fn cmd_open(a: &Args) -> R {
     Ok(Out { v: json!({"ok": true, "path": abs(p).to_string_lossy(), "verb": verb}), text: format!("opened {}\n", abs(p).display()) })
 }
 
-/// openwith <file> [--all]            the apps that open it (Windows default, our own default, icon location)
+/// openwith <file> [--all]            the apps that open it (Windows default marked, icon location)
 /// openwith <file> <app> | --app <app>  open it with one of them
-/// openwith default <.ext> [<app>|--clear]   show / set / clear Rust File Explorer's own default for a type
+/// openwith default <.ext>              the Windows default app for a type (it is changed only in Windows' own dialog)
 fn cmd_open_with(a: &Args) -> R {
-    let p = a.arg(1, "openwith needs a path (or: openwith default <.ext> [<app>|--clear])")?;
+    let p = a.arg(1, "openwith needs a path (or: openwith default <.ext>)")?;
     if p == "default" {
         let ext = a.arg(2, "openwith default needs an extension, e.g. .mp4")?;
         let key = shell::ext_key(ext);
-        if a.flag("--clear") {
-            shell::set_own_default(&key, None).map_err(fail)?;
-            return Ok(Out { v: json!({"ok": true, "ext": key, "default": null}), text: format!("{key}: Windows decides again\n") });
-        }
-        if let Some(app) = a.pos.get(3) {
-            let list = shell::open_with_list(&key, true).map_err(fail)?;
-            let l = app.to_lowercase();
-            let h = list
-                .iter()
-                .find(|h| h.ui_name.to_lowercase() == l || h.name.to_lowercase() == l)
-                .or_else(|| list.iter().find(|h| h.ui_name.to_lowercase().contains(&l)))
-                .ok_or_else(|| fail(format!("no app named '{app}' can open {key} files")))?;
-            shell::set_own_default(&key, Some((&h.ui_name, &h.name))).map_err(fail)?;
-            return Ok(Out { v: json!({"ok": true, "ext": key, "default": h.ui_name, "name": h.name}), text: format!("{key} now always opens with {}\n", h.ui_name) });
-        }
-        let own = shell::own_default(&key);
         let (win, _) = shell::default_app(&key);
-        return Ok(Out {
-            v: json!({"ok": true, "ext": key, "default": own.as_ref().map(|o| o.0.clone()), "windows_default": win}),
-            text: format!("{key}: {} (Windows default: {})\n", own.map(|o| o.0).unwrap_or_else(|| "not set, Windows decides".into()), if win.is_empty() { "none".to_string() } else { win }),
-        });
+        return Ok(Out { v: json!({"ok": true, "ext": key, "windows_default": win}), text: format!("{key}: {}
+", if win.is_empty() { "no default app".to_string() } else { win }) });
     }
     if let Some(app) = a.opt("--app").or_else(|| a.pos.get(2).map(|s| s.as_str())) {
         let h = shell::open_with(Path::new(p), app).map_err(fail)?;
@@ -751,14 +733,13 @@ fn cmd_open_with(a: &Args) -> R {
     }
     let ext = ext_of(p);
     let list = shell::open_with_list(&ext, a.flag("--all")).map_err(fail)?;
-    let own = shell::own_default(&ext);
     let mut t = String::new();
     for h in &list {
-        let ours = own.as_ref().map(|o| o.1 == h.name).unwrap_or(false);
-        t += &format!("{:<36} {:<9} {}\n", trunc(&h.ui_name, 36), if ours { "ours" } else if h.default { "windows" } else { "" }, h.name);
+        t += &format!("{:<36} {:<9} {}
+", trunc(&h.ui_name, 36), if h.default { "default" } else { "" }, h.name);
     }
     Ok(Out {
-        v: json!({"ok": true, "ext": ext, "own_default": own.as_ref().map(|o| o.0.clone()), "apps": list.iter().map(|h| json!({"ui_name": h.ui_name, "name": h.name, "recommended": h.recommended, "windows_default": h.default, "own_default": own.as_ref().map(|o| o.1 == h.name).unwrap_or(false), "icon": h.icon})).collect::<Vec<_>>()}),
+        v: json!({"ok": true, "ext": ext, "apps": list.iter().map(|h| json!({"ui_name": h.ui_name, "name": h.name, "recommended": h.recommended, "windows_default": h.default, "icon": h.icon})).collect::<Vec<_>>()}),
         text: t,
     })
 }
@@ -1047,9 +1028,10 @@ fn cmd_default(a: &Args) -> R {
                     Some(e) => std::path::PathBuf::from(e),
                     None => std::env::current_exe().map_err(|e| fail(e.to_string()))?.with_file_name("RustFileExplorer.exe"),
                 };
-                fmcore::defaultfm::set_in(&root, &exe).map_err(fail)?;
+                // the real root also starts the Win+E helper; a test root only writes its keys
+                if root == fmcore::defaultfm::CLASSES { fmcore::defaultfm::set(&exe) } else { fmcore::defaultfm::set_in(&root, &exe) }.map_err(fail)?;
             } else {
-                fmcore::defaultfm::restore_in(&root).map_err(fail)?;
+                if root == fmcore::defaultfm::CLASSES { fmcore::defaultfm::restore() } else { fmcore::defaultfm::restore_in(&root) }.map_err(fail)?;
             }
             let (mut v, t) = st(&root);
             v["ok"] = json!(true);

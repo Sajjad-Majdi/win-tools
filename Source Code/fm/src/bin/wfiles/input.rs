@@ -88,6 +88,8 @@ impl App {
             Hit::ViewBtn => "View".to_string(),
             Hit::New => "New (Ctrl+Shift+N: folder)".to_string(),
             Hit::OmniClear => "Clear".to_string(),
+            Hit::OmniSearch => "Search (Ctrl+F)".to_string(),
+            Hit::Ask => "AI Search: describe what you need in your own words, in any language (Shift+Enter)".to_string(),
             Hit::Min => "Minimize".to_string(),
             Hit::Max => if unsafe { IsZoomed(self.hwnd).as_bool() } { "Restore down".to_string() } else { "Maximize".to_string() },
             Hit::Close => "Close".to_string(),
@@ -215,7 +217,7 @@ impl App {
                 }
                 T_CARET => {
                     self.caret_on = !self.caret_on;
-                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.accent_field.is_some() {
+                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some() {
                         self.invalidate();
                     } else {
                         // nothing to blink: no timer at all while idle
@@ -252,8 +254,29 @@ impl App {
         self.pane().dir()
     }
 
+    /// Open a search marker row: "N more in ..." unfolds its group; "N hidden ..." turns on Include system & temp.
+    fn search_marker(&mut self, p: usize, path: &str) {
+        let t = self.cur;
+        if let Some(s) = self.tabs[t].panes[p].search.as_mut() {
+            if let Some(key) = path.strip_prefix(crate::rank::MORE) {
+                s.open.insert(key.to_string());
+            } else if path == crate::rank::HIDDEN {
+                s.junk = true;
+            }
+            s.rearrange();
+        }
+        self.tabs[t].panes[p].sel.clear();
+        self.invalidate();
+    }
+
     pub fn open_item(&mut self, it: &Item, new_tab: bool) {
         if it.recycled.is_some() {
+            return;
+        }
+        if it.path.to_string_lossy().starts_with("::") {
+            let p = self.tab().active;
+            let path = it.path.to_string_lossy().into_owned();
+            self.search_marker(p, &path);
             return;
         }
         if it.is_dir {
@@ -551,8 +574,7 @@ impl App {
         let i = self.menu_tab.take().unwrap_or(self.cur).min(self.tabs.len().saturating_sub(1));
         match a {
             Act::TabNew => {
-                let loc = self.tabs[i].pane().loc.clone();
-                self.new_tab(if loc == Loc::Settings { Loc::ThisPc } else { loc });
+                self.new_tab(Loc::ThisPc); // a new tab starts at This PC (Sajjad, 2026-11-19)
             }
             Act::TabDuplicate => {
                 let loc = self.tabs[i].pane().loc.clone();
@@ -736,25 +758,18 @@ impl App {
         let _ = fmcore::pins::save_config(&cfg);
     }
 
-    /// Make the app on row `i` of "Open with" our own default for this file type (one step, no Windows dialog).
+    /// The default-app button on an "Open with" row: Windows' own dialog, where "Always" makes the Windows default
+    /// (Windows lets no app set it silently; the choice stays Windows' only one).
     fn pin_default(&mut self, i: usize) {
         let Some(it) = self.sub.as_ref().and_then(|s| s.items.get(i)).cloned() else { return };
-        if it.pin.is_none() || it.value < 0 {
+        if it.pin.is_none() {
             return;
         }
-        let Some(m) = self.menu.as_ref() else { return };
-        let Some((h, _)) = m.apps.get(it.value as usize).cloned() else { return };
-        let Some(path) = m.paths.first().cloned() else { return };
-        let ext = fmcore::shell::ext_key(&fmcore::util::ext_of(&path.to_string_lossy()));
-        let prev = fmcore::shell::own_default(&ext);
-        match fmcore::shell::set_own_default(&ext, Some((&h.ui_name, &h.name))) {
-            Ok(()) => {
-                self.own_defaults = fmcore::shell::own_defaults();
-                self.refresh_open_with();
-                self.toast(&format!("Always opening {ext} with "), &h.ui_name, true);
-                self.toast_ow = Some((ext, prev));
-            }
-            Err(e) => self.toast_err(&e),
+        let Some(path) = self.menu.as_ref().and_then(|m| m.paths.first().cloned()) else { return };
+        self.retire_menu();
+        self.assoc_stale = true;
+        if let Err(e) = fmcore::shell::open_with_dialog(&path, self.hwnd.0 as isize) {
+            self.toast_err(&e);
         }
     }
 
@@ -771,7 +786,8 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        self.own_defaults = fmcore::shell::own_defaults();
+        let (url, header, _) = crate::ai::relay_saved();
+        self.relay_fields = [Field::new(&url), Field::new(&header), Field::default()];
         if let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::Settings) {
             self.cur = i;
         } else {
@@ -1217,9 +1233,14 @@ impl App {
         let in_menu = matches!(h, Hit::MenuItem(_) | Hit::MenuQuick(_) | Hit::SubItem(_) | Hit::SubPin(_) | Hit::Drop(_)) || (matches!(h, Hit::Block) && (self.menu_rect().map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(false).map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(true).map(|r| r.has(x, y)).unwrap_or(false)));
         if !in_menu && (self.menu.is_some() || self.drop.is_some()) {
             let drop_was = self.drop.as_ref().map(|d| d.kind);
+            let anchor_was = self.drop.as_ref().map(|d| d.anchor);
             self.close_popups();
-            // a click on the same dropdown button just closes it
-            if matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New))) {
+            // a click on the same dropdown button just closes it (any dropdown opened under its own button)
+            let same_button = match (anchor_was, self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0)) {
+                (Some(a), Some(r)) => (a.x - r.x).abs() < 1.0 && (a.y - r.y).abs() < 1.0 && (a.w - r.w).abs() < 1.0,
+                _ => false,
+            };
+            if same_button || matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New))) {
                 return;
             }
         }
@@ -1259,6 +1280,9 @@ impl App {
         if self.key_focus && h != Hit::Set(15) && h != Hit::Set(16) {
             self.key_focus = false;
         }
+        if self.relay_focus != 0 && !matches!(h, Hit::Set(90..=93)) {
+            self.relay_focus = 0;
+        }
         if self.accent_field.is_some() && !matches!(h, Hit::Set(50) | Hit::Set(51)) {
             self.accent_commit();
         }
@@ -1267,7 +1291,7 @@ impl App {
             self.sug.clear();
         }
         // a click on a result moves the keys to the list (as in Explorer); search controls keep them in the box
-        if !matches!(h, Hit::Omni | Hit::OmniClear | Hit::Scope(_) | Hit::Filter(_) | Hit::Meaning | Hit::Drop(_) | Hit::Block) {
+        if !matches!(h, Hit::Omni | Hit::OmniClear | Hit::Scope(_) | Hit::Filter(_) | Hit::Ask | Hit::AiOffer | Hit::Drop(_) | Hit::Block) {
             self.search_focus = false;
         }
         match h {
@@ -1279,8 +1303,7 @@ impl App {
             }
             Hit::TabClose(i) => self.close_tab(i),
             Hit::TabAdd => {
-                let loc = self.pane().loc.clone();
-                self.new_tab(if loc == Loc::Settings { Loc::ThisPc } else { loc });
+                self.new_tab(Loc::ThisPc); // a new tab starts at This PC (Sajjad, 2026-11-19)
             }
             Hit::Back => self.back(),
             Hit::Fwd => self.forward(),
@@ -1346,6 +1369,11 @@ impl App {
                 let col = [SortCol::Name, SortCol::Date, SortCol::Size, SortCol::Type][c as usize % 4];
                 pane.sort = if pane.sort.0 == col { (col, !pane.sort.1) } else { (col, col != SortCol::Name) };
                 pane.sort_items();
+            }
+            Hit::Row(p, i) if self.tab().panes[p].rows().get(i).map(|r| r.path.to_string_lossy().starts_with("::")).unwrap_or(false) => {
+                // "N more in ..." / "N hidden in temp / system folders": one click shows them
+                let path = self.tab().panes[p].rows()[i].path.to_string_lossy().into_owned();
+                self.search_marker(p, &path);
             }
             Hit::Row(p, i) => {
                 self.tab_mut().active = p;
@@ -1421,17 +1449,7 @@ impl App {
                 }
             }
             Hit::Toast(k) => {
-                if k == 1
-                    && let Some((ext, prev)) = self.toast_ow.take()
-                {
-                    let r = fmcore::shell::set_own_default(&ext, prev.as_ref().map(|p| (p.0.as_str(), p.1.as_str())));
-                    self.own_defaults = fmcore::shell::own_defaults();
-                    self.refresh_open_with();
-                    match r {
-                        Ok(()) => self.toast(&format!("{ext} opens as before"), "", false),
-                        Err(e) => self.toast_err(&e),
-                    }
-                } else if k == 1 {
+                if k == 1 {
                     let job = self.toast_job.take();
                     self.toast = None;
                     match job.map(|id| jobs::undo(&self.jobs, id)) {
@@ -1455,15 +1473,34 @@ impl App {
                 self.search_focus = true;
                 self.start_search();
             }
+            Hit::Filter(3) => {
+                // "Include system & temp": temp, caches, AppData, Windows, Program Files ... (off by default)
+                if let Some(s) = self.pane_mut().search.as_mut() {
+                    s.junk = !s.junk;
+                    s.rearrange();
+                }
+            }
             Hit::Filter(i) => {
                 let r = self.hits.iter().find(|h| h.1 == Hit::Filter(i)).map(|h| h.0).unwrap_or_default();
                 self.open_drop([DropKind::FType, DropKind::FSize, DropKind::FDate][i as usize], r, 200.0);
             }
-            Hit::Meaning => {
-                if let Some(s) = self.pane_mut().search.as_mut() {
-                    s.meaning = !s.meaning;
+            Hit::AiOffer => {
+                // AI features off: turn them on right here when a key exists, then search; else Settings shows where
+                if crate::ai::has_key() && crate::ai::set_enabled(true).is_ok() {
+                    self.refresh_ai_flags();
+                    self.toast("AI features are on (Settings > Search and AI)", "", false);
+                    self.search_focus = true;
+                    self.ask_search();
+                } else {
+                    let _ = crate::models::set_switch(crate::models::Section::Ai, true);
+                    self.refresh_ai_flags();
+                    self.open_settings();
+                    self.toast("Add your Gemini API key to use AI Search", "", false);
                 }
-                self.start_search();
+            }
+            Hit::Ask => {
+                self.search_focus = true;
+                self.ask_search();
             }
             Hit::MenuQuick(i) => {
                 self.retire_menu();
@@ -1489,6 +1526,22 @@ impl App {
             }
             Hit::Dlg(k) => self.dialog_click(k, x),
             Hit::Set(k) => self.settings_click(k),
+            Hit::PlaceChk(i) => {
+                if let Some(p) = self.place_rows.get(i).cloned() {
+                    self.sp.toggle(&p);
+                    self.sp.save();
+                }
+            }
+            Hit::PlaceExp(i) => {
+                if let Some(p) = self.place_rows.get(i).cloned() {
+                    if !self.place_open.remove(&p) {
+                        if !self.place_kids.contains_key(&p) {
+                            self.place_kids.insert(p.clone(), sub_folders(&p));
+                        }
+                        self.place_open.insert(p);
+                    }
+                }
+            }
             Hit::WhatIs(k) => match k {
                 0 => self.whatis = None,
                 1 => {
@@ -1662,16 +1715,19 @@ impl App {
             return;
         }
         let pc = self.ui.scope_pc;
+        let junk = self.sp.junk;
         let pane = self.pane_mut();
         if pane.search.is_none() {
-            pane.search = Some(Search::new(first, pc));
+            let mut s = Search::new(first, pc);
+            s.junk = junk;
+            pane.search = Some(s);
         } else if let Some(s) = pane.search.as_mut() {
             s.field.insert(first);
         }
         self.search_focus = true;
         self.path_edit = None;
         if !first.is_empty() {
-            self.timer(T_SEARCH, 30);
+            self.start_search();
         }
     }
 
@@ -1820,6 +1876,11 @@ impl App {
             self.invalidate();
             return;
         }
+        if self.relay_focus != 0 {
+            self.relay_fields[(self.relay_focus - 1) as usize].insert(&s);
+            self.invalidate();
+            return;
+        }
         if let Some(f) = self.accent_field.as_mut() {
             if c.is_ascii_hexdigit() || c == '#' {
                 f.insert(&s);
@@ -1855,7 +1916,7 @@ impl App {
             if let Some(se) = self.pane_mut().search.as_mut() {
                 se.field.insert(&s);
             }
-            self.timer(T_SEARCH, 30);
+            self.start_search();
         } else if c != ' ' {
             // typing in the list selects the next item whose name starts with the typed letters (Ctrl+F searches)
             self.type_ahead(c);
@@ -1986,6 +2047,25 @@ impl App {
                 _ => {
                     if let Some(f) = self.accent_field.as_mut() {
                         f.key(vk, ctrl, shift);
+                    }
+                }
+            }
+            return true;
+        }
+        // relay fields (address, header, secret): Tab moves on, Enter saves
+        if self.relay_focus != 0 {
+            let i = (self.relay_focus - 1) as usize;
+            match vk {
+                ESC => self.relay_focus = 0,
+                ENTER => self.save_relay(),
+                TAB => self.relay_focus = if shift { if i == 0 { 3 } else { i as u8 } } else { (i as u8 + 1) % 3 + 1 },
+                _ => {
+                    if ctrl && vk == 0x56 {
+                        if let Some(s) = crate::dnd::clipboard_text(self.hwnd) {
+                            self.relay_fields[i].insert(s.trim());
+                        }
+                    } else if !(ctrl && (vk == 0x43 || vk == 0x58) && i == 2) {
+                        self.relay_fields[i].key(vk, ctrl, shift);
                     }
                 }
             }
@@ -2143,6 +2223,11 @@ impl App {
                     self.end_search();
                     return true;
                 }
+                ENTER if shift && !ctrl => {
+                    // Shift+Enter: AI Search (plain words become up to three searches)
+                    self.ask_search();
+                    return true;
+                }
                 ENTER => {
                     if ctrl {
                         // containing folder, with the item selected
@@ -2174,13 +2259,13 @@ impl App {
                         {
                             se.field.insert(&s);
                         }
-                        self.timer(T_SEARCH, 30);
+                        self.start_search();
                         return true;
                     }
                     if !(ctrl && matches!(vk, 0x4B | 0x54 | 0x57 | 0x4C)) {
                         let used = self.pane_mut().search.as_mut().map(|s| s.field.key(vk, ctrl, shift)).unwrap_or(false);
                         if used {
-                            self.timer(T_SEARCH, 30);
+                            self.start_search();
                             return true;
                         }
                     }
@@ -2212,8 +2297,7 @@ impl App {
             (0x4C, true, _, _) | (0x73, false, false, false) => self.edit_path(),
             (0x44, false, false, true) => self.edit_path(),
             (0x54, true, false, _) => {
-                let loc = self.pane().loc.clone();
-                self.new_tab(if loc == Loc::Settings { Loc::ThisPc } else { loc });
+                self.new_tab(Loc::ThisPc); // a new tab starts at This PC (Sajjad, 2026-11-19)
             }
             (0x57, true, false, _) => {
                 let c = self.cur;
@@ -2247,7 +2331,6 @@ impl App {
             (0x5A, true, false, _) => self.undo(),
             (0x41, true, false, _) => self.act(Act::SelectAll),
             (0x2E, _, s, _) => self.act(if s { Act::DeleteForGood } else { Act::Delete }),
-            (0x49, true, false, _) => self.act(Act::WhatIs),
             (0x72, false, false, false) => self.toggle_split(),
             (TAB, false, false, false) if self.tab().split() => {
                 let tab = self.tab_mut();
@@ -2360,9 +2443,6 @@ impl App {
             let stem = archive_stem(&sel[0].name);
             items.push(MItem::new(&format!("Extract to \u{201C}{stem}\\\u{201D}"), 0xE8B5, Act::ExtractTo));
             items.push(MItem::new("Extract here", 0xE8B5, Act::ExtractHere));
-        }
-        if one {
-            items.push(MItem::new("What is this file?", 0xF4A5, Act::WhatIs).keys("Ctrl+I"));
         }
         items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath).keys("Ctrl+Shift+C"));
         let mut ct = MItem::new("Copy to", 0xE8C8, Act::CopyToMenu).sep();
@@ -2675,7 +2755,10 @@ impl App {
             DropKind::OpenWith if it.value == -2 => {
                 // the Windows-wide default, through the supported dialog (with "Always use this app")
                 if let Some(p) = paths.first()
-                    && let Err(e) = fmcore::shell::open_with_dialog(p, self.hwnd.0 as isize)
+                    && let Err(e) = {
+                        self.assoc_stale = true;
+                        fmcore::shell::open_with_dialog(p, self.hwnd.0 as isize)
+                    }
                 {
                     self.toast_err(&e);
                 }
@@ -2938,14 +3021,27 @@ impl App {
     }
 
     // ------------------------------------------------------------------ settings
+    /// Settings > Search (ids 100..=108): system & temp, kinds (the folder tree has its own hits).
+    fn search_set_click(&mut self, k: u8) {
+        match k {
+            100 => self.sp.junk = !self.sp.junk,
+            101..=108 => self.sp.kinds_off ^= 1 << (k - 101),
+            _ => return,
+        }
+        self.sp.save();
+        self.invalidate();
+    }
+
     fn settings_click(&mut self, k: u8) {
-        use crate::models::Section;
+        if (100..=108).contains(&k) {
+            return self.search_set_click(k);
+        }
         match k {
             // the user's own click is the only thing that ever changes the default file manager
             1 => {
                 let exe = std::env::current_exe().unwrap_or_default();
                 match fmcore::defaultfm::set(&exe) {
-                    Ok(()) => self.toast("Folders, This PC, Recycle Bin and Win+E now open in Rust File Explorer", "", false),
+                    Ok(()) => self.toast("Folders, This PC and Win+E now open in Rust File Explorer", "", false),
                     Err(e) => self.toast_err(&e),
                 }
             }
@@ -2974,14 +3070,10 @@ impl App {
                 self.ui.ask_delete = !self.ui.ask_delete;
                 self.save_ui();
             }
-            8 => {
-                let on = !crate::models::switch_on(Section::Semsearch);
-                let _ = crate::models::set_switch(Section::Semsearch, on && crate::models::semsearch_detect().is_some());
-                self.refresh_ai_flags();
-            }
             9 => {
-                let on = !(crate::ai::switch_on() && crate::ai::has_key());
-                match crate::ai::set_enabled(on) {
+                // the switch alone: on shows the key and relay rows; AI Search works once a key is there
+                let on = !crate::ai::switch_on();
+                match crate::models::set_switch(crate::models::Section::Ai, on) {
                     Ok(()) => {
                         self.set.msg = None;
                         self.set.msg_ok = false;
@@ -3005,6 +3097,11 @@ impl App {
                 }
             }
             15 => self.key_focus = true,
+            90..=92 => {
+                self.relay_focus = k - 89;
+                self.key_focus = false;
+            }
+            93 => self.save_relay(),
             // Personalize: dropdowns
             20..=26 | 33 | 34 => {
                 let r = self.hits.iter().find(|h| h.1 == Hit::Set(k)).map(|h| h.0).unwrap_or_default();
@@ -3045,12 +3142,6 @@ impl App {
                 }
             }
             51 => self.accent_commit(),
-            60..=79 => {
-                if let Some(ext) = self.own_defaults.keys().nth((k - 60) as usize).cloned() {
-                    let _ = fmcore::shell::set_own_default(&ext, None);
-                    self.own_defaults = fmcore::shell::own_defaults();
-                }
-            }
             16 => self.save_key(),
             17 => {
                 let typed = self.key_field.text.trim().to_string();
@@ -3182,6 +3273,26 @@ impl App {
         self.look_changed();
     }
 
+    /// Settings > AI relay: save the address, header and (when typed) the secret; an empty address removes the relay.
+    fn save_relay(&mut self) {
+        let [u, h, sec] = &self.relay_fields;
+        let (url, header, secret) = (u.text.trim().to_string(), h.text.trim().to_string(), sec.text.trim().to_string());
+        let secret = if url.is_empty() { Some(String::new()) } else if secret.is_empty() { None } else { Some(secret) };
+        match crate::ai::set_relay(&url, &header, secret.as_deref()) {
+            Ok(()) => {
+                self.set.msg = Some(if url.is_empty() { "Relay removed: Gemini is reached directly".into() } else { "Relay saved (the secret is encrypted for this Windows user)".into() });
+                self.set.msg_ok = true;
+                self.relay_focus = 0;
+                self.relay_fields[2] = Field::default();
+            }
+            Err(e) => {
+                self.set.msg = Some(e);
+                self.set.msg_ok = false;
+            }
+        }
+        self.invalidate();
+    }
+
     fn save_key(&mut self) {
         let k = std::mem::take(&mut self.key_field);
         if k.text.trim().is_empty() {
@@ -3272,7 +3383,6 @@ impl App {
             ("New folder", 0xE8F4, Act::NewFolder, vec!["Ctrl", "Shift", "N"], String::new()),
             ("Split view", 0xE8A9, Act::Split, vec!["F3"], String::new()),
             ("Transfers", 0xE8C8, Act::Transfers, vec!["Ctrl", "Shift", "Q"], String::new()),
-            ("What is this file?", 0xE946, Act::WhatIs, vec!["Ctrl", "I"], sel_name.clone()),
             ("Show hidden files", 0xE7B3, Act::ToggleHidden, vec![], String::new()),
             ("Undo", 0xE7A7, Act::Undo, vec!["Ctrl", "Z"], String::new()),
             ("Settings", 0xE713, Act::Settings, vec!["Ctrl", ","], String::new()),
@@ -3488,12 +3598,8 @@ pub fn open_with_items(m: &CtxMenu) -> Vec<MItem> {
     let mut seen = std::collections::HashSet::new();
     let file = m.paths.len() == 1 && m.paths[0].is_file();
     let ext = m.paths.first().map(|p| fmcore::shell::ext_key(&fmcore::util::ext_of(&p.to_string_lossy()))).unwrap_or_default();
-    let own = if file { fmcore::shell::own_default(&ext) } else { None };
-    // the default: ours when set, else the one Windows uses
-    let def = |h: &fmcore::shell::Handler| match &own {
-        Some(o) => o.1 == h.name,
-        None => h.default,
-    };
+    // the default is the one Windows uses (it changes only in Windows' own dialog)
+    let def = |h: &fmcore::shell::Handler| h.default;
     // a stable order (Windows' default first, as Windows lists it): pinning never moves rows under the pointer
     for i in 0..m.apps.len() {
         let (h, icon) = &m.apps[i];
@@ -3507,7 +3613,9 @@ pub fn open_with_items(m: &CtxMenu) -> Vec<MItem> {
             it.checked = true;
             it.keys = "Default".into();
         }
-        it.pin = Some(format!("Always open {ext} files with {}", h.ui_name));
+        if file {
+            it.pin = Some(format!("Set the default app for {ext} files (Windows)"));
+        }
         v.push(it);
     }
     // the shell's app launchers (Terminal, VS Code, Git ...); other verbs live in "More options"
@@ -3522,7 +3630,7 @@ pub fn open_with_items(m: &CtxMenu) -> Vec<MItem> {
         v.push(n);
     }
     if file {
-        let mut w = MItem::new("Set Windows default\u{2026}", 0xE713, Act::None).sep();
+        let mut w = MItem::new("Choose default app\u{2026}", 0xE713, Act::None).sep();
         w.value = -2;
         v.push(w);
     }
@@ -3628,44 +3736,6 @@ pub fn rename_preview(a: &mut App) {
     r.problem = problem;
 }
 
-/// "By meaning" through semsearch: its local server when it runs, else its command line (hidden).
-pub fn meaning_search(words: &str, top: usize) -> Result<(u32, Vec<Item>), String> {
-    let cmd = crate::models::semsearch_detect().ok_or("meaning search is not installed")?;
-    let enc: String = words.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-    let body = match crate::ai_http_get(&format!("http://127.0.0.1:8791/search?q={enc}&top={top}")) {
-        Ok(b) => b,
-        Err(_) => {
-            use std::os::windows::process::CommandExt;
-            let out = std::process::Command::new("cmd.exe").arg("/c").arg(&cmd).arg(words).arg("--json").arg("--top").arg(top.to_string()).creation_flags(0x0800_0000).output().map_err(|e| e.to_string())?;
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        }
-    };
-    let v: serde_json::Value = serde_json::from_str(body.trim()).map_err(|_| "meaning search gave no answer".to_string())?;
-    let arr = v.as_array().cloned().or_else(|| v["results"].as_array().cloned()).unwrap_or_default();
-    let items: Vec<Item> = arr
-        .iter()
-        .filter_map(|x| {
-            let path = PathBuf::from(x["path"].as_str()?);
-            let md = std::fs::metadata(&path).ok();
-            let name = path.file_name()?.to_string_lossy().into_owned();
-            let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            Some(Item {
-                kind: crate::ficons::kind_of(&name, is_dir),
-                hl: vec![],
-                size: md.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
-                modified: md.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| fmcore::util::unix_ft(d.as_secs() as i64)).unwrap_or(0),
-                attrs: 0,
-                folder: path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
-                is_dir,
-                name,
-                path,
-                recycled: None,
-                empty: false,
-            })
-        })
-        .collect();
-    Ok((items.len() as u32, items))
-}
 
 // ---------------------------------------------------------------------- drag and drop into the window
 impl crate::dnd::Sink for App {
@@ -4221,4 +4291,20 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
 
 pub fn content_size(a: &App) -> f32 {
     content_h(a, a.cur, a.tab().active)
+}
+
+/// The sub-folders of a folder for the Settings > Search tree (no hidden, system or dot folders), sorted by name.
+pub fn sub_folders(p: &Path) -> Vec<PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    let mut v: Vec<PathBuf> = std::fs::read_dir(p)
+        .map(|rd| {
+            rd.flatten()
+                // no hidden or system folders, and no dot folders (.vscode, .ssh ...): only real places people pick
+                .filter(|e| !e.file_name().to_string_lossy().starts_with('.') && e.metadata().map(|m| m.is_dir() && m.file_attributes() & 0x6 == 0).unwrap_or(false))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by_key(|x| x.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default());
+    v
 }

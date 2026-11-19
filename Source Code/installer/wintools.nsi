@@ -44,6 +44,17 @@ VIAddVersionKey "LegalCopyright" "Sajjad"
 Section "${APPNAME}"
   ReadRegStr $R0 HKCU "Software\${APPID}" "InstallDir"
   SetOutPath "$INSTDIR"
+!ifdef HELPER
+  ; the Win+E helper (Rust File Explorer): the running copy stops through its own --quit, the new one starts below
+  IfFileExists "$INSTDIR\${HELPER}" 0 +3
+  nsExec::Exec '"$INSTDIR\${HELPER}" --quit'
+  Sleep 300
+  Delete "$INSTDIR\${HELPER}.old"
+  IfFileExists "$INSTDIR\${HELPER}" 0 +2
+  Rename "$INSTDIR\${HELPER}" "$INSTDIR\${HELPER}.old"
+  File "${STAGE}\${HELPER}"
+  Delete /REBOOTOK "$INSTDIR\${HELPER}.old"
+!endif
   ; an older copy may be open: a running exe cannot be overwritten, but it can be renamed. Move it aside so the new
   ; files always land; the old copies are deleted now if free, else at the next restart.
   Delete "$INSTDIR\${EXE}.old"
@@ -73,6 +84,12 @@ Section "${APPNAME}"
   WriteRegStr HKCU "${UNINST}" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "${UNINST}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST}" "NoRepair" 1
+!ifdef HELPER
+  ; Win+E was given to Rust File Explorer ("Set as default"): start the new helper now
+  ReadRegStr $R2 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RustFileExplorerWinE"
+  StrCmp $R2 "" +2
+  Exec '"$INSTDIR\${HELPER}"'
+!endif
 
 !ifdef OLDEXE
   ; 0.1.0 used another exe name and folder: remove that copy (an open window is left alone; in-use files go on restart)
@@ -117,6 +134,13 @@ Section "Uninstall"
   ; ask the open window to quit through its own CLI (no taskkill by name)
   nsExec::Exec '"$INSTDIR\${CLI}" gui quit'
   Sleep 400
+!ifdef HELPER
+  nsExec::Exec '"$INSTDIR\${HELPER}" --quit'
+  Sleep 300
+  Delete "$INSTDIR\${HELPER}"
+  Delete "$INSTDIR\${HELPER}.old"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RustFileExplorerWinE"
+!endif
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\${CLI}"
   Delete "$INSTDIR\${EXE}.old"

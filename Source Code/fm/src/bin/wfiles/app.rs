@@ -59,7 +59,9 @@ pub const T_TRIM: usize = 11;
 pub enum Msg {
     Listed { tab: u64, pane: usize, seq: u64, res: Result<Vec<Item>, String>, ms: f64 },
     Sizes { dir: PathBuf, sizes: HashMap<String, u64>, done: bool },
-    Found { tab: u64, pane: usize, seq: u64, res: Result<(u32, Vec<Item>), String> },
+    /// search results: Everything's matches and (ranked off the UI thread) the rows to show
+    /// search results; `ai` = the AI's note when "AI Search" made them
+    Found { tab: u64, pane: usize, seq: u64, res: Result<(u32, Vec<Item>), String>, rows: Vec<Item>, ai: Option<String> },
     Drives(Vec<Drive>),
     Recent(Vec<fmcore::pins::Recent>),
     Thumb { path: PathBuf, img: Option<(u32, u32, Vec<u8>)> },
@@ -82,11 +84,18 @@ pub enum Msg {
     EvStatus { running: bool, total: u32 },
     KeyTest(Result<(), String>),
     OpenWith { path: PathBuf, apps: Vec<fmcore::shell::Handler> },
-    AiFlags { ai: bool, meaning: bool },
+    AiFlags { ai: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
+    /// the search strip's "AI Search" button
+    Ask,
+    /// "Turn on AI Search" under empty results (AI features off)
+    AiOffer,
+    /// Settings > Search folder tree: tick box / expand arrow of row i
+    PlaceChk(usize),
+    PlaceExp(usize),
     None,
     Tab(usize),
     TabClose(usize),
@@ -116,7 +125,6 @@ pub enum Hit {
     Xfer,
     Scope(u8),
     Filter(u8),
-    Meaning,
     MenuItem(usize),
     MenuQuick(u8),
     SubItem(usize),
@@ -379,6 +387,12 @@ pub struct App {
     pub gfx: Gfx,
     pub t: Theme,
     pub ui: UiSettings,
+    /// Settings > Search: the rules for This PC searches
+    pub sp: SearchPrefs,
+    /// Settings > Search folder tree: open folders, their sub-folders (read once), the rows as painted
+    pub place_open: HashSet<PathBuf>,
+    pub place_kids: HashMap<PathBuf, Vec<PathBuf>>,
+    pub place_rows: Vec<PathBuf>,
     pub tabs: Vec<Tab>,
     pub cur: usize,
     pub next_id: u64,
@@ -431,6 +445,8 @@ pub struct App {
     pub thumb_q: Arc<(Mutex<Vec<PathBuf>>, Condvar)>,
     /// real file icons (shell), made off the UI thread
     pub icons: crate::sicons::Icons,
+    /// Windows' app picker was opened: when the window is active again, file-type icons are made anew
+    pub assoc_stale: bool,
     pub thumb_asked: HashSet<PathBuf>,
     pub sizes: HashMap<PathBuf, HashMap<String, u64>>,
     /// folders whose size pass is still running (their unknown cells show "…")
@@ -451,7 +467,6 @@ pub struct App {
     pub recycle: Vec<fmcore::recycle::Recycled>,
     pub set: SetState,
     pub ai_on: bool,
-    pub meaning_on: bool,
     pub open_with: Option<(PathBuf, Vec<fmcore::shell::Handler>)>,
     pub started: Instant,
     pub first_paint_ms: Option<f64>,
@@ -463,13 +478,12 @@ pub struct App {
     pub last_error: Option<String>,
     pub key_field: Field,
     pub key_focus: bool,
+    /// Settings > AI relay: address, header name, secret (masked); which one has the caret (0 = none)
+    pub relay_fields: [Field; 3],
+    pub relay_focus: u8,
     pub confirm: Option<(String, Act)>,
     pub pending_rename: Option<PathBuf>,
     pub toast_job: Option<u64>,
-    /// Undo of "Always opening .ext with ...": (extension, the previous own default)
-    pub toast_ow: Option<(String, Option<(String, String)>)>,
-    /// Rust File Explorer's own default apps (openwith.json), for Settings
-    pub own_defaults: std::collections::BTreeMap<String, (String, String)>,
     pub shot_hover: bool,
     /// handling a `wfm gui` command (synthetic mouse)
     pub synthetic: bool,
@@ -571,6 +585,38 @@ impl App {
             let _c = fmcore::util::com();
             let m = f();
             post_bg(&bg, hw, m);
+        });
+    }
+
+    /// Run a search on THE search thread. Everything answers one IPC query at a time and cannot cancel one, so a
+    /// thread per key made old queries queue in front of the newest when typing fast. One thread; per pane only the
+    /// newest request waits (a newer one replaces it), and it is sent when the running one is back.
+    pub fn spawn_search(&self, tab: u64, pane: usize, f: impl FnOnce() -> Msg + Send + 'static) {
+        static WORKER: std::sync::Once = std::sync::Once::new();
+        let (m, cv) = &*SEARCH_SLOT;
+        {
+            let mut q = m.lock().unwrap();
+            q.retain(|j| j.0 != (tab, pane));
+            q.push(((tab, pane), Box::new(f), self.bg.clone(), self.hwnd.0 as isize));
+        }
+        cv.notify_one();
+        WORKER.call_once(|| {
+            std::thread::spawn(|| {
+                let _c = fmcore::util::com();
+                let (m, cv) = &*SEARCH_SLOT;
+                loop {
+                    let job = {
+                        let mut q = m.lock().unwrap();
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap();
+                        }
+                        q.remove(0)
+                    };
+                    let (_, f, bg, hw) = job;
+                    let msg = f();
+                    post_bg(&bg, hw, msg);
+                }
+            });
         });
     }
 
@@ -1087,8 +1133,49 @@ impl App {
         });
     }
 
+    /// The real folders behind a place: the Desktop is the user's Desktop plus the Public Desktop.
+    pub fn sources(&self, dir: Option<PathBuf>) -> Vec<PathBuf> {
+        let Some(d) = dir else { return vec![] };
+        let mut v = vec![d.clone()];
+        if known("Desktop").map(|k| fmcore::util::path_eq(&k, &d)).unwrap_or(false)
+            && let Some(p) = public_desktop()
+        {
+            v.push(p);
+        }
+        v
+    }
+
+    /// The user's own places for ranking (lower case, trailing backslash): known folders, pins, recent places.
+    fn own_places(&self) -> Vec<String> {
+        let mut v: Vec<String> = vec![];
+        let mut add = |p: &Path| {
+            let mut s = p.to_string_lossy().to_lowercase();
+            if !s.ends_with('\\') {
+                s.push('\\');
+            }
+            v.push(s);
+        };
+        for (_, _, _, l) in &self.side {
+            if let Loc::Folder(p) = l {
+                add(p);
+            }
+        }
+        if let Some(p) = public_desktop() {
+            add(&p);
+        }
+        for r in &self.recent {
+            if let Some(p) = Path::new(&r.target).parent() {
+                add(p);
+            }
+        }
+        v
+    }
+
     pub fn start_search(&mut self) {
-        let here = self.pane().dir();
+        let here = self.sources(self.pane().dir());
+        let own = self.own_places();
+        let sp = self.sp.clone();
+        let show_hidden = self.ui.hidden;
         let tab_id = self.tab().id;
         let p = self.tab().active;
         let Some(s) = self.pane_mut().search.as_mut() else { return };
@@ -1097,65 +1184,120 @@ impl App {
         let words = s.field.text.trim().to_string();
         if words.is_empty() {
             s.items.clear();
+            s.all.clear();
             s.total = 0;
             self.invalidate();
             return;
         }
-        s.busy = true;
-        let q = s.query(here.as_deref());
-        let meaning = s.meaning;
-        self.spawn(move || {
-            if meaning {
-                return Msg::Found { tab: tab_id, pane: p, seq, res: crate::input::meaning_search(&words, 200) };
+        // more letters typed onto a search whose answer was complete (every match came back): filter those rows
+        // right here, no query, no wait
+        if !s.busy && s.ai.is_none() && plain_words(&words) && !s.done_words.is_empty() {
+            let (lw, dw) = (words.to_lowercase(), s.done_words.to_lowercase());
+            if lw.len() > dw.len() && lw.starts_with(&dw) && (s.total as usize) <= s.all.len() {
+                let ws: Vec<&str> = lw.split_whitespace().collect();
+                s.all.retain(|i| {
+                    let n = i.name.to_lowercase();
+                    ws.iter().all(|w| n.contains(w))
+                });
+                for i in s.all.iter_mut() {
+                    i.hl = match_ranges(&i.name, &words);
+                }
+                s.total = s.all.len() as u32;
+                s.done_words = words;
+                s.open.clear();
+                s.rearrange();
+                let pn = self.pane_mut();
+                pn.scroll = 0.0;
+                pn.sel.clear();
+                pn.focus = None;
+                pn.anchor = None;
+                self.invalidate();
+                return;
             }
-            let r = fmcore::evipc::query(&q, 300, fmcore::evipc::REQ_NAME | fmcore::evipc::REQ_PATH | fmcore::evipc::REQ_SIZE | fmcore::evipc::REQ_MODIFIED | fmcore::evipc::REQ_ATTRS, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(3));
-            let res = match r {
-                Ok(r) => Ok((
-                    r.total,
-                    r.items
+        }
+        s.busy = true;
+        s.own = own.clone();
+        s.open.clear();
+        let (junk, open) = (s.junk, s.open.clone());
+        let mut q = s.query_with(&here, &sp);
+        // a whole-PC search follows Settings > Search (a ticked-out folder's own row is dropped after the query)
+        let whole = s.pc || here.is_empty();
+        // hidden items stay out of search unless "Show hidden files" is on (also everything inside hidden folders,
+        // filtered below: Everything cannot ask about parents)
+        if !show_hidden {
+            // anything named with a dot (.vscode) or inside one (a path holding "\."); NOT attrib:H, which makes
+            // Everything read every match from disk when attributes are not indexed (0.7 s, or a time-out for "a").
+            // Hidden items go below, from the attributes the results already carry.
+            q += " !\\.";
+        }
+        // not for 1-2 letters: they match millions and are rarely the final word
+        let prefix = (plain_words(&words) && words.chars().count() >= 3).then(|| format!("startwith:{}{}", fmcore::evipc::quote(&words), &q[words.len().min(q.len())..]));
+        s.pending_words = words.clone();
+        self.spawn_search(tab_id, p, move || {
+            // the 200 newest matches (attributes are not indexed: every extra row is read from disk), then a fast
+            // second look (~20 ms) for names that START with the words: they rank best and may be older
+            let req = fmcore::evipc::REQ_NAME | fmcore::evipc::REQ_PATH | fmcore::evipc::REQ_SIZE | fmcore::evipc::REQ_MODIFIED | fmcore::evipc::REQ_ATTRS;
+            let mut r = fmcore::evipc::query(&q, 200, req, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(3));
+            if let (Ok(r1), Some(pq)) = (r.as_mut(), prefix.as_ref())
+                && r1.total as usize > r1.items.len()
+                && let Ok(r2) = fmcore::evipc::query(pq, 100, req, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(2))
+            {
+                let seen: HashSet<String> = r1.items.iter().map(|i| i.full().to_lowercase()).collect();
+                r1.items.extend(r2.items.into_iter().filter(|i| !seen.contains(&i.full().to_lowercase())));
+            }
+            let item = |name: String, path: PathBuf, folder: String, is_dir: bool, size: Option<u64>, modified: u64, attrs: u32| Item {
+                kind: crate::ficons::kind_of(&name, is_dir),
+                hl: match_ranges(&name, &words),
+                size: if is_dir { size.filter(|s| *s > 0) } else { size },
+                modified,
+                attrs,
+                folder,
+                is_dir,
+                name,
+                path,
+                recycled: None,
+                empty: false,
+            };
+            let res: Result<(u32, Vec<Item>), String> = match r {
+                Ok(r) => {
+                    let n = r.items.len();
+                    // folders read once per run of the app (each keystroke searches again)
+                    let mut cache = HIDDEN_DIRS.lock().unwrap();
+                    let items: Vec<Item> = r
+                        .items
                         .into_iter()
-                        .map(|i| Item {
-                            kind: crate::ficons::kind_of(&i.name, i.is_dir),
-                            path: PathBuf::from(i.full()),
-                            hl: match_ranges(&i.name, &words),
-                            size: if i.is_dir { i.size.filter(|s| *s > 0) } else { i.size },
-                            modified: i.modified,
-                            attrs: i.attrs,
-                            folder: i.path.clone(),
-                            is_dir: i.is_dir,
-                            name: i.name,
-                            recycled: None,
-                            empty: false,
-                        })
-                        .collect(),
-                )),
-                // Everything not running: the folder walk from fmcore (slower, this folder only)
+                        .filter(|i| !whole || sp.keeps(Path::new(&i.full())))
+                        .filter(|i| show_hidden || i.attrs & 0x2 == 0 && !i.name.starts_with('.') && !in_hidden_folder(Path::new(&i.path), &mut cache))
+                        .map(|i| item(i.name.clone(), PathBuf::from(i.full()), i.path.clone(), i.is_dir, i.size, i.modified, i.attrs))
+                        .collect();
+                    let gone = (n - items.len()) as u32;
+                    Ok((r.total.saturating_sub(gone), items))
+                }
+                // Everything not running: the folder walk from fmcore (slower, this place only: every real folder)
                 Err(_) => {
-                    let q = fmcore::search::Query { words: words.split_whitespace().map(|s| s.to_string()).collect(), in_dir: here.clone(), top: 300, engine: fmcore::search::Engine::Walk, walk_limit_ms: 3000, ..Default::default() };
-                    fmcore::search::search(&q).map(|f| {
-                        (
-                            f.hits.len() as u32,
-                            f.hits
-                                .into_iter()
-                                .map(|h| Item {
-                                    kind: crate::ficons::kind_of(&h.name, h.is_dir),
-                                    path: PathBuf::from(&h.path),
-                                    hl: match_ranges(&h.name, &words),
-                                    size: h.size,
-                                    modified: h.modified,
-                                    attrs: h.attrs,
-                                    folder: Path::new(&h.path).parent().map(|p| p.display().to_string()).unwrap_or_default(),
-                                    is_dir: h.is_dir,
-                                    name: h.name,
-                                    recycled: None,
-                                    empty: false,
-                                })
-                                .collect(),
-                        )
-                    })
+                    let mut all = vec![];
+                    let mut err = None;
+                    for dir in if here.is_empty() { vec![None] } else { here.iter().cloned().map(Some).collect() } {
+                        let q = fmcore::search::Query { words: words.split_whitespace().map(|s| s.to_string()).collect(), in_dir: dir, top: 300, engine: fmcore::search::Engine::Walk, walk_limit_ms: 3000, ..Default::default() };
+                        match fmcore::search::search(&q) {
+                            Ok(f) => all.extend(f.hits.into_iter().map(|h| {
+                                let folder = Path::new(&h.path).parent().map(|p| p.display().to_string()).unwrap_or_default();
+                                item(h.name.clone(), PathBuf::from(&h.path), folder, h.is_dir, h.size, h.modified, h.attrs)
+                            })),
+                            Err(e) => err = Some(e),
+                        }
+                    }
+                    match err {
+                        Some(e) if all.is_empty() => Err(e),
+                        _ => Ok((all.len() as u32, all)),
+                    }
                 }
             };
-            Msg::Found { tab: tab_id, pane: p, seq, res }
+            let rows = match &res {
+                Ok((_, all)) => crate::rank::arrange(all, &words, &own, junk, &open, fmcore::util::now_ft()),
+                Err(_) => vec![],
+            };
+            Msg::Found { tab: tab_id, pane: p, seq, res, rows, ai: None }
         });
     }
 
@@ -1170,7 +1312,6 @@ impl App {
 
     pub fn toast(&mut self, text: &str, bold: &str, undo: bool) {
         self.toast = Some(Toast { text: text.into(), bold: bold.into(), undo, err: false, at: Instant::now(), hover: false });
-        self.toast_ow = None;
         self.timer(T_TOAST, 500);
         self.anim();
         self.invalidate();
@@ -1267,21 +1408,26 @@ impl App {
                 }
                 self.sizes.insert(dir, sizes);
             }
-            Msg::Found { tab, pane, seq, res } => {
+            Msg::Found { tab, pane, seq, res, rows, ai } => {
                 let Some((t, p)) = self.find_pane(tab, pane) else { return };
                 let Some(s) = self.tabs[t].panes[p].search.as_mut() else { return };
                 if s.seq != seq {
                     return;
                 }
                 s.busy = false;
+                // the words this answer is for (a later keystroke may filter it locally)
+                s.done_words = if ai.is_none() && res.is_ok() { std::mem::take(&mut s.pending_words) } else { String::new() };
+                s.ai = ai;
                 match res {
                     Ok((total, items)) => {
                         s.total = total;
-                        s.items = items;
+                        s.all = items;
+                        s.items = rows;
                         s.note.clear();
                     }
                     Err(e) => {
                         s.items.clear();
+                        s.all.clear();
                         s.total = 0;
                         s.note = e;
                     }
@@ -1394,9 +1540,8 @@ impl App {
                     Err(e) => e,
                 });
             }
-            Msg::AiFlags { ai, meaning } => {
+            Msg::AiFlags { ai } => {
                 self.ai_on = ai;
-                self.meaning_on = meaning;
             }
             Msg::OpenWith { path, apps } => {
                 self.open_with = Some((path, apps));
@@ -1407,7 +1552,6 @@ impl App {
 
     pub fn refresh_ai_flags(&mut self) {
         self.ai_on = crate::ai::enabled();
-        self.meaning_on = crate::models::semsearch_enabled();
     }
 
     pub fn refresh_all(&mut self) {
@@ -1553,7 +1697,7 @@ impl App {
                         "rows": p.rows().len(),
                         "first_rows": p.rows().iter().take(12).map(|i| i.name.clone()).collect::<Vec<_>>(),
                         "selected": p.selected().iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
-                        "search": p.search.as_ref().map(|s| json!({"text": s.field.text, "this_pc": s.pc, "total": s.total, "busy": s.busy, "meaning": s.meaning, "note": s.note})),
+                        "search": p.search.as_ref().map(|s| json!({"text": s.field.text, "this_pc": s.pc, "total": s.total, "busy": s.busy, "note": s.note})),
                         "loading": p.loading, "error": p.error, "scroll": p.scroll,
                         "folder_sizes_known": p.items.iter().filter(|i| i.is_dir && i.size.is_some()).count(),
                         "back": p.back.len(), "forward": p.fwd.len(),
@@ -1593,7 +1737,7 @@ impl App {
             "surfaces": self.surfaces(),
             "size": [self.w, self.h], "rail": self.rail(),
             "drives": self.drives.len(), "sidebar": self.side.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
-            "ai_buttons": self.ai_on, "meaning_button": self.meaning_on,
+            "ai_buttons": self.ai_on,
             "first_paint_ms": self.first_paint_ms, "first_list_ms": self.first_list_ms,
             "last_error": self.last_error,
         })
@@ -1970,6 +2114,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_ACTIVATE => {
                 if (wp.0 & 0xFFFF) == 0 {
                     app.close_popups();
+                } else if app.assoc_stale {
+                    // back from Windows' app picker: a new default app brings its own file icons
+                    app.assoc_stale = false;
+                    app.refresh_type_icons();
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2148,6 +2296,10 @@ pub fn run(o: Opts) -> i32 {
             gfx,
             t,
             ui: uis,
+            sp: SearchPrefs::load(&cfg),
+            place_open: HashSet::new(),
+            place_kids: HashMap::new(),
+            place_rows: vec![],
             tabs: vec![],
             cur: 0,
             next_id: 0,
@@ -2194,6 +2346,7 @@ pub fn run(o: Opts) -> i32 {
             bmp_target: 0,
             thumb_q: Arc::new((Mutex::new(vec![]), Condvar::new())),
             icons: crate::sicons::Icons::default(),
+            assoc_stale: false,
             thumb_asked: HashSet::new(),
             sizes: HashMap::new(),
             sizes_busy: HashSet::new(),
@@ -2209,7 +2362,6 @@ pub fn run(o: Opts) -> i32 {
             recycle: vec![],
             set: SetState { ev_running: None, ev_total: 0, msg: None, msg_ok: false },
             ai_on: false,
-            meaning_on: false,
             open_with: None,
             started,
             first_paint_ms: None,
@@ -2221,11 +2373,11 @@ pub fn run(o: Opts) -> i32 {
             last_error: None,
             key_field: Field::default(),
             key_focus: false,
+            relay_fields: Default::default(),
+            relay_focus: 0,
             confirm: None,
             pending_rename: None,
             toast_job: None,
-            toast_ow: None,
-            own_defaults: fmcore::shell::own_defaults(),
             shot_hover: false,
             synthetic: false,
             done_seen: HashSet::new(),
@@ -2304,8 +2456,8 @@ pub fn run(o: Opts) -> i32 {
                 app.refresh_desk();
             }
         }
-        // AI and meaning-search switches read files: keep them off the first frame
-        app.spawn(|| Msg::AiFlags { ai: crate::ai::enabled(), meaning: crate::models::semsearch_enabled() });
+        // the AI switch reads files: keep it off the first frame
+        app.spawn(|| Msg::AiFlags { ai: crate::ai::enabled() });
         // thumbnails worker (newest request first)
         {
             {
@@ -2410,4 +2562,69 @@ fn os_build() -> u32 {
         RtlGetVersion(&mut v);
     }
     v.build
+}
+
+/// Is this folder, or any folder above it, hidden (hidden attribute or a dot name like .vscode)? Answers are cached
+/// per folder, so a search reads each folder's attributes once.
+pub fn in_hidden_folder(dir: &Path, cache: &mut HashMap<PathBuf, bool>) -> bool {
+    let mut chain = vec![];
+    let mut found = None;
+    for a in dir.ancestors() {
+        // the drive root itself carries hidden + system on some disks: it never counts
+        if a.parent().is_none() || a.as_os_str().is_empty() {
+            break;
+        }
+        if let Some(h) = cache.get(a) {
+            found = Some(*h);
+            break;
+        }
+        chain.push(a.to_path_buf());
+        let dot = a.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false);
+        // GetFileAttributesW reads the attributes without opening the folder (std::fs::metadata opens a handle)
+        let attrs = unsafe { windows::Win32::Storage::FileSystem::GetFileAttributesW(windows::core::PCWSTR(fmcore::util::wide(a.as_os_str()).as_ptr())) };
+        if dot || (attrs != u32::MAX && attrs & 0x2 != 0) {
+            found = Some(true);
+            break;
+        }
+    }
+    let h = found.unwrap_or(false);
+    // a hidden folder hides everything below it; a visible chain is visible all the way up
+    for c in chain {
+        cache.insert(c, h);
+    }
+    h
+}
+
+/// in_hidden_folder answers, kept for the whole run (a folder's hidden flag rarely changes)
+pub static HIDDEN_DIRS: std::sync::LazyLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl App {
+    /// File-type icons are made again (after a default app changed): the shell's own image list is reset and every
+    /// per-type icon in the cache is dropped, so the rows ask for them anew.
+    pub fn refresh_type_icons(&mut self) {
+        unsafe {
+            use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+            // FileIconInit(TRUE) (shell32 ordinal 660): the system image list reloads changed type icons
+            if let Ok(h) = GetModuleHandleW(windows::core::w!("shell32.dll"))
+                && let Some(f) = GetProcAddress(h, windows::core::PCSTR(660usize as *const u8))
+            {
+                let f: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+                f(1);
+            }
+        }
+        self.icons.done.retain(|k, _| !k.0.starts_with("e|"));
+        self.icons.asked.retain(|k| !k.0.starts_with("e|"));
+        self.invalidate();
+    }
+}
+
+/// One search job: (tab, pane), the work, where its message goes.
+type SearchJob = ((u64, usize), Box<dyn FnOnce() -> Msg + Send>, Arc<Mutex<Vec<Msg>>>, isize);
+/// The waiting searches (at most one per pane) for the single search thread.
+static SEARCH_SLOT: std::sync::LazyLock<(Mutex<Vec<SearchJob>>, Condvar)> = std::sync::LazyLock::new(|| (Mutex::new(vec![]), Condvar::new()));
+
+/// Words with no Everything syntax (no operators, wildcards, quotes, paths or field: terms): safe to filter locally
+/// and to use in a startwith: query.
+pub fn plain_words(w: &str) -> bool {
+    !w.is_empty() && !w.chars().any(|c| matches!(c, ':' | '|' | '!' | '"' | '*' | '?' | '<' | '>' | '/' | '\\'))
 }

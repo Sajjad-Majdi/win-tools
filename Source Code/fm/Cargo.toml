@@ -15,6 +15,10 @@ path = "src/bin/wfm.rs"
 
 # RustFileExplorer.exe: the file manager window (Win32 + Direct2D, no webview)
 [[bin]]
+name = "RustFileExplorerWinE"
+path = "src/bin/winkey.rs"
+
+[[bin]]
 name = "RustFileExplorer"
 path = "src/bin/wfiles/main.rs"
 

@@ -18,7 +18,7 @@ pub const MODEL: &str = "gemini-3.5-flash-lite";
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
 pub const GET_KEY_URL: &str = "https://aistudio.google.com/apikey";
 /// shown next to the switch in Settings
-pub const SENT_NOTE: &str = "When AI is on, \"What is this file?\" sends the file name, path, type, size and the first lines of a text file, and \"Suggest names\" sends only the file names, to Google Gemini with your key. It is asked only for file types the app does not know. Nothing is sent while AI is off.";
+pub const SENT_NOTE: &str = "Search in your own words, in any language: type what you need and press Shift+Enter (or AI Search). It sends your search words and the names, folders and dates of up to 60 files it finds to Google Gemini with your own key. Nothing is sent while it is off.";
 
 pub fn config_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("WinTools")
@@ -90,9 +90,73 @@ pub fn clear_key() -> Result<(), String> {
 }
 
 fn load_key() -> Option<String> {
+    saved_key().or_else(env_key)
+}
+
+fn saved_key() -> Option<String> {
     let blob = std::fs::read(key_path()).ok()?;
     let plain = dpapi(&blob, false).ok()?;
     String::from_utf8(plain).ok().filter(|k| !k.is_empty())
+}
+
+// ------------------------------------------------------------------------------------------------ relay
+/// A relay that keeps Google's paths, for places where Google is blocked: Settings (ai.json "relay_url",
+/// "relay_header"; the secret encrypted like the key in gemini-relay.key), else GEMINI_BASE_URL /
+/// GEMINI_RELAY_HEADER / GEMINI_RELAY_SECRET from the environment.
+pub struct Relay {
+    pub url: String,
+    pub header: String,
+    pub secret: Option<String>,
+}
+
+fn relay_secret_path() -> std::path::PathBuf {
+    config_dir().join("gemini-relay.key")
+}
+
+/// What Settings shows: (url, header, a secret is saved)
+pub fn relay_saved() -> (String, String, bool) {
+    let s = settings();
+    (s["relay_url"].as_str().unwrap_or("").to_string(), s["relay_header"].as_str().unwrap_or("").to_string(), relay_secret_path().is_file())
+}
+
+/// Save the relay (empty url = no relay). `secret`: None keeps the saved one, Some("") removes it.
+pub fn set_relay(url: &str, header: &str, secret: Option<&str>) -> Result<(), String> {
+    let url = url.trim().trim_end_matches('/');
+    if !url.is_empty() && !url.starts_with("https://") {
+        return Err("the relay address must start with https://".into());
+    }
+    let mut s = settings();
+    s["relay_url"] = json!(url);
+    s["relay_header"] = json!(header.trim());
+    std::fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(config_dir().join("ai.json"), serde_json::to_string_pretty(&s).unwrap()).map_err(|e| e.to_string())?;
+    match secret.map(str::trim) {
+        Some("") => {
+            let _ = std::fs::remove_file(relay_secret_path());
+        }
+        Some(sec) => std::fs::write(relay_secret_path(), dpapi(sec.as_bytes(), true)?).map_err(|e| e.to_string())?,
+        None => {}
+    }
+    Ok(())
+}
+
+fn relay() -> Option<Relay> {
+    let (url, header, _) = relay_saved();
+    if !url.is_empty() {
+        let secret = std::fs::read(relay_secret_path()).ok().and_then(|b| dpapi(&b, false).ok()).and_then(|p| String::from_utf8(p).ok()).filter(|s| !s.is_empty());
+        return Some(Relay { url, header: if header.is_empty() { "x-relay-secret".into() } else { header }, secret });
+    }
+    env("GEMINI_BASE_URL").map(|url| Relay { url, header: env("GEMINI_RELAY_HEADER").unwrap_or_else(|| "x-relay-secret".into()), secret: env("GEMINI_RELAY_SECRET") })
+}
+
+/// A key from the environment (GEMINI_API_KEY, else GEMINI_API_KEY_1), used when none is saved in Settings.
+fn env_key() -> Option<String> {
+    env("GEMINI_API_KEY").or_else(|| env("GEMINI_API_KEY_1"))
+}
+
+/// The key comes from the environment, not from Settings (for the Settings status line).
+pub fn key_from_env() -> bool {
+    saved_key().is_none() && env_key().is_some()
 }
 
 /// CryptProtectData / CryptUnprotectData for the current user.
@@ -190,13 +254,30 @@ fn gemini(key: &str, system: &str, prompt: &str, max_tokens: u32) -> Result<Stri
             "thinkingConfig": {"thinkingLevel": "minimal"}}
     })
     .to_string();
-    let headers = format!("Content-Type: application/json\r\nx-goog-api-key: {key}\r\n");
-    let (code, text) = http_post(ENDPOINT, &headers, &body, 40000)?;
+    let mut headers = format!("Content-Type: application/json\r\nx-goog-api-key: {key}\r\n");
+    // where Google is blocked (Iran): the relay from Settings, else from the environment (never in the code)
+    let endpoint = match relay() {
+        Some(r) => {
+            if let Some(secret) = &r.secret {
+                headers += &format!("{}: {secret}\r\n", r.header);
+            }
+            format!("{}/v1beta/models/{MODEL}:generateContent", r.url.trim_end_matches('/'))
+        }
+        None => ENDPOINT.to_string(),
+    };
+    let (mut code, mut text) = http_post(&endpoint, &headers, &body, 40000)?;
+    // "high demand" (503) is usually gone a moment later: one more try
+    if code == 503 {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        (code, text) = http_post(&endpoint, &headers, &body, 40000)?;
+    }
     if code != 200 {
         let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string())).unwrap_or_default();
         return Err(match code {
             400 if msg.to_lowercase().contains("api key") => "the API key is not valid".into(),
-            403 => format!("Gemini refused the request (HTTP 403{})", if msg.is_empty() { String::new() } else { format!(": {msg}") }),
+            // an HTML 403 with no message = Google blocks this region: a relay helps
+            403 if msg.is_empty() => "Google blocks Gemini from this region: add a relay in Settings > Search and AI".into(),
+            403 => format!("Gemini refused the request (HTTP 403: {msg})"),
             429 => "Free quota reached, try later.".into(),
             _ => format!("Gemini error HTTP {code}{}", if msg.is_empty() { String::new() } else { format!(": {msg}") }),
         });
@@ -321,4 +402,84 @@ pub fn suggest_names(paths: &[std::path::PathBuf], style: &str) -> Result<Vec<St
         return Err("the answer did not have one name per file".into());
     }
     Ok(names)
+}
+
+/// "AI Search" search: a request in plain words (any language) becomes up to three Everything queries that the app runs
+/// together. Only the request text, today's date and the user's folder paths are sent.
+pub fn search_queries(request: &str) -> Result<(Vec<String>, String), String> {
+    search_queries_with(request, None)
+}
+
+/// AI Search, second step: the request and the candidates found (name, folder, kind, date) go to Gemini, which
+/// returns the numbers of the ones that really match, best first, and a short note. This is what makes the search
+/// understand meaning instead of only words.
+pub fn pick_results(request: &str, cands: &[(String, String, bool, String)], key: Option<&str>) -> Result<(Vec<usize>, Vec<usize>, String), String> {
+    let list: Vec<String> = cands.iter().enumerate().map(|(i, (name, folder, dir, date))| format!("{i}. {}{name}  |  in {folder}  |  {date}", if *dir { "[folder] " } else { "" })).collect();
+    let system = r#"You pick files for a request. You get the request and numbered candidates (name | folder | date).
+Reply ONLY with JSON: {"best": [numbers of the best matches, best first, up to 15], "drop": [numbers that clearly do NOT fit], "note": "under 8 words, in the request's language"}.
+Judge by meaning, not by shared words: the folder tells what a file belongs to, the name tells what it is.
+If the exact thing is missing, the closest real things are the best (the program's exe and its folder for a
+missing installer, the project folder for its code). Drop only what clearly does not fit; when unsure, keep."#;
+    let prompt = format!("Request: {request}\nCandidates:\n{}", list.join("\n"));
+    let text = match key {
+        Some(k) => gemini(k, system, &prompt, 600)?,
+        None => complete(system, &prompt)?,
+    };
+    let v = clean_json(&text);
+    let nums = |k: &str| -> Vec<usize> { v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).filter(|i| *i < cands.len()).collect()).unwrap_or_default() };
+    Ok((nums("best"), nums("drop"), v["note"].as_str().unwrap_or("").to_string()))
+}
+
+/// `key`: a key for a test run (the saved key and the AI switch are used when None).
+pub fn search_queries_with(request: &str, key: Option<&str>) -> Result<(Vec<String>, String), String> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let today = {
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+    };
+    let system = format!(
+        r#"You turn a request for files or folders into Everything (voidtools) search queries.
+Reply ONLY with JSON: {{"queries": [3 to 5 strings], "core": "core name words", "note": "under 8 words, in the request's language"}}.
+Your queries gather CANDIDATES; a second step picks the right ones by meaning, so cast a wide net: synonyms,
+both English and Persian words, abbreviations, related names and folder names, each in its own query.
+Everything syntax: space = AND, and EVERY word must be part of the file or folder NAME; a|b = OR; !word = NOT;
+ext:pdf;docx (types); folder: or file:; size:>10mb; dm:today, dm:thisweek, dm:thismonth, dm:lastmonth, dm:thisyear
+(modified); "C:\some\folder\" (quoted, ending in a backslash) = only inside that folder. Never write folder:PATH.
+Rules for good queries:
+- Use 1 or 2 short distinctive name words per query (a title word, a brand, a project name). Never add generic
+  words that names rarely hold (my, the, of, source, code, installer, setup, video, movie, document), unless
+  they are part of a likely name ("file manager" is a project name, "file" alone is not).
+- Programs and games: their folder has the full title, their .exe often an abbreviation (Gears of War -> gow,
+  GoWEDay; Visual Studio Code -> code). Put title|abbreviation in EVERY query (gears|gow).
+- Projects and source code: search FOLDER names with the project words (e.g. file manager folder:), since code
+  files inside are named by their content, not by the project.
+- Express the kind of file with ext: (installers: ext:exe;msi;iso;zip;rar;7z, videos: ext:mp4;mkv;avi;mov;webm,
+  source code: ext:rs;py;js;ts;cs;cpp, documents: ext:pdf;docx;doc;txt;md, pictures: ext:jpg;jpeg;png;webp;heic).
+- Use | for spelling variants, abbreviations and the other language (gears|gow, film|movie, English|Persian word).
+- Query 1: the most precise (topic words + the asked kind). Query 2: the topic with RELATED kinds too (for a
+  game or program also ext:exe and folder:, for a film also its folder). Query 3: the BROAD fallback = only the
+  core name words, no ext:, no date (e.g. gears war). The user wants the nearest real thing when the exact one
+  does not exist (no installer on disk, but the game's exe or folder is there).
+- Also give "core": the core name words alone (e.g. "gears war"), used if every query finds nothing.
+- With no topic word (e.g. "videos downloaded this month"), use the kind + place + time, and core = "".
+Examples:
+"the installer of Gears of War" -> {{"queries": ["gears|gow ext:exe;msi;iso;zip;rar;7z", "gears|gow folder:|ext:exe", "gears|gow war"], "core": "gears war"}}
+"my rust file manager source code" -> {{"queries": ["\"file manager\" folder:", "\"file manager\" ext:rs;toml", "\"file manager\""], "core": "file manager"}}
+Today is {today}. User folders: Desktop {home}\Desktop, Downloads {home}\Downloads, Documents {home}\Documents,
+Pictures {home}\Pictures, Videos {home}\Videos, Music {home}\Music."#
+    );
+    let text = match key {
+        Some(k) => gemini(k, &system, request, 400)?,
+        None => complete(&system, request)?,
+    };
+    let v = clean_json(&text);
+    let qs: Vec<String> = v["queries"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(5).collect()).unwrap_or_default();
+    if qs.is_empty() {
+        return Err("the AI gave no search".into());
+    }
+    // the core name words go last: the caller runs them alone when every query finds nothing
+    let mut qs = qs;
+    let core: String = v["core"].as_str().unwrap_or("").split_whitespace().filter(|w| !w.contains(':')).collect::<Vec<_>>().join(" ");
+    qs.push(core);
+    Ok((qs, v["note"].as_str().unwrap_or("").to_string()))
 }

@@ -52,65 +52,14 @@ pub struct Handler {
     pub default: bool,
 }
 
-/// Our own default apps ("Always open .mp4 with PotPlayer", set in Rust File Explorer only; Windows' UserChoice is
-/// never touched). Kept in openwith.json in the data folder: extension -> (UI name, handler name).
-pub fn own_defaults() -> std::collections::BTreeMap<String, (String, String)> {
-    let v: serde_json::Value = std::fs::read_to_string(data_dir().join("openwith.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::Value::Null);
-    let mut m = std::collections::BTreeMap::new();
-    if let Some(o) = v.as_object() {
-        for (k, x) in o {
-            // {"label": what people see, "handler": the program / app id}; older files used "app" / "name"
-            let ui = x["label"].as_str().or(x["app"].as_str());
-            let name = x["handler"].as_str().or(x["name"].as_str());
-            if let (Some(ui), Some(name)) = (ui, name) {
-                m.insert(k.to_lowercase(), (ui.to_string(), name.to_string()));
-            }
-        }
-    }
-    m
-}
-
 /// ".mp4" style key for an extension or file name.
 pub fn ext_key(ext: &str) -> String {
     let e = ext.trim().trim_start_matches('.').to_lowercase();
     format!(".{e}")
 }
 
-/// Our own default for an extension: (UI name, handler name).
-pub fn own_default(ext: &str) -> Option<(String, String)> {
-    own_defaults().remove(&ext_key(ext))
-}
-
-/// Set (Some((ui name, handler name))) or clear (None) our own default for an extension.
-pub fn set_own_default(ext: &str, app: Option<(&str, &str)>) -> Res<()> {
-    let mut m = own_defaults();
-    match app {
-        Some((ui, name)) => {
-            m.insert(ext_key(ext), (ui.to_string(), name.to_string()));
-        }
-        None => {
-            m.remove(&ext_key(ext));
-        }
-    }
-    let o: serde_json::Map<String, serde_json::Value> = m.into_iter().map(|(k, (ui, name))| (k, serde_json::json!({"label": ui, "handler": name}))).collect();
-    let p = data_dir().join("openwith.json");
-    std::fs::create_dir_all(data_dir()).map_err(|e| format!("cannot create {}: {e}", data_dir().display()))?;
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&serde_json::Value::Object(o)).unwrap()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &p).map_err(|e| format!("cannot write {}: {e}", p.display()))
-}
-
-/// Open a file the way Rust File Explorer does: with our own default app for its type when one is set, else with the
-/// Windows default.
+/// Open a file with its Windows default app.
 pub fn open_file(path: &Path) -> Res<()> {
-    let ext = ext_of(&path.to_string_lossy());
-    if !ext.is_empty()
-        && path.is_file()
-        && let Some((_, name)) = own_default(&ext)
-        && open_with(path, &name).is_ok()
-    {
-        return Ok(());
-    }
     open(path)
 }
 
@@ -138,6 +87,25 @@ pub fn open_with_dialog(path: &Path, owner: isize) -> Res<()> {
     }
     let _c = com();
     let w = wide(path.as_os_str());
+    // Explorer's own "Choose another app": the shell's "openas" verb. Its dialog has "Always" (SHOpenWithDialog on
+    // Windows 11 shows only "Just once"), so the Windows default can really be set there.
+    {
+        let v = wide("openas");
+        let dir = path.parent().map(|p| wide(p.as_os_str())).unwrap_or_else(|| wide(""));
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: windows::Win32::UI::Shell::SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI,
+            hwnd: windows::Win32::Foundation::HWND(owner as *mut _),
+            lpVerb: PCWSTR(v.as_ptr()),
+            lpFile: PCWSTR(w.as_ptr()),
+            lpDirectory: PCWSTR(dir.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        if unsafe { ShellExecuteExW(&mut sei) }.is_ok() {
+            return Ok(());
+        }
+    }
     let info = OPENASINFO { pcszFile: PCWSTR(w.as_ptr()), pcszClass: PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC };
     let owner = (owner != 0).then_some(windows::Win32::Foundation::HWND(owner as *mut _));
     match unsafe { SHOpenWithDialog(owner, &info) } {
