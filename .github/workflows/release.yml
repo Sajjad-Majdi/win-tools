@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use crates.io directly (the local mirror config is for the developer's network)
+        shell: pwsh
+        run: |
+          Remove-Item -Force -ErrorAction SilentlyContinue "Source Code/app/.cargo/config.toml", "Source Code/fm/.cargo/config.toml"
+
+      - name: Rust toolchain (GNU, same as local builds; windres adds the icon and version info)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+          if (-not (Get-Command windres -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress
+            Add-Content $env:GITHUB_PATH "C:\ProgramData\mingw64\mingw64\bin"
+          }
+
+      - name: Build both apps and installers
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = "0.1.0" }
+          & "Source Code/tools/release.ps1" -Version $v -Online
+
+      - name: Upload to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem "Executables" -Filter *.exe | ForEach-Object { $_.FullName }
+          gh release view "${{ github.ref_name }}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ github.ref_name }}" $files --title "Win Tools ${{ github.ref_name }}" --notes-file "Source Code/installer/RELEASE-NOTES.txt"
+          } else {
+            gh release upload "${{ github.ref_name }}" $files --clobber
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-tools
+          path: Executables/*.exe
