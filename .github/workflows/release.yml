@@ -29,6 +29,11 @@ jobs:
             Add-Content $env:GITHUB_PATH "C:\ProgramData\mingw64\mingw64\bin"
           }
 
+      - name: NSIS (installer builder)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) { choco install nsis -y --no-progress }
+
       - name: Build both apps and installers
         shell: pwsh
         run: |
