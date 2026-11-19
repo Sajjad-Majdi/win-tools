@@ -127,7 +127,10 @@ pub struct Gfx {
     /// transparent clear (Mica shows through) when true
     pub alpha_target: bool,
     fa: Option<IDWriteFontCollection>,
-    icon_family: String,
+    pub icon_family: String,
+    /// corner radius factor: 1 = rounded, 0 = square (Personalize)
+    pub corner: f32,
+    xf: RefCell<Vec<windows_numerics::Matrix3x2>>,
 }
 
 impl Gfx {
@@ -147,7 +150,7 @@ impl Gfx {
                 c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).is_ok() && exists.as_bool()
             };
             let icon_family = if has("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.to_string();
-            Ok(Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, dpi: 96.0, alpha_target, fa: None, icon_family })
+            Ok(Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, dpi: 96.0, alpha_target, fa: None, icon_family, corner: 1.0, xf: RefCell::new(vec![]) })
         }
     }
 
@@ -172,6 +175,18 @@ impl Gfx {
 
     pub fn scale(&self) -> f32 {
         self.dpi / 96.0
+    }
+
+    /// Transparent (backdrop shows through) or opaque target; the target is made again on the next frame.
+    pub fn set_alpha(&mut self, on: bool) {
+        if self.alpha_target != on {
+            self.alpha_target = on;
+            self.rt = None;
+            self.base = None;
+            if self.over.is_none() {
+                self.brush = None;
+            }
+        }
     }
 
     pub fn ensure(&mut self, px_w: u32, px_h: u32) -> bool {
@@ -275,6 +290,7 @@ impl Gfx {
         if c.3 <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
+        let rad = self.rad(rad);
         unsafe { self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c)) };
     }
 
@@ -283,7 +299,13 @@ impl Gfx {
             return;
         }
         let r = r.inset(w / 2.0, w / 2.0);
+        let rad = self.rad(rad);
         unsafe { self.rt().DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c), w, None) };
+    }
+
+    /// Corner radius after the corner style (square keeps a 1 px softening only on big radii).
+    fn rad(&self, rad: f32) -> f32 {
+        if self.corner >= 1.0 { rad } else { (rad * self.corner).min(rad).max(if rad > 3.0 { 1.0 } else { 0.0 }) }
     }
 
     /// Soft drop shadow under a rounded card (a few widening translucent layers).
@@ -396,6 +418,31 @@ impl Gfx {
 
     pub fn translate(&self, dx: f32, dy: f32) {
         unsafe { self.rt().SetTransform(&windows_numerics::Matrix3x2::translation(dx, dy)) };
+    }
+
+    /// Scale by `k` around (cx, cy), then move by (dx, dy), on top of the current transform: press-scale and the
+    /// pop-in of menus. Undo with `pop_xf`.
+    pub fn push_scale(&self, cx: f32, cy: f32, k: f32, dx: f32, dy: f32) {
+        use windows_numerics::Matrix3x2 as M;
+        let mut cur = M::identity();
+        unsafe { self.rt().GetTransform(&mut cur) };
+        self.xf.borrow_mut().push(cur);
+        let l = M { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: cx - cx * k + dx, M32: cy - cy * k + dy };
+        // points go through l first, then the current transform
+        let m = M {
+            M11: l.M11 * cur.M11 + l.M12 * cur.M21,
+            M12: l.M11 * cur.M12 + l.M12 * cur.M22,
+            M21: l.M21 * cur.M11 + l.M22 * cur.M21,
+            M22: l.M21 * cur.M12 + l.M22 * cur.M22,
+            M31: l.M31 * cur.M11 + l.M32 * cur.M21 + cur.M31,
+            M32: l.M31 * cur.M12 + l.M32 * cur.M22 + cur.M32,
+        };
+        unsafe { self.rt().SetTransform(&m) };
+    }
+
+    pub fn pop_xf(&self) {
+        let m = self.xf.borrow_mut().pop().unwrap_or_else(windows_numerics::Matrix3x2::identity);
+        unsafe { self.rt().SetTransform(&m) };
     }
 
     pub fn reset_transform(&self) {

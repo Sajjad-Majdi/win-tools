@@ -1,5 +1,5 @@
 #!/bin/bash
-# Save a PNG of the open (hidden) Win Tools window: tools/shot.sh <name>  -> design/build/<name>.png
+# Save a PNG of the open (hidden) Rust Task Manager window: tools/shot.sh <name>  -> design/build/<name>.png
 cd "$(dirname "$0")/.."
 D="$(cygpath -w "$PWD/design/build")"; mkdir -p design/build
 app/target/release/wtm.exe gui shot "$D/$1.bmp" >/dev/null || exit 1

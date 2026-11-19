@@ -2,24 +2,141 @@
 use super::app::*;
 use super::gfx::{Align, C, Font, Rect};
 use super::model::{self, SortKey};
+use super::motion;
 use super::paint::Btn;
+use std::time::Instant;
+
+/// How long closing overlays take to fade out.
+const LEAVE_MS: f32 = 140.0;
 
 impl App {
-    pub fn paint_overlays(&mut self) {
-        if self.page == 0
-            && let Some((i, at)) = self.flyout
+    /// Notice overlays that were just closed and keep drawing them while they fade out.
+    pub fn track_ghosts(&mut self) {
+        if self.shooting {
+            return;
+        }
+        let now = Instant::now();
+        let mut started = false;
         {
-            self.paint_flyout(i, at);
+            let mut mo = self.mo.borrow_mut();
+            match (self.flyout, mo.last_flyout) {
+                (None, Some((i, at))) => {
+                    mo.ghost_flyout = Some((i, at, now));
+                    started = true;
+                }
+                (Some(_), _) => mo.ghost_flyout = None,
+                _ => {}
+            }
+            mo.last_flyout = self.flyout;
+            if self.menu.is_none() {
+                if let Some(m) = mo.last_menu.take() {
+                    mo.ghost_menu = Some((m, now));
+                    started = true;
+                }
+            } else {
+                mo.ghost_menu = None;
+                mo.last_menu = self.menu.clone();
+            }
+            if self.toast.is_none() {
+                if let Some(t) = mo.last_toast.take() {
+                    mo.ghost_toast = Some((t, now));
+                    started = true;
+                }
+            } else {
+                mo.ghost_toast = None;
+                mo.last_toast = self.toast.clone();
+            }
+            if self.dialog.is_none() {
+                if let Some(d) = mo.last_dialog.take() {
+                    mo.ghost_dialog = Some((d, now));
+                    started = true;
+                }
+            } else {
+                mo.ghost_dialog = None;
+                mo.last_dialog = self.dialog.clone();
+            }
+            if self.pane.is_none() {
+                if let Some((p, w)) = mo.last_pane.take() {
+                    mo.ghost_pane = Some((p, w, now));
+                    started = true;
+                }
+            } else {
+                mo.ghost_pane = None;
+                let w = self.pane.as_ref().map(|p| self.pane_w(p.kind)).unwrap_or(0.0);
+                mo.last_pane = self.pane.clone().map(|p| (p, w));
+            }
+        }
+        if started {
+            self.animate(LEAVE_MS as u64);
+        }
+    }
+
+    /// Progress 0..1 of a closing overlay (None when it is gone).
+    pub fn leaving(&self, at: Instant) -> Option<f32> {
+        let p = at.elapsed().as_secs_f32() * 1000.0 / LEAVE_MS;
+        if p >= 1.0 {
+            return None;
+        }
+        self.animate(30);
+        Some(motion::accel(p))
+    }
+
+    pub fn paint_overlays(&mut self) {
+        if self.page == 0 {
+            if let Some((i, at)) = self.flyout {
+                self.paint_flyout(i, at, None);
+            } else if let Some((i, at, closed)) = { self.mo.borrow().ghost_flyout } {
+                self.ghost(|a| a.paint_flyout(i, at, Some(closed)));
+            }
         }
         if self.page != 0 {
             let layer = Rect::new(12.0, TITLE_H, self.w - 24.0, self.h - TITLE_H - 12.0);
             self.paint_toast(layer);
         }
         if self.menu.is_some() {
-            self.paint_menu();
+            self.paint_menu(None);
+        } else if let Some((m, closed)) = { self.mo.borrow().ghost_menu.clone() } {
+            self.ghost(|a| {
+                a.menu = Some(m);
+                a.paint_menu(Some(closed));
+                a.menu = None;
+            });
         }
         if self.dialog.is_some() {
-            self.paint_dialog();
+            self.paint_dialog(None);
+        } else if let Some((d, closed)) = { self.mo.borrow().ghost_dialog.clone() } {
+            self.ghost(|a| {
+                a.dialog = Some(d);
+                a.paint_dialog(Some(closed));
+                a.dialog = None;
+            });
+        }
+    }
+
+    /// Draw something that is only fading out: it takes no clicks.
+    pub fn ghost(&mut self, f: impl FnOnce(&mut App)) {
+        let n = self.hits.len();
+        let (hover, pressed) = (self.hover, self.pressed);
+        self.hover = Hit::None;
+        self.pressed = Hit::None;
+        f(self);
+        self.hover = hover;
+        self.pressed = pressed;
+        self.hits.truncate(n);
+    }
+
+    /// Opacity and vertical offset of a popup: opening = fade in + spring down from -8 px; closing = fade out + lift.
+    fn pop_motion(&self, at: Instant, closed: Option<Instant>) -> Option<(f32, f32)> {
+        match closed {
+            None => {
+                let a = self.tween_in(at, motion::NORMAL, motion::decel);
+                let p = self.spring_in(at, motion::POP);
+                Some((a, -(1.0 - p) * 8.0))
+            }
+            Some(c) => {
+                let q = self.leaving(c)?;
+                Some((1.0 - q, -q * 4.0))
+            }
         }
     }
 
@@ -31,16 +148,24 @@ impl App {
     }
 
     // ------------------------------------------------------------------ performance flyout
-    fn paint_flyout(&mut self, i: u8, at: std::time::Instant) {
+    fn paint_flyout(&mut self, i: u8, at: Instant, closed: Option<Instant>) {
+        let Some((a, dy)) = self.pop_motion(at, closed) else {
+            self.mo.borrow_mut().ghost_flyout = None;
+            return;
+        };
+        let old = self.gfx.push_alpha(a);
+        self.gfx.push_move(0.0, dy);
+        self.paint_flyout_body(i);
+        self.gfx.pop_xf();
+        self.gfx.pop_alpha(old);
+    }
+
+    fn paint_flyout_body(&mut self, i: u8) {
         let t = self.t;
-        let p = self.anim(at, 167);
-        let dy = -(1.0 - p) * 8.0;
-        let r = Rect::new(12.0, 130.0 + dy, self.w - 24.0, 332.0);
+        let top = TITLE_H + if self.prefs.tiles { TILES_H } else { 0.0 } + 6.0;
+        let r = Rect::new(12.0, top, self.w - 24.0, 332.0);
         self.hit(r, Hit::Block);
         self.fly_card(r);
-        if p < 1.0 {
-            self.animate(40);
-        }
         let inner = r.inset(20.0, 18.0);
         let right_w = 232.0;
         let mid_w = 218.0;
@@ -254,7 +379,7 @@ impl App {
     }
 
     // ------------------------------------------------------------------ menus
-    fn paint_menu(&mut self) {
+    fn paint_menu(&mut self, closed: Option<Instant>) {
         let t = self.t;
         let Some(m) = &self.menu else { return };
         let (kind, mx, my, at) = (m.kind, m.x, m.y, m.at);
@@ -276,6 +401,10 @@ impl App {
             MenuKind::Sort => SortKey::MENU.iter().map(|s| (if *s == self.sort { 0xE73E } else { 0 }, s.label().to_string(), String::new(), false, true)).collect(),
             MenuKind::StartupSort => super::pages::STARTUP_SORT.iter().enumerate().map(|(i, s)| (if i as u8 == self.startup_sort { 0xE73E } else { 0 }, s.to_string(), String::new(), false, true)).collect(),
             MenuKind::Chips => self.chips().into_iter().skip(3).map(|c| (c.glyph, c.text, String::new(), false, true)).collect(),
+            MenuKind::DefSort => {
+                let cur = model::SortKey::parse(&self.prefs.sort);
+                SortKey::MENU.iter().map(|s| (if Some(*s) == cur { 0xE73E } else { 0 }, s.label().to_string(), String::new(), false, true)).collect()
+            }
         };
         let mw = match kind {
             MenuKind::Row => 248.0,
@@ -285,11 +414,14 @@ impl App {
         let mh = 8.0 + items.iter().map(|i| if i.3 { 9.0 + 32.0 } else { 32.0 }).sum::<f32>();
         let x = mx.min(self.w - mw - 8.0).max(8.0);
         let y = if my + mh > self.h - 8.0 { (my - mh).max(8.0) } else { my };
-        let p = self.anim(at, 167);
-        let r = Rect::new(x, y - (1.0 - p) * 8.0, mw, mh);
-        if p < 1.0 {
-            self.animate(40);
-        }
+        let Some((alpha, dy)) = self.pop_motion(at, closed) else {
+            self.mo.borrow_mut().ghost_menu = None;
+            return;
+        };
+        let old = self.gfx.push_alpha(alpha);
+        // menus grow from the point they were opened at
+        let up = my + mh > self.h - 8.0;
+        let r = Rect::new(x, y + if up { -dy } else { dy }, mw, mh);
         self.fly_card(r);
         let mut iy = r.y + 4.0;
         for (i, (gl, label, short, sep, enabled)) in items.iter().enumerate() {
@@ -315,23 +447,34 @@ impl App {
             iy += 32.0;
         }
         self.hit(r, Hit::Block);
+        self.gfx.pop_alpha(old);
     }
 
     // ------------------------------------------------------------------ confirm dialog
-    fn paint_dialog(&mut self) {
+    fn paint_dialog(&mut self, closed: Option<Instant>) {
         let t = self.t;
         let Some(d) = &self.dialog else { return };
         let (title, body, job, at) = (d.title.clone(), d.body.clone(), d.job.clone(), d.at);
-        let p = self.anim(at, 200);
-        self.gfx.fill(Rect::new(0.0, 0.0, self.w, self.h), t.smoke.fade(p));
+        // opening: smoke fades in, the dialog springs from 1.05 to 1; closing: both fade, the dialog shrinks a little
+        let (a, s) = match closed {
+            None => (self.tween_in(at, motion::NORMAL, motion::decel), 1.05 - 0.05 * self.spring_in(at, motion::POP)),
+            Some(c) => match self.leaving(c) {
+                Some(q) => (1.0 - q, 1.0 - 0.03 * q),
+                None => {
+                    self.mo.borrow_mut().ghost_dialog = None;
+                    return;
+                }
+            },
+        };
+        self.gfx.fill(Rect::new(0.0, 0.0, self.w, self.h), t.smoke.fade(a));
+        let old = self.gfx.push_alpha(a);
         self.hit(Rect::new(0.0, 0.0, self.w, self.h), Hit::Block);
         let w = 448.0;
         let bh = self.gfx.para_h(&body, w - 48.0, Font::Ui, 14.0, 400, 20.0);
         let ch = 24.0 + 28.0 + 12.0 + bh + 14.0 + 18.0 + 22.0;
         let h = ch + 80.0;
         let r = Rect::new(((self.w - w) / 2.0).round(), ((self.h - h) / 2.0).round(), w, h);
-        let s = 1.05 - 0.05 * p;
-        self.gfx.transform(Some((0.0, 0.0, s, r.cx(), r.cy())));
+        self.gfx.push_scale(r.cx(), r.cy(), s);
         self.gfx.shadow(r, 8.0, 32.0, 64.0, 0.22 * t.sh);
         self.gfx.shadow(r, 8.0, 2.0, 21.0, 0.12 * t.sh);
         self.gfx.fill_round(r, 8.0, t.fly);
@@ -364,24 +507,45 @@ impl App {
         self.button(Rect::new(x + bw + 8.0, by, bw, 32.0), "Wait", 0, Btn::Std, false, true, Hit::DlgWait);
         // default focus on "Wait"
         self.gfx.stroke_round(Rect::new(x + bw + 8.0 - 3.0, by - 3.0, bw + 6.0, 38.0), 6.0, t.t1.fade(0.0), 2.0);
-        self.gfx.transform(None);
-        if p < 1.0 {
-            self.animate(40);
-        }
+        self.gfx.pop_xf();
+        self.gfx.pop_alpha(old);
     }
 
     // ------------------------------------------------------------------ toasts
     pub fn paint_toast(&mut self, layer: Rect) {
+        if self.toast.is_some() {
+            self.paint_toast_at(layer, None);
+        } else if let Some((ts, closed)) = { self.mo.borrow().ghost_toast.clone() } {
+            self.ghost(|a| {
+                a.toast = Some(ts);
+                a.paint_toast_at(layer, Some(closed));
+                a.toast = None;
+            });
+        }
+    }
+
+    fn paint_toast_at(&mut self, layer: Rect, closed: Option<Instant>) {
         let t = self.t;
         let Some(ts) = &self.toast else { return };
         let (text, code, link, ok, at) = (ts.text.clone(), ts.code.clone(), ts.link.as_ref().map(|l| l.0.clone()), ts.ok, ts.at);
-        let p = self.anim(at, 200);
+        // rises 12 px with a spring and fades in; leaves by sinking 6 px and fading out
+        let (alpha, off) = match closed {
+            None => (self.tween_in(at, motion::NORMAL, motion::decel), (1.0 - self.spring_in(at, motion::POP)) * 12.0),
+            Some(c) => match self.leaving(c) {
+                Some(q) => (1.0 - q, q * 6.0),
+                None => {
+                    self.mo.borrow_mut().ghost_toast = None;
+                    return;
+                }
+            },
+        };
+        let old = self.gfx.push_alpha(alpha);
         let g = &self.gfx;
         let tw = g.measure(&text, Font::Ui, 13.0, 400);
         let cw = if code.is_empty() { 0.0 } else { g.measure(&code, Font::Mono, 12.0, 400) + 12.0 };
         let lw = link.as_ref().map(|l| g.measure(l, Font::Ui, 13.0, 600) + 12.0).unwrap_or(0.0);
         let w = (14.0 + 16.0 + 12.0 + tw + cw + lw + 12.0 + 1.0 + 6.0 + 32.0 + 6.0).ceil().min(layer.w - 40.0);
-        let r = Rect::new((layer.cx() - w / 2.0).round(), layer.b() - 28.0 - 44.0 + (1.0 - p) * 12.0, w, 44.0);
+        let r = Rect::new((layer.cx() - w / 2.0).round(), layer.b() - 28.0 - 44.0 + off, w, 44.0);
         self.fly_card(r);
         self.hit(r, Hit::Block);
         let g = &self.gfx;
@@ -396,8 +560,9 @@ impl App {
         }
         if let Some(l) = &link {
             let lr = Rect::new(x - 4.0, r.y + 8.0, lw - 4.0, 28.0);
-            if self.hover == Hit::ToastLink {
-                self.gfx.fill_round(lr, 4.0, t.acc_soft);
+            let hv = self.hov(Hit::ToastLink);
+            if hv > 0.0 {
+                self.gfx.fill_round(lr, 4.0, t.acc_soft.fade(hv));
             }
             self.gfx.text(l, lr, Font::Ui, 13.0, 600, Align::Center, t.acc_t);
             self.hit(lr, Hit::ToastLink);
@@ -410,5 +575,6 @@ impl App {
         self.gfx.glyph(0xE711, cr, 10.0, t.t2);
         self.hit(cr, Hit::ToastClose);
         let _ = C(0.0, 0.0, 0.0, 0.0);
+        self.gfx.pop_alpha(old);
     }
 }

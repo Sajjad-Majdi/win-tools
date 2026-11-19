@@ -149,10 +149,12 @@ openconsole.exe|Microsoft|w|Console host of Windows Terminal.|میزبان کن�
 bash.exe|Git / GNU|w|Bash shell (Git for Windows).|پوستهٔ Bash (Git for Windows).
 git.exe|Git|w|Git command.|دستور گیت.
 cargo.exe|Rust|w|Rust build tool.|ابزار ساخت Rust.
-wintask.exe|Win Tools|s|This Task Manager.|همین تسک منیجر.
-wtm.exe|Win Tools|s|Win Tools command line (for agents and scripts).|خط فرمان Win Tools برای ایجنت‌ها و اسکریپت‌ها.
-wfiles.exe|Win Tools|w|Win Tools Files, the file manager. Running copies stop if it is ended.|فایل منیجر Win Tools. کپی‌های در حال انجام متوقف می‌شوند.
-wfm.exe|Win Tools|s|Win Tools Files command line.|خط فرمان فایل منیجر Win Tools.
+rusttaskmanager.exe|Rust Task Manager|s|This Task Manager.|همین تسک منیجر.
+wintask.exe|Rust Task Manager|s|This Task Manager (before 0.2.0).|همین تسک منیجر (نسخهٔ قدیمی).
+wtm.exe|Rust Task Manager|s|Rust Task Manager command line (for agents and scripts).|خط فرمان Rust Task Manager برای ایجنت‌ها و اسکریپت‌ها.
+rustfileexplorer.exe|Rust File Explorer|w|Rust File Explorer, the file manager. Running copies stop if it is ended.|فایل منیجر Rust File Explorer. کپی‌های در حال انجام متوقف می‌شوند.
+wfiles.exe|Rust File Explorer|w|Rust File Explorer (before 0.2.0). Running copies stop if it is ended.|فایل منیجر Rust File Explorer (نسخهٔ قدیمی). کپی‌های در حال انجام متوقف می‌شوند.
+wfm.exe|Rust File Explorer|s|Rust File Explorer command line.|خط فرمان فایل منیجر Rust File Explorer.
 lockapp.exe|Microsoft|s|The lock screen.|صفحهٔ قفل ویندوز.
 searchapp.exe|Microsoft|s|Windows Search in the taskbar (older Windows 11 builds).|جست‌وجوی ویندوز در نوار وظیفه.
 gamebar.exe|Microsoft|s|Xbox Game Bar overlay.|نوار بازی ایکس‌باکس.
@@ -203,7 +205,7 @@ updater.exe|-|s|A program's updater. Check its path to see whose it is.|به‌�
 java.exe|Oracle / OpenJDK|w|A Java program. Check its command line.|یک برنامهٔ جاوا؛ خط فرمانش را ببینید.
 javaw.exe|Oracle / OpenJDK|w|A Java program without a console.|برنامهٔ جاوا بدون کنسول.
 rustc.exe|Rust|w|Rust compiler (a build is running).|کامپایلر Rust (یک ساخت در حال اجراست).
-llama-server.exe|llama.cpp|s|Local AI model server (Win Tools AI features).|سرور مدل هوش مصنوعی محلی.
+llama-server.exe|llama.cpp|s|Local AI model server (local AI features).|سرور مدل هوش مصنوعی محلی.
 ollama.exe|Ollama|s|Ollama local AI model server.|سرور مدل هوش مصنوعی Ollama.
 docker desktop.exe|Docker|w|Docker Desktop. Running containers stop.|داکر دسکتاپ. کانتینرها متوقف می‌شوند.
 vmmem|Microsoft|w|Memory of WSL or virtual machines. Ending it stops them.|حافظهٔ WSL یا ماشین‌های مجازی.

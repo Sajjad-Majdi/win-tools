@@ -1,6 +1,6 @@
 [package]
 name = "wintools"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -12,9 +12,9 @@ path = "src/lib.rs"
 name = "wtm"
 path = "src/bin/wtm.rs"
 
-# wintask.exe: the Task Manager window
+# RustTaskManager.exe: the Task Manager window
 [[bin]]
-name = "wintask"
+name = "RustTaskManager"
 path = "src/bin/wintask.rs"
 
 [dependencies]

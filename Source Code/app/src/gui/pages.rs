@@ -138,6 +138,9 @@ impl App {
         self.view_h[1] = view.h;
         self.clamp_scroll();
         self.gfx.clip(view);
+        if let Some(n) = order.iter().position(|&i| self.sel == Some(Sel::Startup(i))) {
+            self.sel_highlight(Rect::new(layer.x + 4.0, view.y + 4.0 - self.scroll[1], layer.w - 8.0, 48.0), (2 << 56) | order[n] as u64, n as f32 * 48.0, 0x6200);
+        }
         for (n, &i) in order.iter().enumerate() {
             let y = view.y + 4.0 + n as f32 * 48.0 - self.scroll[1];
             if y + 48.0 < view.y || y > view.b() {
@@ -146,9 +149,7 @@ impl App {
             let e = self.startup[i].clone();
             let r = Rect::new(layer.x + 4.0, y, layer.w - 8.0, 48.0);
             let h = Hit::StRow(i);
-            if self.sel == Some(Sel::Startup(i)) {
-                self.gfx.fill_round(r, 4.0, t.sel);
-            } else {
+            if self.sel != Some(Sel::Startup(i)) {
                 self.hp(r, 4.0, h);
             }
             self.hit(r, h);
@@ -203,7 +204,7 @@ impl App {
         self.gfx.card(card, 8.0, t.card, t.card_s);
         self.gfx.glyph(0xE7EF, Rect::new(lx + 16.0, y, 18.0, 64.0), 16.0, t.t1);
         self.gfx.text("Default Task Manager", Rect::new(lx + 48.0, y + 13.0, lw - 64.0, 18.0), Font::Ui, 13.0, 400, Align::Left, t.t1);
-        let now = if self.is_default { "Now: Win Tools Task Manager" } else { "Now: Windows Task Manager" };
+        let now = if self.is_default { "Now: Rust Task Manager" } else { "Now: Windows Task Manager" };
         self.gfx.text(now, Rect::new(lx + 48.0, y + 32.0, lw - 64.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t2);
         self.gfx.hline(lx + 1.0, lx + lw - 1.0, y + 64.0, t.line);
         let by = y + 64.0 + 10.0;
@@ -212,43 +213,90 @@ impl App {
         let rw = self.btn_w("Restore Windows Task Manager", 0, false);
         self.button(Rect::new(lx + 48.0 + sw + 14.0, by, rw, 32.0), "Restore Windows Task Manager", 0, Btn::Std, false, self.is_default, Hit::RestoreDefault);
         y = card.b();
-        // Look
+        // Personalize
         y += 18.0;
-        self.gfx.text_at("Look", lx, y, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
-        y += 20.0 + 8.0;
-        let card = Rect::new(lx, y, lw, 56.0 * 2.0);
+        self.gfx.text_at("Personalize", lx, y, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
+        y += 28.0;
+        let n = 8 + self.custom_open as usize;
+        let card = Rect::new(lx, y, lw, 56.0 * n as f32);
         self.gfx.card(card, 8.0, t.card, t.card_s);
-        let theme_sel = self.prefs.theme as usize;
-        let speed_sel = [500u64, 1000, 2000, 5000].iter().position(|v| *v == self.prefs.interval_ms).unwrap_or(1);
-        for (i, (g, label)) in [(0xE790u32, "Theme"), (0xE895, "Update speed")].iter().enumerate() {
-            let ry = y + i as f32 * 56.0;
-            if i > 0 {
-                self.gfx.hline(lx + 1.0, lx + lw - 1.0, ry, t.line);
-            }
-            self.gfx.glyph(*g, Rect::new(lx + 16.0, ry, 18.0, 56.0), 16.0, t.t1);
-            self.gfx.text_at(label, lx + 48.0, ry, 56.0, 200.0, Font::Ui, 13.0, 400, t.t1);
-            if i == 0 {
-                self.segmented(lx + lw - 16.0, ry + 28.0, &["System", "Light", "Dark"], theme_sel, 0);
-            } else {
-                self.segmented(lx + lw - 16.0, ry + 28.0, &["0.5 s", "1 s", "2 s", "5 s"], speed_sel, 1);
-            }
+        let right = lx + lw - 16.0;
+        let mut ry = y;
+        self.set_row(lx, lw, ry, false, 0xE790, "Theme", "");
+        self.segmented(right, ry + 28.0, &["System", "Light", "Dark"], self.prefs.theme as usize, 0);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE771, "Background", "");
+        self.segmented(right, ry + 28.0, &["Mica", "Mica Alt", "Acrylic", "Solid"], self.prefs.backdrop as usize, 3);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE81E, "Transparency", "");
+        self.segmented(right, ry + 28.0, &["Off", "Low", "Medium", "High"], self.prefs.transp as usize, 4);
+        ry += 56.0;
+        let acc_name = match self.prefs.accent {
+            None => "Windows".to_string(),
+            Some(rgb) => super::theme::PRESETS.iter().find(|p| p.1 == rgb).map(|p| p.0.to_string()).unwrap_or_else(|| format!("Custom · #{rgb:06X}")),
+        };
+        self.set_row(lx, lw, ry, true, 0xE8D3, "Accent color", &acc_name);
+        self.swatches(right, ry + 28.0);
+        ry += 56.0;
+        if self.custom_open {
+            self.custom_row(lx + 48.0, ry, right, lx, lw);
+            ry += 56.0;
         }
+        self.set_row(lx, lw, ry, true, 0xE8D2, "Text size", "");
+        self.segmented(right, ry + 28.0, &["Small", "Medium", "Large"], self.prefs.font as usize, 6);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE8A9, "Density", "");
+        self.segmented(right, ry + 28.0, &["Compact", "Comfortable"], self.prefs.density as usize, 5);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE739, "Corners", "");
+        self.segmented(right, ry + 28.0, &["Rounded", "Square"], self.prefs.corners as usize, 7);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE89F, "Side pane width", "");
+        self.segmented(right, ry + 28.0, &["Narrow", "Medium", "Wide"], self.prefs.pane as usize, 8);
         y = card.b();
         // Processes
         y += 18.0;
         self.gfx.text_at("Processes", lx, y, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
         y += 28.0;
-        let rows = [(0xE8FDu32, "Merge processes with the same name", self.prefs.merge), (0xE7BA, "Ask before ending an app that may lose work", self.prefs.ask_end), (0xE8EC, "Show PID column", self.prefs.show_pid)];
-        let card = Rect::new(lx, y, lw, 56.0 * rows.len() as f32);
+        let card = Rect::new(lx, y, lw, 56.0 * 7.0);
         self.gfx.card(card, 8.0, t.card, t.card_s);
-        for (i, (g, label, on)) in rows.iter().enumerate() {
-            let ry = y + i as f32 * 56.0;
-            if i > 0 {
-                self.gfx.hline(lx + 1.0, lx + lw - 1.0, ry, t.line);
-            }
-            self.gfx.glyph(*g, Rect::new(lx + 16.0, ry, 18.0, 56.0), 16.0, t.t1);
-            self.gfx.text_at(label, lx + 48.0, ry, 56.0, lw - 160.0, Font::Ui, 13.0, 400, t.t1);
-            self.toggle(lx + lw - 16.0, ry + 28.0, *on, Hit::Toggle(i as u8), true);
+        let mut ry = y;
+        let speed_sel = [500u64, 1000, 2000, 5000].iter().position(|v| *v == self.prefs.interval_ms).unwrap_or(1);
+        self.set_row(lx, lw, ry, false, 0xE895, "Refresh rate", "");
+        self.segmented(right, ry + 28.0, &["0.5 s", "1 s", "2 s", "5 s"], speed_sel, 1);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE8CB, "Default sort", "");
+        let label = model::SortKey::parse(&self.prefs.sort).map(|s| s.label()).unwrap_or("Impact");
+        let bw = (self.gfx.measure(label, Font::Ui, 13.0, 400) + 24.0 + 9.0 + 8.0).ceil();
+        let br = Rect::new(right - bw, ry + 12.0, bw, 32.0);
+        self.button(br, "", 0, Btn::Std, false, true, Hit::DefSort);
+        self.gfx.text_at(label, br.x + 12.0, br.y, 32.0, bw, Font::Ui, 13.0, 400, t.t1);
+        self.gfx.glyph(0xE70D, Rect::new(br.r() - 12.0 - 9.0, br.y + 1.0, 9.0, 32.0), 9.0, t.t2);
+        ry += 56.0;
+        self.set_row(lx, lw, ry, true, 0xE71D, "Columns", "");
+        let cols = [("Type", self.prefs.col_type), ("PID", self.prefs.show_pid), ("Disk", self.prefs.col_disk), ("Network", self.prefs.col_net), ("GPU", self.prefs.col_gpu)];
+        let ws: Vec<f32> = cols.iter().map(|c| (self.gfx.measure(c.0, Font::Ui, 12.5, 400) + 22.0).ceil()).collect();
+        let mut cx = right - ws.iter().sum::<f32>() - 6.0 * (cols.len() as f32 - 1.0);
+        for (i, (name, on)) in cols.iter().enumerate() {
+            let r = Rect::new(cx, ry + 15.0, ws[i], 26.0);
+            let h = Hit::ColPill(i as u8);
+            let k = self.fade(hid(1, h), *on);
+            let pressed = self.press_begin(r, h);
+            self.gfx.fill_round(r, 13.0, t.inp);
+            self.gfx.stroke_round(r, 13.0, t.ctl_s.fade(1.0 - k), 1.0);
+            self.gfx.fill_round(r, 13.0, t.acc.fade(k));
+            self.hp(r, 13.0, h);
+            self.gfx.text(name, r, Font::Ui, 12.5, 400, Align::Center, t.t1.mix(t.on_acc, k));
+            self.press_end(pressed);
+            self.hit(r, h);
+            cx += ws[i] + 6.0;
+        }
+        ry += 56.0;
+        let toggles = [(0xE9D2u32, "Show resource summary", self.prefs.tiles, 4u8), (0xE8EC, "Show attention chips", self.prefs.chips, 5), (0xE8FD, "Merge processes with the same name", self.prefs.merge, 0), (0xE7BA, "Ask before ending an app that may lose work", self.prefs.ask_end, 1)];
+        for (g, label, on, id) in toggles {
+            self.set_row(lx, lw, ry, true, g, label, "");
+            self.toggle(right, ry + 28.0, on, Hit::Toggle(id), true);
+            ry += 56.0;
         }
         y = card.b() + 20.0;
         // right column (below on narrow windows)
@@ -265,9 +313,10 @@ impl App {
                 self.gfx.hline(r.x, r.r(), r.y, t.line);
             }
             let h = Hit::CliCopy(i as u8);
-            let hov = self.hover == h;
-            if hov {
-                self.gfx.fill(Rect::new(r.x, r.y + if i > 0 { 1.0 } else { 0.0 }, r.w, r.h - if i > 0 { 1.0 } else { 0.0 }), t.hov);
+            let hv = self.hov(h);
+            let hov = hv > 0.5;
+            if hv > 0.0 {
+                self.gfx.fill(Rect::new(r.x, r.y + if i > 0 { 1.0 } else { 0.0 }, r.w, r.h - if i > 0 { 1.0 } else { 0.0 }), t.hov.fade(hv));
             }
             self.hit(r, h);
             let cw = self.gfx.text_at(cmd, r.x + 15.0, r.y, 34.0, cmd_w, Font::Mono, 12.0, 400, t.t1);
@@ -317,7 +366,7 @@ impl App {
         let fw = rw2 - 48.0 - 16.0 - sw_ - 8.0 - tw_ - 8.0;
         let fr = Rect::new(fx, ky + 12.0, fw, 32.0);
         let focus = self.key_focus;
-        self.gfx.fill_round(fr, 4.0, if self.hover == Hit::KeyField && !focus { t.ctl_h } else { t.inp });
+        self.gfx.fill_round(fr, 4.0, t.inp.mix(t.ctl_h, if focus { 0.0 } else { self.hov(Hit::KeyField) }));
         self.gfx.stroke_round(fr, 4.0, t.inp_s, 1.0);
         if focus {
             self.gfx.fill_round(Rect::new(fr.x + 1.0, fr.b() - 2.0, fr.w - 2.0, 2.0), 1.0, t.acc);
@@ -359,17 +408,13 @@ impl App {
         if self.key_saved && !self.key_testing {
             let w = self.gfx.measure("Remove", Font::Ui, 12.0, 600) + 8.0;
             let rr = Rect::new(sx - 4.0, sy - 3.0, w, 22.0);
-            if self.hover == Hit::KeyRemove {
-                self.gfx.fill_round(rr, 4.0, t.acc_soft);
-            }
+            self.gfx.fill_round(rr, 4.0, t.acc_soft.fade(self.hov(Hit::KeyRemove)));
             self.gfx.text("Remove", rr, Font::Ui, 12.0, 600, Align::Center, t.acc_t);
             self.hit(rr, Hit::KeyRemove);
         }
         let lw = self.gfx.measure("Get a free key", Font::Ui, 12.0, 600) + 8.0;
         let lr = Rect::new(fr.r() - lw + 4.0, sy - 3.0, lw, 22.0);
-        if self.hover == Hit::KeyLink {
-            self.gfx.fill_round(lr, 4.0, t.acc_soft);
-        }
+        self.gfx.fill_round(lr, 4.0, t.acc_soft.fade(self.hov(Hit::KeyLink)));
         self.gfx.text("Get a free key", lr, Font::Ui, 12.0, 600, Align::Center, t.acc_t);
         self.hit(lr, Hit::KeyLink);
         // row 3: answer language
@@ -386,5 +431,104 @@ impl App {
         self.clamp_scroll();
         self.gfx.unclip();
         self.scrollbar(view.inset(0.0, 4.0), 2);
+    }
+
+    /// One settings row: divider, glyph, label (and a second line in t2).
+    fn set_row(&mut self, lx: f32, lw: f32, ry: f32, divider: bool, glyph: u32, label: &str, sub: &str) {
+        let t = self.t;
+        if divider {
+            self.gfx.hline(lx + 1.0, lx + lw - 1.0, ry, t.line);
+        }
+        self.gfx.glyph(glyph, Rect::new(lx + 16.0, ry, 18.0, 56.0), 16.0, t.t1);
+        if sub.is_empty() {
+            self.gfx.text_at(label, lx + 48.0, ry, 56.0, lw - 160.0, Font::Ui, 13.0, 400, t.t1);
+        } else {
+            self.gfx.text_at(label, lx + 48.0, ry + 10.0, 18.0, 160.0, Font::Ui, 13.0, 400, t.t1);
+            self.gfx.text_at(sub, lx + 48.0, ry + 29.0, 16.0, 160.0, Font::Ui, 12.0, 400, t.t2);
+        }
+    }
+
+    /// Accent swatches, right edge at `right`: Windows accent, 8 presets, custom.
+    fn swatches(&mut self, right: f32, cy: f32) {
+        let t = self.t;
+        let dark = t.dark;
+        let custom = self.prefs.accent.filter(|a| !super::theme::PRESETS.iter().any(|p| p.1 == *a));
+        for i in 0..10u8 {
+            let cx = right - 12.0 - (9 - i) as f32 * 30.0;
+            let col = match i {
+                0 => super::theme::system_accent(dark),
+                1..=8 => {
+                    let (l, d) = super::theme::accent_pair(super::theme::PRESETS[i as usize - 1].1);
+                    if dark { d } else { l }
+                }
+                _ => t.acc,
+            };
+            let sel = match i {
+                0 => self.prefs.accent.is_none(),
+                1..=8 => self.prefs.accent == Some(super::theme::PRESETS[i as usize - 1].1),
+                _ => custom.is_some() || self.custom_open,
+            };
+            let h = Hit::Accent(i);
+            let r = Rect::new(cx - 14.0, cy - 14.0, 28.0, 28.0);
+            let hv = self.hov(h);
+            let k = self.fade(hid(1, h), sel);
+            let pressed = self.press_begin(r, h);
+            if k > 0.0 {
+                self.gfx.ellipse(cx, cy, 13.0, t.t1.fade(k), false, 2.0);
+            }
+            let rad = 10.0 - 1.5 * k + 1.0 * hv * (1.0 - k);
+            if i == 9 && custom.is_none() {
+                self.gfx.ellipse(cx, cy, rad, t.track, true, 0.0);
+                self.gfx.glyph(0xE710, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 10.0, t.t2);
+            } else {
+                self.gfx.ellipse(cx, cy, rad, col, true, 0.0);
+                if i == 0 {
+                    // the Windows accent: a small window mark
+                    self.gfx.glyph(0xE782, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 9.0, t.on_acc.fade(0.9));
+                } else if i == 9 {
+                    self.gfx.glyph(0xE70F, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 9.0, t.on_acc);
+                }
+            }
+            self.press_end(pressed);
+            self.hit(r, h);
+        }
+    }
+
+    /// Settings > Accent > Custom: hue strip and hex field.
+    fn custom_row(&mut self, x: f32, ry: f32, right: f32, lx: f32, lw: f32) {
+        let t = self.t;
+        self.gfx.hline(lx + 1.0, lx + lw - 1.0, ry, t.line);
+        let fw = 104.0;
+        let hr = Rect::new(x, ry + 21.0, (right - fw - 16.0 - x).max(60.0), 14.0);
+        self.hue_rect = hr;
+        let n = 36;
+        for i in 0..n {
+            let seg = Rect::new(hr.x + hr.w * i as f32 / n as f32, hr.y, hr.w / n as f32 + 0.6, hr.h);
+            let c = super::theme::from_hsl(i as f32 * 360.0 / n as f32, 0.78, if t.dark { 0.62 } else { 0.45 });
+            self.gfx.fill(seg, c);
+        }
+        self.gfx.stroke_round(hr, 0.0, t.card_s, 1.0);
+        let hue = self.prefs.accent.map(super::theme::hue_of).unwrap_or(206.0);
+        let kx = hr.x + hr.w * hue / 359.0;
+        let (gx, _) = self.glide(0x6300, kx, super::motion::GLIDE);
+        self.gfx.fill_round(Rect::new(gx - 3.0, hr.y - 4.0, 6.0, hr.h + 8.0), 3.0, t.card);
+        self.gfx.stroke_round(Rect::new(gx - 3.0, hr.y - 4.0, 6.0, hr.h + 8.0), 3.0, t.t1, 1.5);
+        self.hit(hr.inset(0.0, -6.0), Hit::Hue);
+        // hex field
+        let fr = Rect::new(right - fw, ry + 12.0, fw, 32.0);
+        let focus = self.hex_focus;
+        self.gfx.fill_round(fr, 4.0, t.inp.mix(t.ctl_h, if focus { 0.0 } else { self.hov(Hit::HexField) }));
+        self.gfx.stroke_round(fr, 4.0, t.inp_s, 1.0);
+        if focus {
+            self.gfx.fill_round(Rect::new(fr.x + 1.0, fr.b() - 2.0, fr.w - 2.0, 2.0), 1.0, t.acc);
+        } else {
+            self.gfx.fill(Rect::new(fr.x + 3.0, fr.b() - 1.0, fr.w - 6.0, 1.0), t.inp_b);
+        }
+        let shown = if self.hex_buf.is_empty() { self.prefs.accent.map(|a| format!("#{a:06X}")).unwrap_or_default() } else { self.hex_buf.clone() };
+        let tw = self.gfx.text_at(&shown, fr.x + 10.0, fr.y, 32.0, fw - 20.0, Font::Mono, 12.5, 400, t.t1);
+        if focus {
+            self.gfx.fill(Rect::new(fr.x + 10.0 + tw + 1.0, fr.y + 8.0, 1.0, 16.0), t.t1);
+        }
+        self.hit(fr, Hit::HexField);
     }
 }

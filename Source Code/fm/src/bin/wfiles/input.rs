@@ -20,12 +20,51 @@ impl App {
     // ------------------------------------------------------------------ helpers
     pub fn close_popups(&mut self) {
         let any = self.menu.is_some() || self.drop.is_some() || self.sub.is_some();
-        self.menu = None;
-        self.drop = None;
-        self.sub = None;
+        self.retire_menu();
+        if let Some(d) = self.sub.take() {
+            self.drop_out = Some((d, true, Instant::now()));
+        }
+        if let Some(d) = self.drop.take() {
+            self.drop_out = Some((d, false, Instant::now()));
+        }
         if any {
+            self.anim();
             self.invalidate();
         }
+    }
+
+    /// Close the context menu with its short fade-out.
+    pub fn retire_menu(&mut self) {
+        if let Some(m) = self.menu.take() {
+            self.menu_out = Some((m, Instant::now()));
+            self.anim();
+        }
+        if let Some(d) = self.sub.take() {
+            self.drop_out = Some((d, true, Instant::now()));
+        }
+    }
+
+    /// Ctrl / Shift now (a test drag can set them without touching the real keyboard).
+    pub fn key_mods(&self) -> (bool, bool) {
+        if let Some(m) = self.test_mods {
+            return m;
+        }
+        let (c, s, _) = mods();
+        (c, s)
+    }
+
+    /// The hovered target changed: start the hover fades.
+    fn set_hover(&mut self, h: Hit) {
+        self.hover = h;
+        let key = if self.nc_hover != Hit::None { Some(self.nc_hover) } else if h == Hit::None || h == Hit::Block || matches!(h, Hit::ListBg(_)) { None } else { Some(h) };
+        self.hov_f.only(key);
+        self.anim();
+    }
+
+    pub fn nc_hover_changed(&mut self) {
+        let key = if self.nc_hover != Hit::None { Some(self.nc_hover) } else { None };
+        self.hov_f.only(key);
+        self.anim();
     }
 
     fn sel_items(&self) -> Vec<Item> {
@@ -99,12 +138,17 @@ impl App {
                     }
                     self.invalidate();
                 }
-                9 => {
+                T_CARET => {
                     self.caret_on = !self.caret_on;
-                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() {
+                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.accent_field.is_some() {
                         self.invalidate();
+                    } else {
+                        // nothing to blink: no timer at all while idle
+                        let _ = KillTimer(Some(self.hwnd), T_CARET);
+                        self.caret_timer = false;
                     }
                 }
+                T_MARQ => self.marquee_tick(),
                 _ => {}
             }
         }
@@ -355,15 +399,6 @@ impl App {
                 let r = Rect::new(self.mx, self.my, 1.0, 1.0);
                 self.open_drop(DropKind::Sort, r, 200.0);
             }
-            Act::More => {
-                let r = self.hits.iter().find(|h| h.1 == Hit::Pill(5)).map(|h| h.0).unwrap_or(Rect::new(self.w / 2.0, self.h - 90.0, 36.0, 36.0));
-                // "More" = the full right-click menu above the pill
-                self.context_menu(r.x - 120.0, r.y - 8.0, false);
-                let h = self.menu_rect().map(|x| x.h).unwrap_or(400.0);
-                if let Some(m2) = self.menu.as_mut() {
-                    m2.y = (r.y - 8.0 - h).max(TITLE_H);
-                }
-            }
             Act::Transfers => self.xfer_open = !self.xfer_open,
             Act::Palette => self.palette_open(""),
             Act::Refresh => self.refresh_all(),
@@ -420,7 +455,7 @@ impl App {
 
     pub fn save_ui(&self) {
         let mut cfg = fmcore::pins::config();
-        cfg["ui"] = json!({"theme": self.ui.theme, "folder_sizes": self.ui.sizes, "extensions": self.ui.ext, "hidden": self.ui.hidden, "ask_delete": self.ui.ask_delete, "scope_pc": self.ui.scope_pc});
+        cfg["ui"] = json!({"theme": self.look.theme, "folder_sizes": self.ui.sizes, "extensions": self.ui.ext, "hidden": self.ui.hidden, "ask_delete": self.ui.ask_delete, "scope_pc": self.ui.scope_pc});
         let _ = fmcore::pins::save_config(&cfg);
     }
 
@@ -519,6 +554,41 @@ impl App {
     pub fn mouse_move(&mut self, x: f32, y: f32, down: bool) {
         self.mx = x;
         self.my = y;
+        if let Some((x0, w0)) = self.side_drag {
+            self.look.side_w = (w0 + x - x0).clamp(crate::look::SIDE_MIN, crate::look::SIDE_MAX);
+            self.invalidate();
+            return;
+        }
+        if let Some((k, x0, w0)) = self.col_drag {
+            // columns are anchored on the right: dragging a divider left makes the column on its right wider
+            let w = (w0 + x0 - x).clamp(crate::look::COL_MIN, crate::look::COL_MAX);
+            match k {
+                0 => self.look.w_date = w,
+                1 => self.look.w_type = w,
+                _ => self.look.w_size = w,
+            }
+            self.invalidate();
+            return;
+        }
+        if self.marquee.is_some() {
+            if let Some(m) = self.marquee.as_mut() {
+                m.x1 = x;
+                m.y1 = y;
+            }
+            self.marquee_update();
+            self.marquee_edge();
+            self.invalidate();
+            return;
+        }
+        if down
+            && self.press_ws
+            && let Some((x0, y0, p, _)) = self.press
+            && ((x - x0).abs() > 4.0 || (y - y0).abs() > 4.0)
+        {
+            self.marquee_start(p, x0, y0);
+            self.mouse_move(x, y, down);
+            return;
+        }
         if let Some((p, y0, s0)) = self.drag_scroll {
             let t = self.cur;
             let g = pane_geoms(self, t)[p];
@@ -530,6 +600,7 @@ impl App {
             return;
         }
         if down
+            && !self.press_ws
             && let Some((x0, y0, p, i)) = self.press
             && ((x - x0).abs() > 5.0 || (y - y0).abs() > 5.0)
         {
@@ -553,18 +624,21 @@ impl App {
         }
         if self.nc_hover != Hit::None {
             self.nc_hover = Hit::None;
+            self.nc_hover_changed();
         }
         let h = self.hit_at(x, y);
         if h != self.hover {
-            self.hover = h;
+            self.set_hover(h);
             // submenus open on hover
             if let Hit::MenuItem(i) = h
                 && let Some(m) = &self.menu
                 && m.items.get(i).map(|it| it.sub).unwrap_or(false)
             {
                 self.open_sub(i);
-            } else if let Hit::MenuItem(_) = h {
-                self.sub = None;
+            } else if let Hit::MenuItem(_) = h
+                && let Some(d) = self.sub.take()
+            {
+                self.drop_out = Some((d, true, Instant::now()));
             }
             if let Some(t) = self.toast.as_mut() {
                 t.hover = matches!(h, Hit::Toast(_)) || matches!(h, Hit::Block) && t.hover;
@@ -578,9 +652,125 @@ impl App {
     }
 
     pub fn mouse_up(&mut self, _x: f32, _y: f32) {
+        if self.side_drag.take().is_some() || self.col_drag.take().is_some() {
+            self.save_look();
+        }
+        if self.marquee.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_MARQ);
+            }
+        } else if self.press_ws
+            && let Some((_, _, p, i)) = self.press
+            && i != usize::MAX
+        {
+            // a click (no drag) on the empty part of a row selects that row
+            let (c, sh) = self.key_mods();
+            self.select_row(p, i, c, sh);
+        }
+        self.press_ws = false;
         self.press = None;
         self.drag_scroll = None;
         self.pressed = Hit::None;
+        self.press_f.only(None);
+        self.anim();
+        self.invalidate();
+    }
+
+    // ------------------------------------------------------------------ rubber-band selection
+    fn marquee_start(&mut self, p: usize, x0: f32, y0: f32) {
+        let t = self.cur;
+        let g = pane_geoms(self, t)[p];
+        let (c, sh) = self.key_mods();
+        let pane = &mut self.tabs[t].panes[p];
+        let base = if c || sh { pane.sel.clone() } else { Default::default() };
+        if !(c || sh) {
+            pane.sel.clear();
+        }
+        pane.kb = false;
+        let scroll = pane.scroll;
+        self.marquee = Some(Marquee { pane: p, x0, y0: y0 - g.list.y + scroll, x1: x0, y1: y0, base, ctrl: c, shift: sh });
+        self.press = None;
+        self.press_ws = false;
+        self.close_popups();
+    }
+
+    /// Select what the rectangle touches: Ctrl toggles against the old selection, Shift adds to it.
+    fn marquee_update(&mut self) {
+        let Some(m) = self.marquee.as_ref() else { return };
+        let (p, t) = (m.pane, self.cur);
+        if p >= self.tabs[t].panes.len() {
+            return;
+        }
+        let g = pane_geoms(self, t)[p];
+        let scroll = self.tabs[t].panes[p].scroll;
+        let (ax, ay, bx, by) = (m.x0, m.y0, m.x1, m.y1 - g.list.y + scroll);
+        let r = Rect::new(ax.min(bx), ay.min(by), (ax - bx).abs().max(1.0), (ay - by).abs().max(1.0));
+        let n = self.tabs[t].panes[p].rows().len();
+        let mut touched = vec![];
+        for i in 0..n {
+            let ir = crate::paint::item_rect(self, t, p, i);
+            if ir.intersects(&r) {
+                touched.push(i);
+            }
+        }
+        let (base, ctrl) = (m.base.clone(), m.ctrl);
+        let pane = &mut self.tabs[t].panes[p];
+        let paths: Vec<PathBuf> = touched.iter().filter_map(|i| pane.rows().get(*i).map(|x| x.path.clone())).collect();
+        let mut sel = base.clone();
+        for path in paths {
+            if ctrl && base.contains(&path) {
+                sel.remove(&path);
+            } else {
+                sel.insert(path);
+            }
+        }
+        pane.sel = sel;
+        if let Some(&f) = touched.last() {
+            pane.focus = Some(f);
+            if pane.anchor.is_none() || !m.shift {
+                pane.anchor = touched.first().copied();
+            }
+        }
+    }
+
+    /// Auto-scroll while the pointer is near or past the top / bottom of the list.
+    fn marquee_edge(&mut self) {
+        let Some(m) = self.marquee.as_ref() else { return };
+        let g = pane_geoms(self, self.cur)[m.pane];
+        let near = m.y1 < g.list.y + 24.0 || m.y1 > g.list.b() - 24.0;
+        if near {
+            self.timer(T_MARQ, 16);
+        } else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_MARQ);
+            }
+        }
+    }
+
+    fn marquee_tick(&mut self) {
+        let Some(m) = self.marquee.as_ref() else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_MARQ);
+            }
+            return;
+        };
+        let (p, t) = (m.pane, self.cur);
+        let g = pane_geoms(self, t)[p];
+        let y = m.y1;
+        // speed grows with the distance past the edge band
+        let v = if y < g.list.y + 24.0 { -((g.list.y + 24.0 - y) * 0.6).clamp(2.0, 40.0) } else if y > g.list.b() - 24.0 { ((y - g.list.b() + 24.0) * 0.6).clamp(2.0, 40.0) } else { 0.0 };
+        if v == 0.0 {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_MARQ);
+            }
+            return;
+        }
+        let max = (content_h(self, t, p) - g.list.h).max(0.0);
+        let pane = &mut self.tabs[t].panes[p];
+        pane.scroll = (pane.scroll + v).clamp(0.0, max);
+        pane.sf.set(pane.scroll);
+        pane.sf_written = pane.scroll;
+        self.marquee_update();
         self.invalidate();
     }
 
@@ -612,11 +802,19 @@ impl App {
         let geoms = pane_geoms(self, t);
         for (p, g) in geoms.iter().enumerate() {
             if g.all.has(x, y) || self.pane().loc == Loc::Settings {
+                let max = if self.pane().loc == Loc::Settings { (self.settings_h - crate::paint::content_rect(self).h).max(0.0) } else { (content_h(self, t, p) - g.list.h).max(0.0) };
                 let pane = &mut self.tabs[t].panes[p];
-                pane.scroll = (pane.scroll - d / 120.0 * 96.0).max(0.0);
+                // each notch adds to where the list is heading, so fast wheeling builds speed; it eases into place
+                let from = if pane.sf.settled() { pane.scroll } else { pane.sf.target };
+                if pane.sf.settled() {
+                    pane.sf.set(pane.scroll);
+                }
+                pane.sf.to((from - d / 120.0 * 110.0).clamp(0.0, max));
+                pane.sf_written = pane.scroll;
                 break;
             }
         }
+        self.anim();
         self.invalidate();
     }
 
@@ -647,7 +845,7 @@ impl App {
             Hit::Tab(i) => {
                 self.cur = i;
             }
-            _ => self.menu = None,
+            _ => self.retire_menu(),
         }
         self.invalidate();
     }
@@ -655,6 +853,11 @@ impl App {
     pub fn mouse_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool, dbl: bool) {
         let h = self.hit_at(x, y);
         self.pressed = h;
+        self.press_ws = false;
+        if !matches!(h, Hit::None | Hit::Block | Hit::ListBg(_)) {
+            self.press_f.only(Some(h));
+            self.anim();
+        }
         // clicks outside a popup close it
         let in_menu = matches!(h, Hit::MenuItem(_) | Hit::MenuQuick(_) | Hit::SubItem(_) | Hit::Drop(_)) || (matches!(h, Hit::Block) && (self.menu_rect().map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(false).map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(true).map(|r| r.has(x, y)).unwrap_or(false)));
         if !in_menu && (self.menu.is_some() || self.drop.is_some()) {
@@ -695,6 +898,9 @@ impl App {
         }
         if self.key_focus && h != Hit::Set(15) && h != Hit::Set(16) {
             self.key_focus = false;
+        }
+        if self.accent_field.is_some() && !matches!(h, Hit::Set(50) | Hit::Set(51)) {
+            self.accent_commit();
         }
         if self.path_edit.is_some() && h != Hit::Omni {
             self.path_edit = None;
@@ -750,10 +956,31 @@ impl App {
             Hit::New => self.act(Act::NewMenu),
             Hit::ViewBtn => self.act(Act::ViewMenu),
             Hit::Side(i) => self.side_click(i),
+            Hit::SideThisPc => self.go(Loc::ThisPc),
             Hit::SideSettings => self.open_settings(),
+            Hit::SideEdge => {
+                if dbl {
+                    self.look.side_w = 232.0;
+                    self.save_look();
+                } else {
+                    self.side_drag = Some((x, self.look.side_w));
+                }
+            }
+            Hit::ColEdge(p, k) => {
+                if dbl {
+                    self.autofit_col(p, k);
+                } else {
+                    let w = match k {
+                        0 => self.look.w_date,
+                        1 => self.look.w_type,
+                        _ => self.look.w_size,
+                    };
+                    self.col_drag = Some((k, x, w));
+                }
+            }
             Hit::Header(p, c) => {
                 let pane = &mut self.tab_mut().panes[p];
-                let col = [SortCol::Name, SortCol::Date, SortCol::Size][c as usize];
+                let col = [SortCol::Name, SortCol::Date, SortCol::Size, SortCol::Type][c as usize % 4];
                 pane.sort = if pane.sort.0 == col { (col, !pane.sort.1) } else { (col, col != SortCol::Name) };
                 pane.sort_items();
             }
@@ -774,6 +1001,11 @@ impl App {
                     if let Some(it) = self.tab().panes[p].rows().get(i).cloned() {
                         self.open_item(&it, ctrl);
                     }
+                } else if self.on_whitespace(p, i, x) {
+                    // the empty part of a row: a drag here draws the selection rectangle; a click selects the row
+                    self.tab_mut().panes[p].kb = false;
+                    self.press = Some((x, y, p, i));
+                    self.press_ws = true;
                 } else {
                     let path = self.tab().panes[p].rows().get(i).map(|x| x.path.clone());
                     let already = path.as_ref().map(|x| self.tab().panes[p].sel.contains(x)).unwrap_or(false);
@@ -788,8 +1020,12 @@ impl App {
             }
             Hit::ListBg(p) => {
                 self.tab_mut().active = p;
-                if !ctrl {
+                if !ctrl && !shift {
                     self.tab_mut().panes[p].sel.clear();
+                }
+                if self.pane().loc != Loc::Settings {
+                    self.press = Some((x, y, p, usize::MAX));
+                    self.press_ws = true;
                 }
             }
             Hit::PaneHead(p) => self.tab_mut().active = p,
@@ -797,19 +1033,6 @@ impl App {
                 let s = self.tab().panes[p].scroll;
                 self.drag_scroll = Some((p, y, s));
             }
-            Hit::Pill(id) => match id {
-                0 => self.act(Act::Copy),
-                1 => self.act(Act::Cut),
-                2 => self.act(Act::Rename),
-                3 => self.act(Act::Delete),
-                4 => self.act(Act::Zip),
-                5 => self.act(Act::More),
-                10 => self.act(Act::Paste),
-                11 => self.act(Act::NewFolder),
-                12 => self.act(Act::SelectAll),
-                13 => self.act(Act::Restore),
-                _ => {}
-            },
             Hit::Xfer => self.xfer_open = !self.xfer_open,
             Hit::XferHead(_) => jobs::toggle_pause(&self.jobs, None),
             Hit::Job(id, a) => match a {
@@ -870,7 +1093,7 @@ impl App {
                 self.start_search();
             }
             Hit::MenuQuick(i) => {
-                self.menu = None;
+                self.retire_menu();
                 self.act([Act::Cut, Act::Copy, Act::Rename, Act::Delete][i as usize]);
             }
             Hit::MenuItem(i) => self.menu_click(i),
@@ -927,11 +1150,58 @@ impl App {
         }
     }
 
+    /// Is x on the empty part of row i (past the name text) in the details / list view?
+    fn on_whitespace(&mut self, p: usize, i: usize, x: f32) -> bool {
+        let t = self.cur;
+        if crate::paint::is_pc(self, t, p) || (self.tabs[t].view == View::Grid && !self.tabs[t].panes[p].searching()) {
+            return false;
+        }
+        let Some(it) = self.tabs[t].panes[p].rows().get(i).cloned() else { return false };
+        let r = crate::paint::item_rect(self, t, p, i);
+        let small = self.tabs[t].view == View::List && !self.tabs[t].panes[p].searching();
+        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        let nx = r.x + 10.0 + isz + 10.0;
+        let fs = self.look.text();
+        let name = self.display_name(&it);
+        let tw = self.gfx.measure(&name, crate::gfx::Font::Ui, fs, 400);
+        let cp = crate::paint::col_pos(self, r, nx);
+        x > nx + tw.min(cp.name.1) + 8.0
+    }
+
+    /// Double-click on a header divider: the column fits its widest cell.
+    fn autofit_col(&mut self, p: usize, k: u8) {
+        let rows = self.tab().panes[p].rows().clone();
+        let fs2 = self.look.small_text();
+        let label = ["Date modified", "Type", "Size"][k as usize % 3];
+        let mut w = self.gfx.measure(label, crate::gfx::Font::Ui, 12.0, 400) + 18.0;
+        for it in rows.iter().take(2000) {
+            let s = match k {
+                0 => crate::fmt::date(it.modified, false),
+                1 => crate::ficons::type_label(&it.name, it.is_dir),
+                _ => it.size.map(crate::fmt::size).unwrap_or_default(),
+            };
+            w = w.max(self.gfx.measure(&s, crate::gfx::Font::Ui, fs2, 400) + 8.0);
+        }
+        let w = w.clamp(crate::look::COL_MIN, crate::look::COL_MAX);
+        match k {
+            0 => self.look.w_date = w,
+            1 => self.look.w_type = w,
+            _ => self.look.w_size = w,
+        }
+        self.save_look();
+    }
+
     fn side_click(&mut self, i: usize) {
         if i == usize::MAX {
-            // rail menu button: leave split view to get the full sidebar back
-            if self.tab().split() {
+            // the menu button: open / close the sidebar on a narrow window, else leave split view or switch
+            // between the full sidebar and the icon rail
+            if self.w < 640.0 {
+                self.side_open = !self.side_open;
+            } else if self.tab().split() {
                 self.toggle_split();
+            } else if self.w >= 1000.0 {
+                self.look.side_w = if self.look.side_w < 1.0 { 232.0 } else { 0.0 };
+                self.save_look();
             }
             return;
         }
@@ -1095,6 +1365,13 @@ impl App {
             self.invalidate();
             return;
         }
+        if let Some(f) = self.accent_field.as_mut() {
+            if c.is_ascii_hexdigit() || c == '#' {
+                f.insert(&s);
+            }
+            self.invalidate();
+            return;
+        }
         if let Some(r) = self.rename.as_mut() {
             match (r.mode, r.focus) {
                 (0 | 2, 0) => r.pattern.insert(&s),
@@ -1191,6 +1468,19 @@ impl App {
                 self.close_popups();
                 return true;
             }
+        }
+        // custom accent colour (#RRGGBB)
+        if self.accent_field.is_some() {
+            match vk {
+                ESC => self.accent_field = None,
+                ENTER => self.accent_commit(),
+                _ => {
+                    if let Some(f) = self.accent_field.as_mut() {
+                        f.key(vk, ctrl, shift);
+                    }
+                }
+            }
+            return true;
         }
         // API key field (masked; never logged)
         if self.key_focus {
@@ -1443,23 +1733,29 @@ impl App {
         let recycle = self.pane().loc == Loc::RecycleBin;
         let mut items = vec![];
         if bg || paths.is_empty() {
-            let mut v = MItem::new("View", 0xE8FD, Act::ViewMenu);
+            let folder = self.pane().loc.path().is_some();
+            let mut p = MItem::new("Paste", 0xE77F, Act::Paste).keys("Ctrl+V");
+            p.enabled = !crate::dnd::clipboard_files().0.is_empty() && folder;
+            items.push(p);
+            let mut n = MItem::new("New", 0xE710, Act::NewMenu);
+            n.sub = true;
+            n.enabled = folder;
+            items.push(n);
+            items.push(MItem::new("Select all", 0xE8B3, Act::SelectAll).keys("Ctrl+A"));
+            let mut v = MItem::new("View", 0xE8FD, Act::ViewMenu).sep();
             v.sub = true;
             items.push(v);
             let mut s = MItem::new("Sort by", 0xE8CB, Act::SortMenu);
             s.sub = true;
             items.push(s);
-            let mut p = MItem::new("Paste", 0xE77F, Act::Paste).keys("Ctrl+V").sep();
-            p.enabled = !crate::dnd::clipboard_files().0.is_empty() && !recycle;
-            items.push(p);
-            let mut n = MItem::new("New", 0xE710, Act::NewMenu);
-            n.sub = true;
-            n.enabled = !recycle;
-            items.push(n);
-            items.push(MItem::new("Open in Terminal", 0xE756, Act::Terminal).keys("Ctrl+`").sep());
-            items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
-            items.push(MItem::new("Pin to sidebar", 0xE718, Act::Pin));
-            items.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
+            items.push(MItem::new("Refresh", 0xE72C, Act::Refresh).keys("Ctrl+F5"));
+            if folder {
+                items.push(MItem::new("Open in Terminal", 0xE756, Act::Terminal).keys("Ctrl+`").sep());
+                items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
+                items.push(MItem::new("Pin to sidebar", 0xE718, Act::Pin));
+                items.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
+            }
+            let _ = recycle;
             self.menu = Some(CtxMenu { x, y, items, paths: vec![], bg: true, seq, loading: false, shell: vec![], at: Instant::now() });
             return;
         }
@@ -1546,6 +1842,7 @@ impl App {
                         let mut x = MItem::new(&clean(&s.text), 0, Act::None);
                         x.shell = Some(if s.verb.is_empty() { s.text.clone() } else { s.verb.clone() });
                         x.enabled = s.enabled;
+                        x.icon = s.icon.clone().map(std::sync::Arc::new);
                         x
                     })
                     .collect();
@@ -1616,7 +1913,7 @@ impl App {
                 for (i, l) in ["Same as Windows", "Light", "Dark"].iter().enumerate() {
                     let mut m = MItem::new(l, 0, Act::None);
                     m.value = i as i64;
-                    m.checked = self.ui.theme as usize == i;
+                    m.checked = self.look.theme as usize == i;
                     v.push(m);
                 }
             }
@@ -1691,6 +1988,7 @@ impl App {
                 }
             }
             DropKind::More | DropKind::Shell => {}
+            DropKind::Look(k) => v = self.look_items(k),
         }
         v
     }
@@ -1711,8 +2009,7 @@ impl App {
             return;
         }
         let paths = m.paths.clone();
-        self.menu = None;
-        self.sub = None;
+        self.retire_menu();
         if let Some(verb) = it.shell {
             // the shell's own item: run it on the UI thread (it may show its own window)
             let _c = fmcore::util::com();
@@ -1729,15 +2026,20 @@ impl App {
         let Some(d) = self.sub.take() else { return };
         let Some(it) = d.items.get(i).cloned() else { return };
         let paths = self.menu.as_ref().map(|m| m.paths.clone()).unwrap_or_default();
-        self.menu = None;
-        self.apply_drop(d.kind, &it, paths);
+        let kind = d.kind;
+        self.drop_out = Some((d, true, Instant::now()));
+        self.retire_menu();
+        self.apply_drop(kind, &it, paths);
     }
 
     fn drop_click(&mut self, i: usize) {
         let Some(d) = self.drop.take() else { return };
         let Some(it) = d.items.get(i).cloned() else { return };
         let paths = self.sel_paths();
-        self.apply_drop(d.kind, &it, paths);
+        let kind = d.kind;
+        self.drop_out = Some((d, false, Instant::now()));
+        self.anim();
+        self.apply_drop(kind, &it, paths);
     }
 
     fn apply_drop(&mut self, kind: DropKind, it: &MItem, paths: Vec<PathBuf>) {
@@ -1774,11 +2076,12 @@ impl App {
                 self.start_search();
             }
             DropKind::Theme => {
-                self.ui.theme = it.value as u8;
+                self.look.theme = it.value as u8;
                 self.forced_dark = None;
-                self.save_ui();
+                self.save_look();
                 self.apply_theme();
             }
+            DropKind::Look(k) => self.look_pick(k, it),
             DropKind::Lang => {
                 let _ = crate::ai::set_lang(if it.value == 1 { "fa" } else { "en" });
             }
@@ -2040,7 +2343,7 @@ impl App {
             1 => {
                 let exe = std::env::current_exe().unwrap_or_default();
                 match fmcore::defaultfm::set(&exe) {
-                    Ok(()) => self.toast("Folders and Win+E now open in Win Tools Files", "", false),
+                    Ok(()) => self.toast("Folders and Win+E now open in Rust File Explorer", "", false),
                     Err(e) => self.toast(&e, "", false),
                 }
             }
@@ -2100,6 +2403,37 @@ impl App {
                 }
             }
             15 => self.key_focus = true,
+            // Personalize: dropdowns
+            20..=26 | 33 => {
+                let r = self.hits.iter().find(|h| h.1 == Hit::Set(k)).map(|h| h.0).unwrap_or_default();
+                self.open_drop(DropKind::Look(k), r, r.w.max(170.0));
+            }
+            // sidebar sections and columns
+            27 => self.look.show_pinned = !self.look.show_pinned,
+            28 => self.look.show_drives = !self.look.show_drives,
+            29 => self.look.show_recent = !self.look.show_recent,
+            30 => self.look.col_date = !self.look.col_date,
+            31 => self.look.col_type = !self.look.col_type,
+            32 => self.look.col_size = !self.look.col_size,
+            // accent swatches: 40 = Windows, 41.. = presets, 50 = custom
+            40 => {
+                self.look.accent = None;
+                self.accent_field = None;
+            }
+            41..=49 => {
+                self.look.accent = Some(crate::look::ACCENTS[(k - 41) as usize].1);
+                self.accent_field = None;
+            }
+            50 => {
+                if self.accent_field.is_none() {
+                    let cur = self.look.accent.map(|c| format!("#{c:06X}")).unwrap_or_else(|| "#".into());
+                    let mut f = Field::new(&cur);
+                    f.caret = cur.chars().count();
+                    f.anchor = 0;
+                    self.accent_field = Some(f);
+                }
+            }
+            51 => self.accent_commit(),
             16 => self.save_key(),
             17 => {
                 let typed = self.key_field.text.trim().to_string();
@@ -2109,7 +2443,107 @@ impl App {
             }
             _ => {}
         }
+        if (20..=51).contains(&k) {
+            self.look_changed();
+        }
         self.invalidate();
+    }
+
+    /// Apply the typed custom accent (#RRGGBB) and close the field.
+    fn accent_commit(&mut self) {
+        let Some(f) = self.accent_field.take() else { return };
+        let hex = f.text.trim().trim_start_matches('#').to_string();
+        if hex.len() == 6
+            && let Ok(c) = u32::from_str_radix(&hex, 16)
+        {
+            self.look.accent = Some(c);
+            self.look_changed();
+        }
+    }
+
+    /// Everything from Personalize applies at once: theme, accent, corners, backdrop, layout; then it is saved.
+    pub fn look_changed(&mut self) {
+        self.apply_theme();
+        self.apply_backdrop();
+        self.save_look();
+        for t in 0..self.tabs.len() {
+            for p in 0..self.tabs[t].panes.len() {
+                if self.tabs[t].panes[p].loc == Loc::ThisPc {
+                    self.load(t, p, true);
+                }
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Choices of a Personalize dropdown.
+    pub fn look_items(&self, k: u8) -> Vec<MItem> {
+        use crate::look::*;
+        let lk = &self.look;
+        let (names, cur): (Vec<String>, usize) = match k {
+            20 => (BACKDROPS.iter().map(|s| s.to_string()).collect(), lk.backdrop as usize),
+            21 => (TRANSPARENCY.iter().map(|s| s.to_string()).collect(), lk.transparency as usize),
+            22 => (DENSITY.iter().map(|s| s.to_string()).collect(), lk.density as usize),
+            23 => (SIZES3.iter().map(|s| s.to_string()).collect(), lk.font as usize),
+            24 => (SIZES3.iter().map(|s| s.to_string()).collect(), lk.icons as usize),
+            25 => (CORNERS.iter().map(|s| s.to_string()).collect(), lk.square as usize),
+            26 => {
+                let ws = SIDEBAR_WIDTHS;
+                let cur = ws.iter().position(|w| (w.1 - lk.side_w).abs() < 1.0).unwrap_or(usize::MAX);
+                (ws.iter().map(|w| w.0.to_string()).collect(), cur)
+            }
+            33 => {
+                let opts = self.start_options();
+                let cur = opts.iter().position(|o| o.1 == lk.start).unwrap_or(usize::MAX);
+                (opts.into_iter().map(|o| o.0).collect(), cur)
+            }
+            _ => (vec![], 0),
+        };
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let mut m = MItem::new(n, 0, Act::None);
+                m.value = i as i64;
+                m.checked = i == cur;
+                m
+            })
+            .collect()
+    }
+
+    /// Start page choices: (label, value saved in look.json).
+    pub fn start_options(&self) -> Vec<(String, String)> {
+        let mut v = vec![("This PC".to_string(), "thispc".to_string()), ("Last folder".to_string(), "last".to_string())];
+        for (name, _, _, l) in &self.side {
+            if let Loc::Folder(p) = l {
+                v.push((name.clone(), p.display().to_string()));
+            }
+        }
+        if !matches!(self.look.start.as_str(), "thispc" | "last") && !v.iter().any(|o| o.1 == self.look.start) {
+            let p = PathBuf::from(&self.look.start);
+            v.push((folder_title(&p), self.look.start.clone()));
+        }
+        v
+    }
+
+    fn look_pick(&mut self, k: u8, it: &MItem) {
+        let i = it.value as usize;
+        match k {
+            20 => self.look.backdrop = i as u8,
+            21 => self.look.transparency = i as u8,
+            22 => self.look.density = i as u8,
+            23 => self.look.font = i as u8,
+            24 => self.look.icons = i as u8,
+            25 => self.look.square = i == 1,
+            26 => self.look.side_w = crate::look::SIDEBAR_WIDTHS[i.min(crate::look::SIDEBAR_WIDTHS.len() - 1)].1,
+            33 => {
+                if let Some(o) = self.start_options().get(i) {
+                    self.look.start = o.1.clone();
+                }
+            }
+            _ => {}
+        }
+        self.look_changed();
     }
 
     fn save_key(&mut self) {
@@ -2317,6 +2751,7 @@ pub fn merge_shell_items(m: &mut CtxMenu) {
         let mut it = MItem::new(&text, 0, Act::None);
         it.shell = Some(if has_kids { s.text.clone() } else if s.verb.is_empty() { s.text.clone() } else { s.verb.clone() });
         it.sub = has_kids;
+        it.icon = s.icon.clone().map(std::sync::Arc::new);
         it.enabled = s.enabled;
         extra.push(it);
     }
@@ -2857,6 +3292,63 @@ pub fn ipc(a: &mut App, line: &str) -> String {
             }
             ok()
         }
+        "drag" => {
+            // drag X0 Y0 X1 Y1 [ctrl|shift]: a synthetic mouse drag inside this window only (no real cursor)
+            let v: Vec<f32> = arg.split_whitespace().filter_map(num).collect();
+            if v.len() < 4 {
+                return err("drag X0 Y0 X1 Y1 [ctrl|shift]");
+            }
+            let (c, sh) = (arg.contains("ctrl"), arg.contains("shift"));
+            a.mouse_move(v[0], v[1], false);
+            a.test_mods = Some((c, sh));
+            a.mouse_down(v[0], v[1], c, sh, false);
+            let steps = 12;
+            for k in 1..=steps {
+                let f = k as f32 / steps as f32;
+                a.mouse_move(v[0] + (v[2] - v[0]) * f, v[1] + (v[3] - v[1]) * f, true);
+            }
+            let held = arg.contains("hold");
+            if !held {
+                a.mouse_up(v[2], v[3]);
+                a.test_mods = None;
+            }
+            json!({"ok": true, "selected": a.pane().sel.len(), "marquee": a.marquee.is_some()}).to_string()
+        }
+        "wheel" => {
+            // wheel X Y NOTCHES (negative = down): smooth scrolling test without the real mouse
+            let v: Vec<f32> = arg.split_whitespace().filter_map(num).collect();
+            if v.len() < 3 {
+                return err("wheel X Y NOTCHES");
+            }
+            for _ in 0..(v[2].abs() as i32).max(1) {
+                a.wheel(v[0], v[1], 120.0 * v[2].signum());
+            }
+            json!({"ok": true, "target": a.pane().sf.target, "scroll": a.pane().scroll}).to_string()
+        }
+        "paint" => {
+            // draw a frame now (an --offscreen window gets no WM_PAINT: it is outside every monitor)
+            a.take_bg();
+            a.paint();
+            ok()
+        }
+        "release" => {
+            a.mouse_up(a.mx, a.my);
+            a.test_mods = None;
+            json!({"ok": true, "selected": a.pane().sel.len()}).to_string()
+        }
+        "look" => {
+            let mut it = arg.splitn(2, ' ');
+            match (it.next(), it.next()) {
+                (Some(k), Some(v)) if !k.is_empty() => {
+                    if !a.look.set(k, v.trim()) {
+                        return err("look KEY VALUE (backdrop, transparency, theme, accent, density, font, icons, sidebar, corners, pinned, drives, recent, date, size, type, start)");
+                    }
+                    a.look_changed();
+                }
+                _ => {}
+            }
+            json!({"ok": true, "look": a.look.to_json()}).to_string()
+        }
         "theme" => {
             a.forced_dark = match arg {
                 "light" => Some(false),
@@ -2892,6 +3384,8 @@ pub fn ipc(a: &mut App, line: &str) -> String {
         }
         "close-popups" => {
             a.close_popups();
+            a.menu_out = None;
+            a.drop_out = None;
             a.pv = None;
             a.palette = None;
             a.rename = None;

@@ -1,6 +1,9 @@
 #![windows_subsystem = "windows"]
-//! wfiles.exe: the Win Tools Files window (Win32 + Direct2D, no webview).
-//! Args: [folder or file] [--theme light|dark] [--size WxH] [--gpu] [--no-mica] [--new-window]
+#![allow(non_snake_case)]
+//! RustFileExplorer.exe: the Rust File Explorer window (Win32 + Direct2D, no webview).
+//! Args: [folder or file] [--theme light|dark] [--size WxH] [--gpu] [--no-mica] [--new-window] [--offscreen]
+//! --offscreen (tests): the real window on the real desktop, but far off the screen, without a taskbar button, never
+//! activated; `wfm gui shot-real` then captures it as Windows composes it (caption buttons, backdrop).
 //! A second start sends its folder to the open window as a new tab (unless --new-window).
 //! A crash writes %TEMP%\wfiles-crash.log (there is no console to print to).
 mod ai;
@@ -12,7 +15,9 @@ mod gfx;
 mod input;
 mod jobs;
 mod known;
+mod look;
 mod model;
+mod motion;
 mod models;
 mod paint;
 mod preview;
@@ -88,6 +93,7 @@ fn main() {
         size,
         path,
         no_mica: flag("--no-mica"),
+        offscreen: flag("--offscreen"),
     };
     let code = app::run(o);
     std::process::exit(code);

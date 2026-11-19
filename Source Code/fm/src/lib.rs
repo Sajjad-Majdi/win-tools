@@ -1,4 +1,4 @@
-//! fmcore: the engine of Win Tools Files, a fast replacement for Windows File Explorer.
+//! fmcore: the engine of Rust File Explorer, a fast replacement for Windows File Explorer.
 //!
 //! The GUI and the `wfm` CLI are thin layers over this library. Every function is synchronous and returns
 //! readable `String` errors; long operations take a progress callback and a `Control` (cancel / pause) so a GUI

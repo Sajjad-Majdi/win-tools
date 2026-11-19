@@ -1,9 +1,9 @@
-# Builds both Win Tools apps from the same source state and writes the shipping files to ..\..\Executables:
-#   WinTools-TaskManager-<ver>-setup.exe, WinTools-TaskManager-<ver>-portable.exe,
-#   WinTools-Files-<ver>-setup.exe,       WinTools-Files-<ver>-portable.exe
+# Builds both apps (Rust Task Manager, Rust File Explorer) from the same source state and writes the shipping files to ..\..\Executables:
+#   RustTaskManager-<ver>-setup.exe,  RustTaskManager-<ver>-portable.exe,
+#   RustFileExplorer-<ver>-setup.exe, RustFileExplorer-<ver>-portable.exe
 # Usage: powershell -File tools\release.ps1 [-Version 0.1.0]
 # -Online builds without --offline (CI; the developer's PC uses the local crates mirror and --offline).
-param([string]$Version = "0.1.0", [switch]$Online)
+param([string]$Version = "0.2.0", [switch]$Online)
 $ErrorActionPreference = "Stop"
 $src = Split-Path -Parent $PSScriptRoot
 $out = Join-Path (Split-Path -Parent $src) "Executables"
@@ -19,8 +19,8 @@ if (-not $Online) { $cargoArgs += "--offline" }
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $apps = @(
-  @{ Dir = "app"; Exe = "wintask.exe"; Cli = "wtm.exe"; Name = "Win Tools Task Manager"; Id = "com.sajjad.wintools.taskman"; File = "WinTools-TaskManager"; Icon = "wintask.ico" },
-  @{ Dir = "fm";  Exe = "wfiles.exe";  Cli = "wfm.exe"; Name = "Win Tools Files";        Id = "com.sajjad.wintools.files";   File = "WinTools-Files";       Icon = "wfiles.ico" }
+  @{ Dir = "app"; Exe = "RustTaskManager.exe";  Cli = "wtm.exe"; Name = "Rust Task Manager";  Id = "com.sajjad.wintools.taskman"; File = "RustTaskManager";  Icon = "wintask.ico"; OldExe = "wintask.exe"; OldName = "Win Tools Task Manager" },
+  @{ Dir = "fm";  Exe = "RustFileExplorer.exe"; Cli = "wfm.exe"; Name = "Rust File Explorer"; Id = "com.sajjad.wintools.files";   File = "RustFileExplorer"; Icon = "wfiles.ico";  OldExe = "wfiles.exe";  OldName = "Win Tools Files" }
 )
 
 foreach ($a in $apps) {
@@ -39,7 +39,7 @@ foreach ($a in $apps) {
   Copy-Item (Join-Path $src "installer\LICENSES.txt") $stage
   $setup = Join-Path $out ("{0}-{1}-setup.exe" -f $a.File, $Version)
   & $nsis /V2 "/DVERSION=$Version" "/DSTAGE=$stage" "/DOUTFILE=$setup" "/DAPPID=$($a.Id)" "/DAPPNAME=$($a.Name)" `
-      "/DEXE=$($a.Exe)" "/DCLI=$($a.Cli)" "/DICON=$(Join-Path $src ('installer\' + $a.Icon))" (Join-Path $src "installer\wintools.nsi")
+      "/DEXE=$($a.Exe)" "/DCLI=$($a.Cli)" "/DOLDEXE=$($a.OldExe)" "/DOLDNAME=$($a.OldName)" "/DICON=$(Join-Path $src ('installer\' + $a.Icon))" (Join-Path $src "installer\wintools.nsi")
   if ($LASTEXITCODE -ne 0) { throw "makensis failed for $($a.Name)" }
   Copy-Item (Join-Path $bin $a.Exe) (Join-Path $out ("{0}-{1}-portable.exe" -f $a.File, $Version)) -Force
 }

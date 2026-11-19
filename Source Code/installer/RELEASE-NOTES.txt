@@ -1,10 +1,20 @@
-First release of Win Tools: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.0 (renamed from Win Tools): a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.0
+- New names, exe names and icons. Installing over 0.1.0 removes the old copy and its Start menu entry.
+- Real Windows 11 caption buttons (Snap Layouts kept) and spring-based motion that uses no CPU when idle.
+- Personalize: theme, Mica / Mica Alt / Acrylic / solid, transparency, accent, density, text size, corners and more.
+- Rust File Explorer: This PC start page, drives at the top of the sidebar, rubber-band selection, icons in the
+  right-click menu, resizable columns, a much smaller minimum window size. The bottom bubble is gone.
+- Rust Task Manager: Settings is now a tab. Rounder corners.
 
 Downloads
-- WinTools-TaskManager-<version>-setup.exe   install for the current user (no admin), Start menu shortcut, uninstaller
-- WinTools-TaskManager-<version>-portable.exe run without installing
-- WinTools-Files-<version>-setup.exe         install for the current user (no admin), Start menu shortcut, uninstaller
-- WinTools-Files-<version>-portable.exe       run without installing
+- RustTaskManager-<version>-setup.exe    install for the current user (no admin), Start menu shortcut, uninstaller
+- RustTaskManager-<version>-portable.exe  run without installing
+- RustFileExplorer-<version>-setup.exe   install for the current user (no admin), Start menu shortcut, uninstaller
+- RustFileExplorer-<version>-portable.exe run without installing
 
 These files are not code-signed yet, so Windows SmartScreen may warn on first start ("More info" > "Run anyway").
 AI features and meaning search are off by default and are not included in these files.
+
+Written in Rust. Not affiliated with or endorsed by the Rust Project or the Rust Foundation.

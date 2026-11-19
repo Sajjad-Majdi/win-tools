@@ -1,8 +1,8 @@
 //! "Set as default file manager" / "Restore Explorer", per user (HKCU only, no admin rights).
 //!
-//! `set` makes folders, drives and Win+E open in wfiles.exe:
+//! `set` makes folders, drives and Win+E open in RustFileExplorer.exe:
 //! - `HKCU\Software\Classes\Directory\shell` and `...\Drive\shell`: default verb `openinwfiles` with
-//!   `"<wfiles.exe>" "%1"`;
+//!   `"<RustFileExplorer.exe>" "%1"`;
 //! - `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command` (Win+E).
 //! `restore` deletes exactly those keys again, so Explorer is the handler once more.
 //! Only the GUI's Settings buttons (a click by the user) and `wfm default set|restore` run them.
@@ -62,15 +62,15 @@ pub fn is_default() -> bool {
     get_value(r"Software\Classes\Directory\shell", "").as_deref() == Some(VERB)
 }
 
-/// Make `exe` (full path of wfiles.exe) the default for folders, drives and Win+E.
+/// Make `exe` (full path of RustFileExplorer.exe) the default for folders, drives and Win+E.
 pub fn set(exe: &std::path::Path) -> Res<()> {
     let exe = exe.to_string_lossy();
     if !exe.to_lowercase().ends_with(".exe") {
-        return Err("needs the full path of wfiles.exe".into());
+        return Err("needs the full path of RustFileExplorer.exe".into());
     }
     for class in ["Directory", "Drive"] {
         let base = format!(r"Software\Classes\{class}\shell");
-        set_value(&format!(r"{base}\{VERB}"), "", "Open in Win Tools Files")?;
+        set_value(&format!(r"{base}\{VERB}"), "", "Open in Rust File Explorer")?;
         set_value(&format!(r"{base}\{VERB}\command"), "", &format!("\"{exe}\" \"%1\""))?;
         set_value(&base, "", VERB)?;
     }

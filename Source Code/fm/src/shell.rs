@@ -101,7 +101,7 @@ pub fn open_with(path: &Path, app: &str) -> Res<Handler> {
     Ok(pick.0.clone())
 }
 
-/// Show the item selected in a folder window of the current file manager (Explorer until Win Tools is the default).
+/// Show the item selected in a folder window of the current file manager (Explorer until Rust File Explorer is the default).
 pub fn reveal(path: &Path) -> Res<()> {
     let path = abs(path);
     if !path.exists() {

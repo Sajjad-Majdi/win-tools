@@ -195,7 +195,7 @@ const STOPS: &[(&str, &str)] = &[
 /// Never suggested: Windows parts, our own tools, the search index the file manager uses, WebView2 hosts
 /// (they belong to other apps), antivirus, and graphics / audio drivers' helpers.
 const NEVER: &[&str] = &[
-    "everything.exe", "msedgewebview2.exe", "claude.exe", "wintask.exe", "wtm.exe", "wfm.exe", "explorer.exe", "dwm.exe",
+    "everything.exe", "msedgewebview2.exe", "claude.exe", "rusttaskmanager.exe", "rustfileexplorer.exe", "wintask.exe", "wfiles.exe", "wtm.exe", "wfm.exe", "explorer.exe", "dwm.exe",
     "msmpeng.exe", "nissrv.exe", "searchhost.exe", "ctfmon.exe", "textinputhost.exe", "sihost.exe",
     "audiodg.exe", "fontdrvhost.exe", "lsass.exe", "csrss.exe", "winlogon.exe", "services.exe", "svchost.exe",
 ];

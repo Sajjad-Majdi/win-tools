@@ -185,8 +185,96 @@ fn luma(c: C) -> f32 {
     0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
 }
 
-/// The theme for light/dark with the system accent applied (default blue keeps the exact design values).
-pub fn make(dark: bool) -> Theme {
+/// Accent presets offered in Settings (base colours; light and dark shades are derived).
+pub const PRESETS: [(&str, u32); 8] = [
+    ("Blue", 0x0078D4),
+    ("Purple", 0x8764B8),
+    ("Pink", 0xC239B3),
+    ("Red", 0xD13438),
+    ("Orange", 0xCA5010),
+    ("Gold", 0xB8860B),
+    ("Green", 0x107C10),
+    ("Teal", 0x038387),
+];
+
+fn to_hsl(c: C) -> (f32, f32, f32) {
+    let (r, g, b) = (c.0, c.1, c.2);
+    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (mx + mn) / 2.0;
+    if mx - mn < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = mx - mn;
+    let s = if l > 0.5 { d / (2.0 - mx - mn) } else { d / (mx + mn) };
+    let h = if mx == r { (g - b) / d + if g < b { 6.0 } else { 0.0 } } else if mx == g { (b - r) / d + 2.0 } else { (r - g) / d + 4.0 };
+    (h * 60.0, s, l)
+}
+
+pub fn from_hsl(h: f32, s: f32, l: f32) -> C {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    C(r + m, g + m, b + m, 1.0)
+}
+
+/// Hue of an RGB colour (0..360), for the custom accent picker.
+pub fn hue_of(rgb: u32) -> f32 {
+    to_hsl(C::hex(rgb)).0
+}
+
+/// The accent shades for one base colour: (light-theme accent, dark-theme accent). Lightness is fixed so text
+/// on the accent and the accent on the window stay readable whatever colour is picked.
+pub fn accent_pair(rgb: u32) -> (C, C) {
+    let (h, s, _) = to_hsl(C::hex(rgb));
+    let s2 = s.min(0.92);
+    (from_hsl(h, s2.max(0.35), 0.37), from_hsl(h, s2.max(0.45), 0.72))
+}
+
+pub fn hex(c: C) -> String {
+    format!("#{:02X}{:02X}{:02X}", (c.0 * 255.0).round() as u8, (c.1 * 255.0).round() as u8, (c.2 * 255.0).round() as u8)
+}
+
+/// The theme for light/dark, with the accent (`None` = the system accent) and the surface transparency
+/// (0 off .. 3 high) applied. The defaults keep the exact design values.
+pub fn make(dark: bool, accent: Option<u32>, transp: u8) -> Theme {
+    let mut t = make_sys(dark);
+    if let Some(rgb) = accent {
+        let (l, d) = accent_pair(rgb);
+        let a = if dark { d } else { l };
+        t.acc = a;
+        t.acc_t = if dark { mix(a, C::hex(0xFFFFFF), 0.15) } else { a };
+        t.acc_h = if dark { mix(a, C::hex(0xFFFFFF), 0.12) } else { mix(a, C::hex(0xFFFFFF), 0.1) };
+        t.on_acc = if dark { mix(a, C::hex(0x000000), 0.85) } else { C::hex(0xF7FAFF) };
+        t.acc_soft = t.acc.a(if dark { 0.15 } else { 0.11 });
+    }
+    if transp > 0 {
+        // surfaces let the backdrop through; hover / press / selection become tints so they work on any surface
+        let (layer_a, card_a) = [(1.0, 1.0), (0.86, 0.9), (0.72, 0.8), (0.55, 0.68)][transp.min(3) as usize];
+        t.layer = t.layer.a(layer_a);
+        t.card = t.card.a(card_a);
+        t.layer_s = t.layer_s.a(0.8);
+        t.card_s = t.card_s.a(0.8);
+        let ink = if dark { C(1.0, 1.0, 1.0, 1.0) } else { C(0.0, 0.0, 0.0, 1.0) };
+        t.hov = ink.a(if dark { 0.06 } else { 0.045 });
+        t.prs = ink.a(if dark { 0.035 } else { 0.03 });
+        t.sel = t.acc.a(if dark { 0.16 } else { 0.10 });
+        t.tag = ink.a(if dark { 0.08 } else { 0.06 });
+        t.track = ink.a(if dark { 0.13 } else { 0.10 });
+    }
+    t
+}
+
+/// Light/dark with the system accent applied (default blue keeps the exact design values).
+fn make_sys(dark: bool) -> Theme {
     let mut t = if dark { DARK } else { LIGHT };
     if let Some((dark1, light2, light3)) = accent_palette() {
         // the stock blue palette stays on the hand-tuned design values
@@ -207,4 +295,28 @@ pub fn make(dark: bool) -> Theme {
         }
     }
     t
+}
+
+/// The system accent as a base colour (for the "System" swatch).
+pub fn system_accent(dark: bool) -> C {
+    make_sys(dark).acc
+}
+
+/// Corner radius for a drawn shape. The design values (4 controls, 8 cards and flyouts) are the inputs; the
+/// "Rounded" look is rounder than Windows: controls, inputs, pills and row highlights 4 -> 8, cards, panels,
+/// flyouts, menus and the dialog 8 -> 12. Hairlines (< 3) and half-height pills (> 8) keep their radius.
+/// "Square" draws every corner square.
+pub fn radius(r: f32, rounded: bool) -> f32 {
+    if !rounded {
+        return 0.0;
+    }
+    if r < 3.0 {
+        r
+    } else if r <= 4.5 {
+        r * 2.0
+    } else if r <= 8.0 {
+        r + 4.0
+    } else {
+        r
+    }
 }

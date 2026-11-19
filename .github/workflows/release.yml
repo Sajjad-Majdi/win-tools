@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         run: |
           $v = "${{ github.ref_name }}".TrimStart("v")
-          if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = "0.1.0" }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = "0.2.0" }
           & "Source Code/tools/release.ps1" -Version $v -Online
 
       - name: Upload to the release
@@ -50,12 +50,12 @@ jobs:
           $files = Get-ChildItem "Executables" -Filter *.exe | ForEach-Object { $_.FullName }
           gh release view "${{ github.ref_name }}" 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create "${{ github.ref_name }}" $files --title "Win Tools ${{ github.ref_name }}" --notes-file "Source Code/installer/RELEASE-NOTES.txt"
+            gh release create "${{ github.ref_name }}" $files --title "Rust Task Manager and Rust File Explorer ${{ github.ref_name }}" --notes-file "Source Code/installer/RELEASE-NOTES.txt"
           } else {
             gh release upload "${{ github.ref_name }}" $files --clobber
           }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: win-tools
+          name: rust-tools
           path: Executables/*.exe

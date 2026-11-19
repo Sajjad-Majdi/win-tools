@@ -1,4 +1,4 @@
-//! Adds the app icon and the version resource (ProductName, CompanyName, FileDescription, version) to wintask.exe and
+//! Adds the app icon and the version resource (ProductName, CompanyName, FileDescription, version) to RustTaskManager.exe and
 //! wtm.exe with windres (GNU toolchain). The GNU preprocessor breaks on paths with spaces, so the inputs are staged in
 //! a space-free temp folder first. On other toolchains the exes build without resources.
 use std::path::PathBuf;
@@ -27,9 +27,9 @@ BEGIN
   BLOCK \"040904B0\"
   BEGIN
    VALUE \"CompanyName\", \"Sajjad Majdi\"
-   VALUE \"FileDescription\", \"Win Tools Task Manager\"
+   VALUE \"FileDescription\", \"Rust Task Manager\"
    VALUE \"FileVersion\", \"{3}\"
-   VALUE \"ProductName\", \"Win Tools Task Manager\"
+   VALUE \"ProductName\", \"Rust Task Manager\"
    VALUE \"ProductVersion\", \"{3}\"
    VALUE \"LegalCopyright\", \"Copyright (c) 2026 Sajjad Majdi. MIT License.\"
   END

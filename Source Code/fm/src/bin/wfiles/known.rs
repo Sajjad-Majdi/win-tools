@@ -85,7 +85,7 @@ const TABLE: &[(&[&str], &str, &str)] = &[
 /// (description, usual app) for a file name, or None when the type is unknown.
 pub fn describe(name: &str, is_dir: bool) -> Option<(String, String)> {
     if is_dir {
-        return Some(("A folder.".into(), "Win Tools Files".into()));
+        return Some(("A folder.".into(), "Rust File Explorer".into()));
     }
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".tar.gz") || lower.ends_with(".tar.xz") || lower.ends_with(".tar.bz2") {

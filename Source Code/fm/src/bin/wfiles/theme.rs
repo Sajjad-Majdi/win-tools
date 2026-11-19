@@ -1,6 +1,17 @@
 //! Colour tokens from design-fm/design-notes.md (light and dark). The accent follows the Windows accent colour.
 use crate::gfx::C;
 
+/// Corner radii, in one place. Clearly rounder than Windows (owner's choice, 2026-11-19). Personalize > Corners
+/// "Square" scales them down in Gfx; "Rounded" (these values) is the default.
+/// Cards, panels and the This PC drive tiles.
+pub const R_CARD: f32 = 12.0;
+/// Buttons, inputs, pills, rows and selection highlights.
+pub const R_CTRL: f32 = 8.0;
+/// Menus, flyouts and dialogs.
+pub const R_MENU: f32 = 12.0;
+/// Small icon buttons inside other controls (tab close, breadcrumbs, key caps).
+pub const R_SMALL: f32 = 6.0;
+
 #[derive(Clone)]
 pub struct Theme {
     pub dark: bool,
@@ -178,9 +189,14 @@ pub fn system_dark() -> bool {
     reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme") == Some(0)
 }
 
-/// Theme for `dark`, with the user's Windows accent (AccentPalette: light3, light2, light1, base, dark1, dark2, dark3).
-pub fn make(dark_mode: bool) -> Theme {
+/// Theme for `dark`: the user's chosen accent (`custom`), else the Windows accent (AccentPalette: light3, light2,
+/// light1, base, dark1, dark2, dark3).
+pub fn make(dark_mode: bool, custom: Option<u32>) -> Theme {
     let mut t = if dark_mode { dark() } else { light() };
+    if let Some(c) = custom {
+        set_accent(&mut t, C::hex(c));
+        return t;
+    }
     if let Some(p) = reg_bin(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentPalette")
         && p.len() >= 28
     {
@@ -205,4 +221,25 @@ pub fn make(dark_mode: bool) -> Theme {
         }
     }
     t
+}
+
+/// Accent tokens from one base colour: darker for light mode, lighter for dark mode (readable text on both).
+pub fn set_accent(t: &mut Theme, base: C) {
+    let white = C::hex(0xFFFFFF);
+    let black = C::hex(0x000000);
+    if t.dark {
+        t.accent = base.mix(white, 0.42);
+        t.accent2 = base.mix(white, 0.56);
+        t.accent_text = base.mix(white, 0.50);
+        t.on_accent = C::hex(0x0A0F14);
+        t.sel = t.layer.mix(base, 0.30);
+        t.sel_stroke = t.layer.mix(base, 0.55);
+    } else {
+        t.accent = base.mix(black, 0.12);
+        t.accent2 = base;
+        t.accent_text = base.mix(black, 0.18);
+        t.on_accent = C::hex(0xFFFFFF);
+        t.sel = t.layer.mix(base, 0.14);
+        t.sel_stroke = t.layer.mix(base, 0.38);
+    }
 }

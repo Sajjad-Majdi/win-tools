@@ -4,6 +4,7 @@ pub mod data;
 pub mod gfx;
 pub mod icons;
 pub mod model;
+pub mod motion;
 mod over;
 mod pages;
 mod paint;

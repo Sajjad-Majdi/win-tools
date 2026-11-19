@@ -4,8 +4,9 @@ use crate::ficons::{self, Kind};
 use crate::fmt;
 use crate::gfx::{Align, C, Font, Rect, Span};
 use crate::model::*;
+use crate::motion::Spring;
 use crate::preview::{PvKind, Tok};
-use crate::theme::Theme;
+use crate::theme::{R_CARD, R_CTRL, R_MENU, R_SMALL, Theme};
 use std::time::Instant;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -28,21 +29,27 @@ pub struct PG {
     pub list: Rect,
 }
 
-pub fn ease(t: f32) -> f32 {
-    // Fluent decelerate (approximation of cubic-bezier(0.1, 0.9, 0.2, 1))
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(4)
-}
-
+/// Popup and view progress: a spring (a little bouncy for popups up to 200 ms, gentle for views); exactly 1.0 when
+/// settled, so `k != 1.0` means "still moving".
 fn prog(at: Instant, ms: f32, shooting: bool) -> f32 {
-    if shooting { 1.0 } else { ease(at.elapsed().as_secs_f32() * 1000.0 / ms) }
+    crate::motion::since(at, if ms <= 200.0 { Spring::Bouncy } else { Spring::Gentle }, shooting)
 }
 
 /// Content area: right of the sidebar, below the bar, above the status bar, left of the "What is this file?" panel.
 pub fn content_rect(a: &App) -> Rect {
     let m = a.main_rect();
-    let wi = if a.whatis.is_some() && !a.tab().split() { WHATIS_W } else { 0.0 };
-    Rect::new(m.x + 1.0, m.y, m.w - 1.0 - wi, m.h - STATUS_H)
+    let wi = if a.whatis.is_some() && !a.tab().split() && m.w > WHATIS_W + 300.0 { WHATIS_W } else { 0.0 };
+    Rect::new(m.x + 1.0, m.y, m.w - 1.0 - wi, (m.h - STATUS_H).max(0.0))
+}
+
+/// The pane shows the This PC page (drive tiles + pinned folders).
+pub fn is_pc(a: &App, t: usize, p: usize) -> bool {
+    let pn = &a.tabs[t].panes[p];
+    pn.loc == Loc::ThisPc && !pn.searching()
+}
+
+fn tiled(a: &App, t: usize, p: usize) -> bool {
+    (a.tabs[t].view == View::Grid && !a.tabs[t].panes[p].searching()) || is_pc(a, t, p)
 }
 
 pub fn pane_geoms(a: &App, t: usize) -> Vec<PG> {
@@ -68,9 +75,8 @@ pub fn pane_geoms(a: &App, t: usize) -> Vec<PG> {
         } else {
             None
         };
-        let grid = tab.view == View::Grid && !p.searching();
-        let cols = if grid { Rect::new(all.x, y, all.w, 0.0) } else { Rect::new(all.x, y, all.w, HEADER_H) };
-        let list = Rect::new(all.x, cols.b(), all.w, all.b() - cols.b());
+        let cols = if tiled(a, t, i) { Rect::new(all.x, y, all.w, 0.0) } else { Rect::new(all.x, y, all.w, HEADER_H) };
+        let list = Rect::new(all.x, cols.b(), all.w, (all.b() - cols.b()).max(0.0));
         out.push(PG { all, head, strip, cols, list });
     }
     out
@@ -81,9 +87,9 @@ pub fn row_h(a: &App, t: usize, p: usize) -> f32 {
     if pane.searching() {
         ROW2_H
     } else if a.tabs[t].view == View::List {
-        LIST_ROW_H
+        a.look.list_row_h()
     } else {
-        ROW_H
+        a.look.row_h()
     }
 }
 
@@ -91,31 +97,122 @@ pub fn grid_cols(list: Rect) -> usize {
     (((list.w - 40.0 + 10.0) / 150.0).floor() as usize).max(1)
 }
 
+/// This PC page: drive tiles, then the pinned folders, both in a wrapping grid.
+#[derive(Clone, Copy, Debug)]
+pub struct PcLay {
+    pub tw: f32,
+    pub cols: usize,
+    pub n_d: usize,
+    pub head_d: f32,
+    pub y_d: f32,
+    pub head_p: f32,
+    pub y_p: f32,
+    pub h: f32,
+}
+pub const PC_TILE_D: f32 = 68.0;
+pub const PC_TILE_P: f32 = 56.0;
+
+pub fn pc_lay(a: &App, t: usize, p: usize, list: Rect) -> PcLay {
+    let rows = a.tabs[t].panes[p].rows();
+    let n_d = rows.iter().take_while(|i| i.kind == crate::ficons::Kind::Drive).count();
+    let n_p = rows.len() - n_d;
+    let avail = (list.w - 40.0).max(120.0);
+    let cols = (((avail + 12.0) / (300.0 + 12.0)).floor() as usize).max(1);
+    let tw = ((avail + 12.0) / cols as f32 - 12.0).min(360.0);
+    let head_d = 10.0;
+    let y_d = head_d + 34.0;
+    let rows_d = n_d.div_ceil(cols);
+    let head_p = y_d + rows_d as f32 * (PC_TILE_D + 8.0) + 14.0;
+    let y_p = head_p + 34.0;
+    let rows_p = n_p.div_ceil(cols);
+    let h = if n_p == 0 { head_p } else { y_p + rows_p as f32 * (PC_TILE_P + 8.0) + 12.0 };
+    PcLay { tw, cols, n_d, head_d, y_d, head_p, y_p, h }
+}
+
+/// Rect of item `i` in content coordinates: window x, y from the top of the list content (scroll not applied).
+pub fn item_rect(a: &App, t: usize, p: usize, i: usize) -> Rect {
+    let g = pane_geoms(a, t)[p.min(a.tabs[t].panes.len() - 1)];
+    let list = g.list;
+    if is_pc(a, t, p) {
+        let l = pc_lay(a, t, p, list);
+        let (k, y0, th) = if i < l.n_d { (i, l.y_d, PC_TILE_D) } else { (i - l.n_d, l.y_p, PC_TILE_P) };
+        return Rect::new(list.x + 20.0 + (k % l.cols) as f32 * (l.tw + 12.0), y0 + (k / l.cols) as f32 * (th + 8.0), l.tw, th);
+    }
+    if tiled(a, t, p) {
+        let cols = grid_cols(list);
+        return Rect::new(list.x + 20.0 + (i % cols) as f32 * 150.0, 14.0 + (i / cols) as f32 * 156.0, 140.0, 150.0);
+    }
+    let h = row_h(a, t, p);
+    Rect::new(list.x + 6.0, 4.0 + i as f32 * h, list.w - 12.0, h)
+}
+
 /// (y of row i inside the scrolled content, its height, visible height)
 pub fn row_geom(a: &App, t: usize, p: usize, i: usize) -> (f32, f32, f32) {
     let g = pane_geoms(a, t)[p.min(a.tabs[t].panes.len() - 1)];
-    let view_h = (g.list.h - PILL_SPACE).max(40.0);
-    if a.tabs[t].view == View::Grid && !a.tabs[t].panes[p].searching() {
-        let cols = grid_cols(g.list);
-        return (14.0 + (i / cols) as f32 * 156.0, 150.0, view_h);
-    }
-    let h = row_h(a, t, p);
-    (4.0 + i as f32 * h, h, view_h)
+    let r = item_rect(a, t, p, i);
+    (r.y, r.h, g.list.h.max(1.0))
 }
 
 pub fn content_h(a: &App, t: usize, p: usize) -> f32 {
     let n = a.tabs[t].panes[p].rows().len();
     let g = pane_geoms(a, t)[p];
-    if a.tabs[t].view == View::Grid && !a.tabs[t].panes[p].searching() {
-        let cols = grid_cols(g.list);
-        return 14.0 + n.div_ceil(cols) as f32 * 156.0 + PILL_SPACE;
+    if is_pc(a, t, p) {
+        return pc_lay(a, t, p, g.list).h;
     }
-    8.0 + n as f32 * row_h(a, t, p) + PILL_SPACE
+    if tiled(a, t, p) {
+        let cols = grid_cols(g.list);
+        return 14.0 + n.div_ceil(cols) as f32 * 156.0 + 14.0;
+    }
+    8.0 + n as f32 * row_h(a, t, p)
+}
+
+/// Columns of the details / list view: Name, then Date modified, Type, Size from the right. When the pane is too
+/// narrow the extra columns drop out (Type first, then Date, then Size) so Name keeps NAME_MIN.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColPos {
+    pub name: (f32, f32),
+    pub date: Option<(f32, f32)>,
+    pub ty: Option<(f32, f32)>,
+    pub size: Option<(f32, f32)>,
+}
+
+pub fn col_pos(a: &App, r: Rect, name_x: f32) -> ColPos {
+    let lk = &a.look;
+    let right = r.r() - 10.0;
+    let mut want = [(lk.col_date, lk.w_date), (lk.col_type, lk.w_type), (lk.col_size, lk.w_size)];
+    let total = |w: &[(bool, f32)]| w.iter().filter(|c| c.0).map(|c| c.1 + 12.0).sum::<f32>();
+    for drop in [1usize, 0, 2] {
+        if right - name_x - total(&want) >= crate::look::NAME_MIN {
+            break;
+        }
+        want[drop].0 = false;
+    }
+    let mut x = right;
+    let mut out = ColPos::default();
+    if want[2].0 {
+        x -= want[2].1;
+        out.size = Some((x, want[2].1));
+        x -= 12.0;
+    }
+    if want[1].0 {
+        x -= want[1].1;
+        out.ty = Some((x, want[1].1));
+        x -= 12.0;
+    }
+    if want[0].0 {
+        x -= want[0].1;
+        out.date = Some((x, want[0].1));
+        x -= 12.0;
+    }
+    out.name = (name_x, (x - name_x).max(0.0));
+    out
 }
 
 impl App {
     pub fn hit(&mut self, r: Rect, h: Hit) {
-        self.hits.push((r, h));
+        if !self.no_hits {
+            self.hits.push((r, h));
+        }
     }
 
     pub fn hit_at(&self, x: f32, y: f32) -> Hit {
@@ -149,9 +246,28 @@ impl App {
         self.h = ph as f32 / self.scale();
         self.hits.clear();
         let t = self.t.clone();
+        // smooth scrolling: advance before the layout is painted
+        let mut moving = false;
+        for tab in self.tabs.iter_mut() {
+            for pn in tab.panes.iter_mut() {
+                if !pn.sf.settled() {
+                    if (pn.scroll - pn.sf_written).abs() > 0.5 {
+                        // something else moved the list (keyboard, scroll_to): stop following
+                        pn.sf.set(pn.scroll);
+                    } else {
+                        moving |= pn.sf.step();
+                        pn.scroll = pn.sf.value;
+                        pn.sf_written = pn.scroll;
+                    }
+                }
+            }
+        }
         self.gfx.begin();
-        if self.mica && !self.gfx.offscreen() {
+        if self.mica && !self.gfx.offscreen() && self.look.see_through() {
             self.gfx.clear(C(0.0, 0.0, 0.0, 0.0));
+        } else if self.mica && !self.gfx.offscreen() {
+            self.gfx.clear(C(0.0, 0.0, 0.0, 0.0));
+            self.gfx.gradient(Rect::new(0.0, 0.0, self.w, self.h), t.mica_a, t.mica_b);
         } else {
             self.gfx.gradient(Rect::new(0.0, 0.0, self.w, self.h), t.mica_a, t.mica_b);
         }
@@ -165,6 +281,19 @@ impl App {
         self.paint_main(&t);
         self.paint_overlays(&t);
         self.gfx.end();
+        // keep the frame timer only while something moves (no timer at all when idle)
+        moving |= self.hov_f.busy();
+        moving |= self.press_f.busy();
+        moving |= self.menu_out.is_some() || self.drop_out.is_some();
+        if moving && !self.shooting {
+            self.anim();
+        }
+        // caret blink only while a text field has focus
+        let field = self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.accent_field.is_some();
+        if field && !self.caret_timer {
+            self.caret_timer = true;
+            self.timer(T_CARET, 530);
+        }
         if first {
             trace(&format!("{:.1} ms: frame drawn", self.started.elapsed().as_secs_f64() * 1000.0));
         }
@@ -174,32 +303,38 @@ impl App {
     }
 
     // ------------------------------------------------------------------ small parts
+    /// Press-scale around the centre of `r` while `h` is pressed (springs back on release). Pair with `unpress`.
+    fn press_in(&self, r: Rect, h: Hit) -> bool {
+        let k = self.pk(h);
+        if k > 0.001 {
+            self.gfx.push_scale(r.cx(), r.cy(), 1.0 - (1.0 - crate::motion::PRESS_SCALE) * k, 0.0, 0.0);
+            return true;
+        }
+        false
+    }
+
     pub fn button(&mut self, r: Rect, label: &str, glyph: u32, style: Btn, h: Hit, t: &Theme) {
-        let hov = self.hov(h) && style != Btn::Disabled;
-        let pressed = self.pressed == h && hov;
+        let hk = if style == Btn::Disabled { 0.0 } else { self.hk(h) };
+        let pk = if style == Btn::Disabled { 0.0 } else { self.pk(h) };
+        let scaled = style != Btn::Disabled && self.press_in(r, h);
         match style {
             Btn::Std => {
-                self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), 5.0, t.field_border);
-                self.gfx.fill_round(r, 5.0, if pressed { t.layer2 } else if hov { t.card.mix(t.hover.a(1.0), 0.05) } else { t.card });
-                self.gfx.stroke_round(r, 5.0, t.stroke, 1.0);
-                if hov {
-                    self.gfx.fill_round(r, 5.0, t.hover);
-                }
+                self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), R_CTRL, t.field_border);
+                self.gfx.fill_round(r, R_CTRL, t.card.mix(t.layer2, pk));
+                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
+                self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk * (1.0 - pk)));
             }
             Btn::Accent => {
-                self.gfx.fill_round(r, 5.0, if hov { t.accent2 } else { t.accent });
+                self.gfx.fill_round(r, R_CTRL, t.accent.mix(t.accent2, hk).mix(t.accent, pk * 0.6).a(1.0 - 0.12 * pk));
                 self.gfx.fill(Rect::new(r.x + 4.0, r.b() - 1.0, r.w - 8.0, 1.0), C(0.0, 0.0, 0.0, 0.18));
             }
             Btn::Ghost => {
-                if pressed {
-                    self.gfx.fill_round(r, 5.0, t.press);
-                } else if hov {
-                    self.gfx.fill_round(r, 5.0, t.hover);
-                }
+                self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(r, R_CTRL, t.press.a(t.press.3 * pk * 0.6));
             }
             Btn::Disabled => {
-                self.gfx.fill_round(r, 5.0, t.layer2);
-                self.gfx.stroke_round(r, 5.0, t.stroke, 1.0);
+                self.gfx.fill_round(r, R_CTRL, t.layer2);
+                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
             }
         }
         let fg = match style {
@@ -214,16 +349,21 @@ impl App {
             self.gfx.glyph(glyph, Rect::new(x, r.y, 14.0, r.h), 14.0, fg);
         }
         self.gfx.text(label, Rect::new(x + gw, r.y, tw + 2.0, r.h), Font::Ui, 13.0, 400, Align::Left, fg);
+        if scaled {
+            self.gfx.pop_xf();
+        }
         self.hit(r, h);
     }
 
     fn icon_btn(&mut self, r: Rect, glyph: u32, size: f32, color: C, h: Hit, rad: f32, t: &Theme) {
-        if self.pressed == h && self.hov(h) {
-            self.gfx.fill_round(r, rad, t.press);
-        } else if self.hov(h) {
-            self.gfx.fill_round(r, rad, t.hover);
+        let (hk, pk) = (self.hk(h), self.pk(h));
+        let scaled = self.press_in(r, h);
+        self.gfx.fill_round(r, rad, t.hover.a(t.hover.3 * hk));
+        self.gfx.fill_round(r, rad, t.press.a(t.press.3 * pk * 0.6));
+        self.gfx.glyph(glyph, r, size, color.a(color.3 * (1.0 - 0.15 * pk)));
+        if scaled {
+            self.gfx.pop_xf();
         }
-        self.gfx.glyph(glyph, r, size, color);
         self.hit(r, h);
     }
 
@@ -248,11 +388,11 @@ impl App {
     }
 
     fn dropdown(&mut self, r: Rect, label: &str, h: Hit, t: &Theme, font: Font) {
-        self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), 5.0, t.field_bottom);
-        self.gfx.fill_round(r, 5.0, t.field);
-        self.gfx.stroke_round(r, 5.0, t.field_border, 1.0);
+        self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), R_CTRL, t.field_bottom);
+        self.gfx.fill_round(r, R_CTRL, t.field);
+        self.gfx.stroke_round(r, R_CTRL, t.field_border, 1.0);
         if self.hov(h) {
-            self.gfx.fill_round(r, 5.0, t.hover);
+            self.gfx.fill_round(r, R_CTRL, t.hover);
         }
         if font == Font::Fa {
             self.gfx.para(label, Rect::new(r.x + 12.0, r.y + 2.0, r.w - 40.0, r.h), Font::Fa, 13.0, 400, Align::Right, t.text, 28.0, true, 1);
@@ -266,22 +406,22 @@ impl App {
     fn kbd(&mut self, x: f32, y: f32, s: &str, t: &Theme) -> f32 {
         let w = self.gfx.measure(s, Font::Ui, 11.5, 400) + 12.0;
         let r = Rect::new(x, y, w.max(20.0), 20.0);
-        self.gfx.fill_round(r, 4.0, t.kbd);
-        self.gfx.stroke_round(r, 4.0, t.stroke, 1.0);
+        self.gfx.fill_round(r, R_SMALL, t.kbd);
+        self.gfx.stroke_round(r, R_SMALL, t.stroke, 1.0);
         self.gfx.text(s, r, Font::Ui, 11.5, 400, Align::Center, t.text2);
         r.w
     }
 
     fn field_box(&mut self, r: Rect, focus: bool, t: &Theme) {
-        self.gfx.fill_round(r, 5.0, t.field);
-        self.gfx.stroke_round(r, 5.0, t.field_border, 1.0);
+        self.gfx.fill_round(r, R_CTRL, t.field);
+        self.gfx.stroke_round(r, R_CTRL, t.field_border, 1.0);
         if focus {
             self.gfx.clip(Rect::new(r.x, r.b() - 2.0, r.w, 2.0));
-            self.gfx.fill_round(r, 5.0, t.accent);
+            self.gfx.fill_round(r, R_CTRL, t.accent);
             self.gfx.unclip();
         } else {
             self.gfx.clip(Rect::new(r.x, r.b() - 1.0, r.w, 1.0));
-            self.gfx.fill_round(r, 5.0, t.field_bottom);
+            self.gfx.fill_round(r, R_CTRL, t.field_bottom);
             self.gfx.unclip();
         }
     }
@@ -312,9 +452,10 @@ impl App {
     // ------------------------------------------------------------------ title bar with tabs
     fn paint_title(&mut self, t: &Theme) {
         let n = self.tabs.len();
-        let caps_x = self.w - 46.0 * 3.0;
-        let avail = caps_x - 8.0 - 40.0 - 36.0;
-        let tw = (avail / n as f32).clamp(96.0, 200.0);
+        let caps_x = self.w - CAP_W * 3.0;
+        let avail = (caps_x - 8.0 - 40.0 - 36.0).max(40.0);
+        let tw = (avail / n as f32).min(200.0).max(if avail / n as f32 >= 96.0 { 96.0 } else { 36.0 });
+        let la = self.look.layer_alpha();
         let mut x = 8.0;
         let mut tab_hits = vec![];
         for i in 0..n {
@@ -328,12 +469,11 @@ impl App {
                     0.0,
                     0.0,
                     1.0,
-                    t.bar,
+                    t.bar.a(la),
                 );
             } else {
-                if self.hov(Hit::Tab(i)) || self.hov(Hit::TabClose(i)) {
-                    self.gfx.fill_round(Rect::new(r.x, r.y, r.w, r.h - 4.0), 8.0, t.hover);
-                }
+                let hk = self.hk(Hit::Tab(i)).max(self.hk(Hit::TabClose(i)));
+                self.gfx.fill_round(Rect::new(r.x, r.y, r.w, r.h - 4.0), 8.0, t.hover.a(t.hover.3 * hk));
                 if i > 0 && i - 1 != self.cur {
                     self.gfx.fill(Rect::new(r.x, 17.0, 1.0, 14.0), t.stroke);
                 }
@@ -341,55 +481,77 @@ impl App {
             let tab = &self.tabs[i];
             let loc = tab.pane().loc.clone();
             let title = tab.title();
+            let small = tw < 80.0;
+            let ix = if small { r.x + (r.w - 16.0) / 2.0 } else { r.x + 12.0 };
             match loc {
-                Loc::Settings => self.gfx.glyph(0xE713, Rect::new(r.x + 12.0, r.y, 16.0, r.h), 15.0, t.text2),
-                Loc::RecycleBin => self.gfx.glyph(0xE74D, Rect::new(r.x + 12.0, r.y, 16.0, r.h), 15.0, t.text2),
-                Loc::ThisPc => self.gfx.glyph(0xE7F8, Rect::new(r.x + 12.0, r.y, 16.0, r.h), 15.0, t.text2),
-                Loc::Folder(ref p) if p.parent().is_none() => ficons::draw(&self.gfx, t, Kind::Drive, Rect::new(r.x + 12.0, r.cy() - 8.0, 16.0, 16.0)),
-                _ => ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.x + 12.0, r.cy() - 8.0, 16.0, 16.0)),
+                Loc::Settings => self.gfx.glyph(0xE713, Rect::new(ix, r.y, 16.0, r.h), 15.0, t.text2),
+                Loc::RecycleBin => self.gfx.glyph(0xE74D, Rect::new(ix, r.y, 16.0, r.h), 15.0, t.text2),
+                Loc::ThisPc => self.gfx.glyph(0xE7F8, Rect::new(ix, r.y, 16.0, r.h), 15.0, t.text2),
+                Loc::Folder(ref p) if p.parent().is_none() => ficons::draw(&self.gfx, t, Kind::Drive, Rect::new(ix, r.cy() - 8.0, 16.0, 16.0)),
+                _ => ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(ix, r.cy() - 8.0, 16.0, 16.0)),
             }
-            self.gfx.text(&title, Rect::new(r.x + 38.0, r.y, r.w - 38.0 - 34.0, r.h), Font::Ui, 12.0, 400, Align::Left, if active { t.text } else { t.text2 });
-            let cr = Rect::new(r.r() - 30.0, r.y + 4.0, 24.0, 24.0);
-            if self.hov(Hit::TabClose(i)) {
-                self.gfx.fill_round(cr, 4.0, t.hover);
+            if !small {
+                self.gfx.text(&title, Rect::new(r.x + 38.0, r.y, r.w - 38.0 - 34.0, r.h), Font::Ui, 12.0, 400, Align::Left, if active { t.text } else { t.text2 });
+                let cr = Rect::new(r.r() - 30.0, r.y + 4.0, 24.0, 24.0);
+                let hk = self.hk(Hit::TabClose(i));
+                self.gfx.fill_round(cr, R_SMALL, t.hover.a(t.hover.3 * hk));
+                self.gfx.glyph(0xE711, cr, 10.0, t.text2);
+                tab_hits.push((r, Hit::Tab(i)));
+                tab_hits.push((cr, Hit::TabClose(i)));
+            } else {
+                tab_hits.push((r, Hit::Tab(i)));
             }
-            self.gfx.glyph(0xE711, cr, 10.0, t.text2);
-            tab_hits.push((r, Hit::Tab(i)));
-            tab_hits.push((cr, Hit::TabClose(i)));
             x += tw;
         }
         for (r, h) in tab_hits {
             self.hit(r, h);
         }
         let ar = Rect::new(x + 4.0, 8.0, 32.0, 32.0);
-        self.icon_btn(ar, 0xE710, 12.0, t.text2, Hit::TabAdd, 6.0, t);
+        if ar.r() < caps_x - 4.0 {
+            self.icon_btn(ar, 0xE710, 12.0, t.text2, Hit::TabAdd, R_CTRL, t);
+        }
+        // caption buttons exactly as Windows 11 draws them: Segoe Fluent Icons 10 px, 46 px wide, full title bar height,
+        // hover fill, close hover #C42B1C with a white glyph, press fills; restore glyph only when maximised
         let maxed = unsafe { IsZoomed(self.hwnd).as_bool() };
+        let active_win = unsafe { GetForegroundWindow() } == self.hwnd || self.shooting || self.offscreen;
         let caps = [(Hit::Min, 0xE921u32), (Hit::Max, if maxed { 0xE923 } else { 0xE922 }), (Hit::Close, 0xE8BB)];
         for (i, (h, gl)) in caps.iter().enumerate() {
-            let r = Rect::new(caps_x + i as f32 * 46.0, 0.0, 46.0, 32.0);
-            let hov = self.nc_hover == *h && !self.shooting;
-            let mut fg = t.text;
-            if hov {
-                if *h == Hit::Close {
-                    self.gfx.fill(r, C::hex(0xC42B1C));
-                    fg = C::hex(0xFFFFFF);
-                } else {
-                    self.gfx.fill(r, t.hover);
+            let r = Rect::new(caps_x + i as f32 * CAP_W, 0.0, CAP_W, TITLE_H);
+            let hk = self.hk(*h);
+            let down = self.nc_down == *h && self.nc_hover == *h;
+            let mut fg = if active_win { t.text } else { t.text.a(0.45) };
+            if *h == Hit::Close {
+                let red = if down { C::hex(0xC42B1C).a(0.9) } else { C::hex(0xC42B1C) };
+                self.gfx.fill(r, red.a(red.3 * hk));
+                fg = fg.mix(C::hex(0xFFFFFF), hk);
+            } else {
+                let (hov, prs) = if t.dark { (C(1.0, 1.0, 1.0, 0.0605), C(1.0, 1.0, 1.0, 0.0419)) } else { (C(0.0, 0.0, 0.0, 0.0373), C(0.0, 0.0, 0.0, 0.0241)) };
+                self.gfx.fill(r, if down { prs } else { hov.a(hov.3 * hk) });
+                if down {
+                    fg = fg.a(fg.3 * 0.78);
                 }
             }
-            self.gfx.glyph(*gl, r, 10.0, fg);
+            self.gfx.text(&char::from_u32(*gl).unwrap().to_string(), r, Font::Icon, 10.0, 400, Align::Center, fg);
             self.hit(r, *h);
         }
     }
 
     // ------------------------------------------------------------------ top bar
+    /// x where the back button starts (a sidebar toggle sits before it while the sidebar is hidden)
+    pub fn nav_x(&self) -> f32 {
+        if self.side_hidden() { 48.0 } else { 10.0 }
+    }
+
     pub fn omni_rect(&mut self) -> Rect {
         let narrow = self.w < 1000.0;
+        let tiny = self.w < 560.0;
         let vw = if narrow { 34.0 } else { 53.0 };
-        let nw = if narrow { 34.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0 };
+        let nw = if tiny { 0.0 } else if narrow { 34.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0 };
         let vx = self.w - 10.0 - vw;
         let nx = vx - 4.0 - nw;
-        Rect::new(130.0, TITLE_H + 7.0, nx - 4.0 - 6.0 - 130.0, 34.0)
+        // very narrow: no forward button
+        let x0 = self.nav_x() + if tiny { 82.0 } else { 120.0 };
+        Rect::new(x0, TITLE_H + 7.0, (nx - 4.0 - 6.0 - x0).max(60.0), 34.0)
     }
 
     fn crumbs(&self) -> Vec<(String, Loc)> {
@@ -430,33 +592,43 @@ impl App {
 
     fn paint_bar(&mut self, t: &Theme) {
         let bar = Rect::new(0.0, TITLE_H, self.w, BAR_H);
-        self.gfx.fill(bar, t.bar);
+        self.gfx.fill(bar, t.bar.a(self.look.layer_alpha()));
         self.gfx.fill(Rect::new(0.0, TOP - 1.0, self.w, 1.0), t.divider);
         let pane = self.pane();
         let (can_back, can_fwd, can_up) = (!pane.back.is_empty(), !pane.fwd.is_empty(), !matches!(pane.loc, Loc::ThisPc));
         let y = TITLE_H + 8.0;
-        self.icon_btn(Rect::new(10.0, y, 34.0, 32.0), 0xE72B, 16.0, if can_back { t.text } else { t.text_dis }, Hit::Back, 5.0, t);
-        self.icon_btn(Rect::new(48.0, y, 34.0, 32.0), 0xE72A, 16.0, if can_fwd { t.text } else { t.text_dis }, Hit::Fwd, 5.0, t);
-        self.icon_btn(Rect::new(86.0, y, 34.0, 32.0), 0xE74A, 16.0, if can_up { t.text } else { t.text_dis }, Hit::Up, 5.0, t);
+        let tiny = self.w < 560.0;
+        if self.side_hidden() {
+            self.icon_btn(Rect::new(10.0, y, 34.0, 32.0), 0xE700, 16.0, t.text, Hit::Side(usize::MAX), R_CTRL, t);
+        }
+        let nx0 = self.nav_x();
+        self.icon_btn(Rect::new(nx0, y, 34.0, 32.0), 0xE72B, 16.0, if can_back { t.text } else { t.text_dis }, Hit::Back, R_CTRL, t);
+        if !tiny {
+            self.icon_btn(Rect::new(nx0 + 38.0, y, 34.0, 32.0), 0xE72A, 16.0, if can_fwd { t.text } else { t.text_dis }, Hit::Fwd, R_CTRL, t);
+        }
+        self.icon_btn(Rect::new(nx0 + if tiny { 38.0 } else { 76.0 }, y, 34.0, 32.0), 0xE74A, 16.0, if can_up { t.text } else { t.text_dis }, Hit::Up, R_CTRL, t);
         let o = self.omni_rect();
         let narrow = self.w < 1000.0;
         // New + view buttons
         let nx = o.r() + 6.0 + 4.0;
         let vx;
-        if narrow {
-            self.icon_btn(Rect::new(nx, y, 34.0, 32.0), 0xE710, 14.0, t.text, Hit::New, 5.0, t);
+        if tiny {
+            vx = nx;
+            let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
+            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
+        } else if narrow {
+            self.icon_btn(Rect::new(nx, y, 34.0, 32.0), 0xE710, 14.0, t.text, Hit::New, R_CTRL, t);
             vx = nx + 34.0 + 4.0;
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, t.text, Hit::ViewBtn, 5.0, t);
+            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
         } else {
             let nw = 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0;
             let r = Rect::new(nx, y, nw, 32.0);
             self.button(r, "New", 0xE710, Btn::Ghost, Hit::New, t);
             vx = nx + nw + 4.0;
             let vr = Rect::new(vx, y, 53.0, 32.0);
-            if self.hov(Hit::ViewBtn) || self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false) {
-                self.gfx.fill_round(vr, 5.0, t.hover);
-            }
+            let open = self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false);
+            self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
             self.gfx.glyph(g, Rect::new(vr.x + 12.0, vr.y, 14.0, 32.0), 14.0, t.text);
             self.gfx.glyph(0xE70D, Rect::new(vr.x + 32.0, vr.y, 9.0, 32.0), 9.0, t.text2);
@@ -466,16 +638,16 @@ impl App {
         let searching = self.pane().search.is_some();
         let editing = self.path_edit.is_some();
         if searching || editing {
-            self.gfx.fill_round(o, 6.0, t.card);
-            self.gfx.stroke_round(o, 6.0, t.field_border, 1.0);
+            self.gfx.fill_round(o, R_CTRL, t.card);
+            self.gfx.stroke_round(o, R_CTRL, t.field_border, 1.0);
             self.gfx.clip(Rect::new(o.x, o.b() - 2.0, o.w, 2.0));
-            self.gfx.fill_round(o, 6.0, t.accent);
+            self.gfx.fill_round(o, R_CTRL, t.accent);
             self.gfx.unclip();
         } else {
-            self.gfx.fill_round(o, 6.0, t.field);
-            self.gfx.stroke_round(o, 6.0, t.field_border, 1.0);
+            self.gfx.fill_round(o, R_CTRL, t.field);
+            self.gfx.stroke_round(o, R_CTRL, t.field_border, 1.0);
             if self.hov(Hit::Omni) {
-                self.gfx.fill_round(o, 6.0, t.hover.a(t.hover.3 * 0.5));
+                self.gfx.fill_round(o, R_CTRL, t.hover.a(t.hover.3 * 0.5));
             }
         }
         self.hit(o, Hit::Omni);
@@ -491,15 +663,13 @@ impl App {
                 self.gfx.text("Search", Rect::new(o.x + 38.0, o.y, 200.0, o.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
             }
             let cr = Rect::new(o.r() - 32.0, o.y + 4.0, 26.0, 26.0);
-            self.icon_btn(cr, 0xE711, 10.0, t.text2, Hit::OmniClear, 4.0, t);
+            self.icon_btn(cr, 0xE711, 10.0, t.text2, Hit::OmniClear, R_SMALL, t);
         } else {
-            let sw = if narrow { 34.0 } else { 86.0 };
+            let sw = if narrow || o.w < 300.0 { 34.0 } else { 86.0 };
             let sr = Rect::new(o.r() - sw, o.y + 4.0, sw - 4.0, 26.0);
-            if self.hov(Hit::OmniSearch) {
-                self.gfx.fill_round(sr, 4.0, t.hover);
-            }
+            self.gfx.fill_round(sr, R_SMALL, t.hover.a(t.hover.3 * self.hk(Hit::OmniSearch)));
             self.gfx.fill(Rect::new(sr.x, sr.y, 1.0, sr.h), t.divider);
-            if narrow {
+            if sw < 40.0 {
                 self.gfx.glyph(0xE721, sr, 14.0, t.text2);
             } else {
                 self.gfx.glyph(0xE721, Rect::new(sr.x + 10.0, sr.y, 14.0, sr.h), 14.0, t.text2);
@@ -529,7 +699,7 @@ impl App {
             if first > 0 {
                 let r = Rect::new(x, cy, 26.0, 26.0);
                 if self.hov(Hit::Crumb(first - 1)) {
-                    self.gfx.fill_round(r, 4.0, t.hover);
+                    self.gfx.fill_round(r, R_SMALL, t.hover);
                 }
                 self.gfx.text("...", r, Font::Ui, 13.0, 400, Align::Center, t.text);
                 self.hit(r, Hit::Crumb(first - 1));
@@ -541,9 +711,7 @@ impl App {
             for (i, c) in crumbs.iter().enumerate().skip(first) {
                 let w = widths[i].min((sr.x - 8.0 - x).max(30.0));
                 let r = Rect::new(x, cy, w, 26.0);
-                if self.hov(Hit::Crumb(i)) {
-                    self.gfx.fill_round(r, 4.0, t.hover);
-                }
+                self.gfx.fill_round(r, R_SMALL, t.hover.a(t.hover.3 * self.hk(Hit::Crumb(i))));
                 self.gfx.text(&c.0, Rect::new(r.x + 6.0, r.y, r.w - 12.0, r.h), Font::Ui, 13.0, if i == last { 600 } else { 400 }, Align::Left, t.text);
                 self.hit(r, Hit::Crumb(i));
                 x += w;
@@ -561,65 +729,89 @@ impl App {
     }
 
     fn paint_side(&mut self, t: &Theme) {
+        let sw = self.side_w();
         let x = 6.0;
-        let w = SIDE_W - 12.0;
+        let w = sw - 12.0;
         let mut y = TOP + 8.0;
+        if !self.look.see_through() && self.mica && !self.gfx.offscreen() {
+            // transparency off: an opaque sidebar
+            self.gfx.gradient(Rect::new(0.0, TOP, sw, self.h - TOP), t.mica_a, t.mica_b);
+        }
+        let bottom_limit = self.h - 8.0 - 32.0 - 8.0;
+        self.gfx.clip(Rect::new(0.0, TOP, sw, (bottom_limit - TOP).max(0.0)));
         let group = |a: &mut App, y: &mut f32, name: &str| {
             a.gfx.text(name, Rect::new(x + 12.0, *y + 10.0, w, 18.0), Font::Ui, 12.0, 600, Align::Left, t.text3);
             *y += 30.0;
         };
-        group(self, &mut y, "Pinned");
+        let fs = self.look.text();
+        // This PC: the start page with the big drive tiles
+        let r = Rect::new(x, y, w, 32.0);
+        let sel = self.pane().loc == Loc::ThisPc;
+        self.nav_bg(r, sel, Hit::SideThisPc, t);
+        self.gfx.glyph(0xE7F8, Rect::new(r.x + 10.0, r.y, 16.0, r.h), 16.0, t.text2);
+        self.gfx.text("This PC", Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, fs, 400, Align::Left, t.text);
+        self.hit(r, Hit::SideThisPc);
+        y += 36.0;
         let side = self.side.clone();
-        for (i, (name, glyph, color, loc)) in side.iter().enumerate() {
-            let r = Rect::new(x, y, w, 32.0);
-            let sel = self.side_selected(loc);
-            self.nav_bg(r, sel, Hit::Side(i), t);
-            if *glyph == 0 {
-                ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.x + 10.0, r.cy() - 8.0, 16.0, 16.0));
-            } else {
-                let c = if *color == 0 { t.text2 } else { C::hex(*color) };
-                let c = if t.dark && *color != 0 { c.mix(C::hex(0xFFFFFF), 0.25) } else { c };
-                self.gfx.glyph(*glyph, Rect::new(r.x + 10.0, r.y, 16.0, r.h), 16.0, c);
-            }
-            self.gfx.text(name, Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
-            self.hit(r, Hit::Side(i));
-            y += 32.0;
-        }
-        y += 6.0;
-        group(self, &mut y, "Drives");
-        let drives = self.drives.clone();
         let base = side.len();
-        let bottom_limit = self.h - 8.0 - 32.0 - 8.0;
-        for (i, d) in drives.iter().enumerate() {
-            if y + 46.0 > bottom_limit {
-                break;
+        if self.look.show_drives {
+            group(self, &mut y, "Drives");
+            let drives = self.drives.clone();
+            for (i, d) in drives.iter().enumerate() {
+                if y + 46.0 > bottom_limit {
+                    break;
+                }
+                let r = Rect::new(x, y, w, 46.0);
+                let loc = Loc::Folder(d.root.clone().into());
+                let sel = self.side_selected(&loc);
+                self.nav_bg(r, sel, Hit::Side(base + i), t);
+                let letter = d.root.trim_end_matches('\\');
+                let name = if d.label.is_empty() { drive_label(letter) } else { format!("{} ({letter})", d.label) };
+                let l1 = Rect::new(r.x, r.y + 9.5, r.w, 18.0);
+                self.gfx.glyph(if d.kind == "network" { 0xE8CE } else if d.kind == "removable" { 0xE88E } else { 0xEDA2 }, Rect::new(r.x + 10.0, l1.y, 16.0, l1.h), 16.0, t.text2);
+                let free = if d.total > 0 { format!("{} free", fmt::size(d.free)) } else { String::new() };
+                let fw = if w > 170.0 { self.gfx.measure(&free, Font::Ui, 12.0, 400) } else { 0.0 };
+                self.gfx.text(&name, Rect::new(r.x + 38.0, l1.y, r.w - 38.0 - fw - 16.0, l1.h), Font::Ui, fs, 400, Align::Left, t.text);
+                if fw > 0.0 {
+                    self.gfx.text(&free, Rect::new(r.r() - 10.0 - fw - 2.0, l1.y, fw + 2.0, l1.h), Font::Ui, 12.0, 400, Align::Right, t.text3);
+                }
+                let mr = Rect::new(r.x + 38.0, l1.b() + 5.0, r.w - 48.0, 4.0);
+                self.gfx.fill_round(mr, 2.0, t.track);
+                if d.total > 0 {
+                    let used = 1.0 - d.free as f32 / d.total as f32;
+                    self.gfx.fill_round(Rect::new(mr.x, mr.y, (mr.w * used).max(4.0), 4.0), 2.0, if used > 0.9 { t.danger } else { t.accent });
+                }
+                self.hit(r, Hit::Side(base + i));
+                y += 46.0;
             }
-            let r = Rect::new(x, y, w, 46.0);
-            let loc = Loc::Folder(d.root.clone().into());
-            let sel = self.side_selected(&loc);
-            self.nav_bg(r, sel, Hit::Side(base + i), t);
-            let letter = d.root.trim_end_matches('\\');
-            let name = if d.label.is_empty() { drive_label(letter) } else { format!("{} ({letter})", d.label) };
-            let l1 = Rect::new(r.x, r.y + 9.5, r.w, 18.0);
-            self.gfx.glyph(if d.kind == "network" { 0xE8CE } else if d.kind == "removable" { 0xE88E } else { 0xEDA2 }, Rect::new(r.x + 10.0, l1.y, 16.0, l1.h), 16.0, t.text2);
-            let free = if d.total > 0 { format!("{} free", fmt::size(d.free)) } else { String::new() };
-            let fw = self.gfx.measure(&free, Font::Ui, 12.0, 400);
-            self.gfx.text(&name, Rect::new(r.x + 38.0, l1.y, r.w - 38.0 - fw - 16.0, l1.h), Font::Ui, 13.0, 400, Align::Left, t.text);
-            self.gfx.text(&free, Rect::new(r.r() - 10.0 - fw - 2.0, l1.y, fw + 2.0, l1.h), Font::Ui, 12.0, 400, Align::Right, t.text3);
-            let mr = Rect::new(r.x + 38.0, l1.b() + 5.0, r.w - 48.0, 4.0);
-            self.gfx.fill_round(mr, 2.0, t.track);
-            if d.total > 0 {
-                let used = 1.0 - d.free as f32 / d.total as f32;
-                self.gfx.fill_round(Rect::new(mr.x, mr.y, (mr.w * used).max(4.0), 4.0), 2.0, if used > 0.9 { t.danger } else { t.accent });
+            y += 6.0;
+        }
+        if self.look.show_pinned {
+            group(self, &mut y, "Pinned");
+            for (i, (name, glyph, color, loc)) in side.iter().enumerate() {
+                if y + 32.0 > bottom_limit {
+                    break;
+                }
+                let r = Rect::new(x, y, w, 32.0);
+                let sel = self.side_selected(loc);
+                self.nav_bg(r, sel, Hit::Side(i), t);
+                if *glyph == 0 {
+                    ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.x + 10.0, r.cy() - 8.0, 16.0, 16.0));
+                } else {
+                    let c = if *color == 0 { t.text2 } else { C::hex(*color) };
+                    let c = if t.dark && *color != 0 { c.mix(C::hex(0xFFFFFF), 0.25) } else { c };
+                    self.gfx.glyph(*glyph, Rect::new(r.x + 10.0, r.y, 16.0, r.h), 16.0, c);
+                }
+                self.gfx.text(name, Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, fs, 400, Align::Left, t.text);
+                self.hit(r, Hit::Side(i));
+                y += 32.0;
             }
-            self.hit(r, Hit::Side(base + i));
-            y += 46.0;
+            y += 6.0;
         }
         let recent = self.recent.clone();
-        if !recent.is_empty() && y + 30.0 + 32.0 + 6.0 < bottom_limit {
-            y += 6.0;
+        if self.look.show_recent && !recent.is_empty() && y + 30.0 + 32.0 < bottom_limit {
             group(self, &mut y, "Recent");
-            let base = base + drives.len();
+            let base = base + self.drives.len();
             for (i, r0) in recent.iter().enumerate() {
                 if y + 32.0 > bottom_limit {
                     break;
@@ -627,71 +819,92 @@ impl App {
                 let r = Rect::new(x, y, w, 32.0);
                 self.nav_bg(r, false, Hit::Side(base + i), t);
                 ficons::draw(&self.gfx, t, ficons::kind_of(&r0.name, r0.is_dir), Rect::new(r.x + 10.0, r.cy() - 8.0, 16.0, 16.0));
-                self.gfx.text(&r0.name, Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
+                self.gfx.text(&r0.name, Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, fs, 400, Align::Left, t.text);
                 self.hit(r, Hit::Side(base + i));
                 y += 32.0;
             }
         }
+        self.gfx.unclip();
         let r = Rect::new(x, self.h - 8.0 - 32.0, w, 32.0);
         let sel = self.pane().loc == Loc::Settings;
         self.nav_bg(r, sel, Hit::SideSettings, t);
         self.gfx.glyph(0xE713, Rect::new(r.x + 10.0, r.y, 16.0, r.h), 16.0, t.text2);
-        self.gfx.text("Settings", Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
+        self.gfx.text("Settings", Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, fs, 400, Align::Left, t.text);
         self.hit(r, Hit::SideSettings);
+        // the edge: drag to resize (double-click: default width)
+        let er = Rect::new(sw - 4.0, TOP, 8.0, self.h - TOP);
+        let ek = if self.side_drag.is_some() { 1.0 } else { self.hk(Hit::SideEdge) };
+        self.gfx.fill(Rect::new(sw - 1.0, TOP, 2.0, self.h - TOP), t.accent.a(0.6 * ek));
+        self.hit(er, Hit::SideEdge);
     }
 
     fn nav_bg(&mut self, r: Rect, sel: bool, h: Hit, t: &Theme) {
+        let (hk, pk) = (self.hk(h), self.pk(h));
         if sel {
-            self.gfx.fill_round(r, 5.0, t.navsel);
+            self.gfx.fill_round(r, R_CTRL, t.navsel);
             self.gfx.fill_round(Rect::new(r.x, r.cy() - 7.0, 3.0, 14.0), 1.5, t.accent);
-        } else if self.pressed == h && self.hov(h) {
-            self.gfx.fill_round(r, 5.0, t.press);
-        } else if self.hov(h) {
-            self.gfx.fill_round(r, 5.0, t.hover);
+        } else {
+            self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk));
+            self.gfx.fill_round(r, R_CTRL, t.press.a(t.press.3 * pk * 0.7));
         }
     }
 
     fn paint_rail(&mut self, t: &Theme) {
+        if self.side_hidden() {
+            return;
+        }
         let x = 6.0;
         let mut y = TOP + 8.0;
         let r = Rect::new(x, y, 40.0, 36.0);
-        self.icon_btn(r, 0xE700, 16.0, t.text2, Hit::SideSettings, 5.0, t);
-        // (the menu button opens Settings' sidebar view later; for now it toggles the full sidebar off split view)
-        self.hits.pop();
-        self.hit(r, Hit::Side(usize::MAX));
+        // the menu button: full sidebar / rail
+        self.icon_btn(r, 0xE700, 16.0, t.text2, Hit::Side(usize::MAX), R_CTRL, t);
+        y += 38.0;
+        let r = Rect::new(x, y, 40.0, 36.0);
+        let sel = self.pane().loc == Loc::ThisPc;
+        self.nav_bg(r, sel, Hit::SideThisPc, t);
+        self.gfx.glyph(0xE7F8, r, 16.0, t.text2);
+        self.hit(r, Hit::SideThisPc);
         y += 38.0;
         let side = self.side.clone();
-        for (i, (_, glyph, color, loc)) in side.iter().enumerate() {
-            let r = Rect::new(x, y, 40.0, 36.0);
-            let sel = self.side_selected(loc);
-            self.nav_bg(r, sel, Hit::Side(i), t);
-            if *glyph == 0 {
-                ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.cx() - 8.0, r.cy() - 8.0, 16.0, 16.0));
-            } else {
-                let c = if *color == 0 { t.text2 } else { C::hex(*color) };
-                self.gfx.glyph(*glyph, r, 16.0, c);
-            }
-            self.hit(r, Hit::Side(i));
-            y += 38.0;
-        }
-        y += 6.0;
-        self.gfx.fill(Rect::new(x + 8.0, y, 24.0, 1.0), t.divider);
-        y += 10.0;
         let drives = self.drives.clone();
-        for (i, d) in drives.iter().enumerate() {
-            if y + 36.0 > self.h - 8.0 - 40.0 {
-                break;
+        let limit = self.h - 8.0 - 40.0;
+        if self.look.show_drives {
+            for (i, d) in drives.iter().enumerate() {
+                if y + 36.0 > limit {
+                    break;
+                }
+                let r = Rect::new(x, y, 40.0, 36.0);
+                let loc = Loc::Folder(d.root.clone().into());
+                let sel = self.side_selected(&loc);
+                self.nav_bg(r, sel, Hit::Side(side.len() + i), t);
+                let chip = Rect::new(r.cx() - 13.0, r.cy() - 10.0, 26.0, 20.0);
+                self.gfx.fill_round(chip, R_SMALL, t.layer2);
+                self.gfx.stroke_round(chip, R_SMALL, t.stroke, 1.0);
+                self.gfx.text(d.root.trim_end_matches('\\'), chip, Font::Ui, 12.0, 600, Align::Center, t.text2);
+                self.hit(r, Hit::Side(side.len() + i));
+                y += 38.0;
             }
-            let r = Rect::new(x, y, 40.0, 36.0);
-            let loc = Loc::Folder(d.root.clone().into());
-            let sel = self.side_selected(&loc);
-            self.nav_bg(r, sel, Hit::Side(side.len() + i), t);
-            let chip = Rect::new(r.cx() - 13.0, r.cy() - 10.0, 26.0, 20.0);
-            self.gfx.fill_round(chip, 4.0, t.layer2);
-            self.gfx.stroke_round(chip, 4.0, t.stroke, 1.0);
-            self.gfx.text(d.root.trim_end_matches('\\'), chip, Font::Ui, 12.0, 600, Align::Center, t.text2);
-            self.hit(r, Hit::Side(side.len() + i));
-            y += 38.0;
+            y += 6.0;
+            self.gfx.fill(Rect::new(x + 8.0, y, 24.0, 1.0), t.divider);
+            y += 10.0;
+        }
+        if self.look.show_pinned {
+            for (i, (_, glyph, color, loc)) in side.iter().enumerate() {
+                if y + 36.0 > limit {
+                    break;
+                }
+                let r = Rect::new(x, y, 40.0, 36.0);
+                let sel = self.side_selected(loc);
+                self.nav_bg(r, sel, Hit::Side(i), t);
+                if *glyph == 0 {
+                    ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.cx() - 8.0, r.cy() - 8.0, 16.0, 16.0));
+                } else {
+                    let c = if *color == 0 { t.text2 } else { C::hex(*color) };
+                    self.gfx.glyph(*glyph, r, 16.0, c);
+                }
+                self.hit(r, Hit::Side(i));
+                y += 38.0;
+            }
         }
         let r = Rect::new(x, self.h - 8.0 - 36.0, 40.0, 36.0);
         let sel = self.pane().loc == Loc::Settings;
@@ -703,7 +916,7 @@ impl App {
     // ------------------------------------------------------------------ main area
     fn paint_main(&mut self, t: &Theme) {
         let m = self.main_rect();
-        self.gfx.fill(m, t.layer);
+        self.gfx.fill(m, t.layer.a(self.look.layer_alpha()));
         self.gfx.fill(Rect::new(m.x, m.y, 1.0, m.h), t.stroke);
         let cur = self.cur;
         if self.pane().loc == Loc::Settings {
@@ -732,11 +945,8 @@ impl App {
             }
         }
         self.paint_status(t);
-        if self.whatis.is_some() && !self.tab().split() {
+        if self.whatis.is_some() && !self.tab().split() && content_rect(self).w < m.w - 2.0 {
             self.paint_whatis(t);
-        }
-        if self.pane().loc != Loc::Settings {
-            self.paint_pill(t);
         }
     }
 
@@ -778,17 +988,17 @@ impl App {
         let w1 = self.gfx.measure(&here, Font::Ui, 13.0, 400).min(160.0) + 28.0;
         let w2 = self.gfx.measure("This PC", Font::Ui, 13.0, 600) + 28.0;
         let seg = Rect::new(s.x + 16.0, s.y + 8.0, w1 + w2 + 6.0, 32.0);
-        self.gfx.fill_round(seg, 6.0, t.layer2);
-        self.gfx.stroke_round(seg, 6.0, t.stroke, 1.0);
+        self.gfx.fill_round(seg, R_CTRL, t.layer2);
+        self.gfx.stroke_round(seg, R_CTRL, t.stroke, 1.0);
         for (i, (label, w)) in [(here.as_str(), w1), ("This PC", w2)].iter().enumerate() {
             let x = seg.x + 2.0 + if i == 0 { 0.0 } else { w1 + 2.0 };
             let r = Rect::new(x, seg.y + 2.0, *w, 28.0);
             let on = (i == 1) == pc;
             if on {
-                self.gfx.fill_round(r, 4.0, t.card);
-                self.gfx.stroke_round(r, 4.0, t.stroke, 1.0);
+                self.gfx.fill_round(r, R_SMALL, t.card);
+                self.gfx.stroke_round(r, R_SMALL, t.stroke, 1.0);
             } else if self.hov(Hit::Scope(i as u8)) {
-                self.gfx.fill_round(r, 4.0, t.hover);
+                self.gfx.fill_round(r, R_SMALL, t.hover);
             }
             self.gfx.text(label, r.inset(12.0, 0.0), Font::Ui, 13.0, if on { 600 } else { 400 }, Align::Center, if on { t.text } else { t.text2 });
             self.hit(r, Hit::Scope(i as u8));
@@ -801,10 +1011,10 @@ impl App {
             let wv = self.gfx.measure(val, Font::Ui, 12.5, 400);
             let r = Rect::new(x, s.y + 9.0, 12.0 + wn + 6.0 + wv + 6.0 + 9.0 + 10.0, 30.0);
             let on = *idx != 0;
-            self.gfx.fill_round(r, 15.0, if on { t.sel } else { t.card });
-            self.gfx.stroke_round(r, 15.0, if on { t.sel_stroke } else { t.stroke }, 1.0);
+            self.gfx.fill_round(r, R_CTRL, if on { t.sel } else { t.card });
+            self.gfx.stroke_round(r, R_CTRL, if on { t.sel_stroke } else { t.stroke }, 1.0);
             if self.hov(Hit::Filter(i as u8)) {
-                self.gfx.fill_round(r, 15.0, t.hover);
+                self.gfx.fill_round(r, R_CTRL, t.hover);
             }
             self.gfx.text(name, Rect::new(r.x + 12.0, r.y, wn + 2.0, r.h), Font::Ui, 12.5, 400, Align::Left, t.text);
             self.gfx.text(val, Rect::new(r.x + 12.0 + wn + 6.0, r.y, wv + 2.0, r.h), Font::Ui, 12.5, 400, Align::Left, t.text2);
@@ -826,14 +1036,14 @@ impl App {
             let mw = 14.0 + 13.0 + 8.0 + self.gfx.measure("By meaning", Font::Ui, 13.0, 400) + 12.0;
             let r = Rect::new(right - mw, s.y + 8.0, mw, 32.0);
             if meaning {
-                self.gfx.fill_round(r, 16.0, t.sel);
-                self.gfx.stroke_round(r, 16.0, t.sel_stroke, 1.0);
+                self.gfx.fill_round(r, R_CTRL, t.sel);
+                self.gfx.stroke_round(r, R_CTRL, t.sel_stroke, 1.0);
             } else {
-                self.gfx.fill_round(r, 16.0, t.card);
-                self.gfx.stroke_round(r, 16.0, t.stroke, 1.0);
+                self.gfx.fill_round(r, R_CTRL, t.card);
+                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
             }
             if self.hov(Hit::Meaning) {
-                self.gfx.fill_round(r, 16.0, t.hover);
+                self.gfx.fill_round(r, R_CTRL, t.hover);
             }
             self.gfx.glyph(0xF4A5, Rect::new(r.x + 13.0, r.y, 14.0, r.h), 13.0, t.accent_text);
             self.gfx.text("By meaning", Rect::new(r.x + 35.0, r.y, mw - 40.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
@@ -843,63 +1053,121 @@ impl App {
         self.gfx.text(&count, Rect::new(x + 6.0, s.y, (right - x - 6.0).max(0.0), s.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
     }
 
-    fn cols_layout(&self, g: &PG) -> (f32, f32, bool) {
-        let narrow = g.all.w < 600.0;
-        let (dw, sw) = if narrow { (112.0, 76.0) } else { (150.0, 92.0) };
-        (dw, sw, narrow)
-    }
-
     fn paint_list(&mut self, g: PG, p: usize, t: &Theme) {
         let cur = self.cur;
         let view = self.tabs[cur].view;
         let pane_searching = self.tabs[cur].panes[p].searching();
-        let grid = view == View::Grid && !pane_searching;
-        let (dw, sw, narrow) = self.cols_layout(&g);
-        // column header
-        if !grid {
+        let pc = is_pc(self, cur, p);
+        let grid = tiled(self, cur, p) && !pc;
+        let (fs, fs2) = (self.look.text(), self.look.small_text());
+        let small = view == View::List && !pane_searching;
+        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        // column header (dividers can be dragged; double-click fits)
+        if !grid && !pc && g.cols.h > 0.0 {
             let c = g.cols;
             let (sort, desc) = self.tabs[cur].panes[p].sort;
-            let r_size = Rect::new(c.r() - 6.0 - 16.0 - sw, c.y, sw, c.h);
-            let r_date = Rect::new(r_size.x - 12.0 - dw, c.y, dw, c.h);
-            let r_name = Rect::new(c.x + 6.0 + 16.0, c.y, r_date.x - 12.0 - c.x - 22.0, c.h);
-            for (i, (label, r, col)) in [("Name", r_name, SortCol::Name), ("Date modified", r_date, SortCol::Date), ("Size", r_size, SortCol::Size)].iter().enumerate() {
-                let hr = Rect::new(r.x - 6.0, r.y + 4.0, r.w + 12.0, r.h - 8.0);
-                if self.hov(Hit::Header(p, i as u8)) {
-                    self.gfx.fill_round(hr, 4.0, t.hover);
-                }
-                let lw = self.gfx.measure(label, Font::Ui, 12.0, 400);
-                let right = i == 2;
-                let tx = if right { r.r() - lw } else { r.x };
+            let rr = Rect::new(c.x + 6.0, c.y, c.w - 12.0, c.h);
+            let cp = col_pos(self, rr, rr.x + 10.0 + isz + 10.0);
+            let mut heads: Vec<(&str, f32, f32, SortCol, bool, u8)> = vec![("Name", rr.x + 10.0, cp.name.0 + cp.name.1 - rr.x - 10.0, SortCol::Name, false, 0)];
+            if let Some((x, w)) = cp.date {
+                heads.push(("Date modified", x, w, SortCol::Date, false, 1));
+            }
+            if let Some((x, w)) = cp.ty {
+                heads.push(("Type", x, w, SortCol::Type, false, 3));
+            }
+            if let Some((x, w)) = cp.size {
+                heads.push(("Size", x, w, SortCol::Size, true, 2));
+            }
+            for (label, x, w, col, right, idx) in heads.iter().copied() {
+                let hr = Rect::new(x - 6.0, c.y + 4.0, w + 12.0, c.h - 8.0);
+                let h = Hit::Header(p, idx);
+                self.gfx.fill_round(hr, R_SMALL, t.hover.a(t.hover.3 * self.hk(h)));
+                self.gfx.fill_round(hr, R_SMALL, t.press.a(t.press.3 * self.pk(h) * 0.7));
+                let lw = self.gfx.measure(label, Font::Ui, 12.0, 400).min(w);
+                let tx = if right { x + w - lw } else { x };
                 let arrow_x = if right { tx - 14.0 } else { tx + lw + 6.0 };
-                self.gfx.text(label, Rect::new(tx, r.y, lw + 2.0, r.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
-                if sort == *col && !pane_searching {
-                    self.gfx.glyph(if desc { 0xE70D } else { 0xE70E }, Rect::new(arrow_x, r.y, 8.0, r.h), 8.0, t.text2);
+                self.gfx.text(label, Rect::new(tx, c.y, lw + 2.0, c.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
+                if sort == col && !pane_searching && arrow_x + 8.0 < x + w + 6.0 {
+                    self.gfx.glyph(if desc { 0xE70D } else { 0xE70E }, Rect::new(arrow_x, c.y, 8.0, c.h), 8.0, t.text2);
                 }
-                self.hit(hr, Hit::Header(p, i as u8));
+                self.hit(hr, h);
+            }
+            for (k, col) in [cp.date, cp.ty, cp.size].iter().enumerate() {
+                if let Some((x, _)) = col {
+                    let h = Hit::ColEdge(p, k as u8);
+                    let on = self.col_drag.map(|d| d.0 == k as u8).unwrap_or(false);
+                    let hk = if on { 1.0 } else { self.hk(h) };
+                    self.gfx.fill(Rect::new(x - 6.5, c.y + 9.0, 1.0, c.h - 18.0), t.divider.mix(t.accent, hk));
+                    self.hit(Rect::new(x - 10.0, c.y, 8.0, c.h), h);
+                }
             }
             self.gfx.fill(Rect::new(c.x + 6.0, c.b() - 1.0, c.w - 12.0, 1.0), t.divider);
         }
         let list = g.list;
+        if list.h <= 0.0 {
+            return;
+        }
         self.hit(list, Hit::ListBg(p));
-        // clamp scroll
+        // clamp scroll (and the smooth-scroll target)
         let ch = content_h(self, cur, p);
         let max = (ch - list.h).max(0.0);
+        {
+            let pane = &mut self.tabs[cur].panes[p];
+            pane.scroll = pane.scroll.clamp(0.0, max);
+            if !pane.sf.settled() {
+                pane.sf.target = pane.sf.target.clamp(0.0, max);
+            }
+        }
+        // selection changes: a single selection slides to its new row, newly selected rows fade in
+        let (seen, sel_now) = {
+            let pane = &self.tabs[cur].panes[p];
+            (pane.sel_seen.clone(), pane.sel.clone())
+        };
+        if seen != sel_now {
+            let mut slide = None;
+            let mut fades = vec![];
+            if seen.len() == 1 && sel_now.len() == 1 && !self.shooting {
+                let old = seen.iter().next().unwrap().clone();
+                if let Some(oi) = self.tabs[cur].panes[p].rows().iter().position(|r| r.path == old) {
+                    slide = Some(item_rect(self, cur, p, oi));
+                }
+            }
+            if slide.is_none() {
+                fades = sel_now.difference(&seen).cloned().collect();
+            }
+            let now = Instant::now();
+            let pane = &mut self.tabs[cur].panes[p];
+            pane.slide = slide.map(|r| (r, now));
+            for f in fades {
+                pane.sel_fade.insert(f, now);
+            }
+            pane.sel_seen = sel_now;
+        }
         let pane = &mut self.tabs[cur].panes[p];
-        pane.scroll = pane.scroll.clamp(0.0, max);
+        pane.sel_fade.retain(|_, at| crate::motion::moving(*at, Spring::Snappy));
+        if pane.slide.map(|s| !crate::motion::moving(s.1, Spring::Snappy)).unwrap_or(false) {
+            pane.slide = None;
+        }
+        let animating_sel = !pane.sel_fade.is_empty() || pane.slide.is_some();
         let scroll = pane.scroll;
         let loading = pane.loading;
         let error = pane.error.clone();
         let rows = pane.rows().clone();
         let sel = pane.sel.clone();
+        let sel_fade = pane.sel_fade.clone();
+        let slide = pane.slide;
         let focus = if pane.kb { pane.focus } else { None };
         let shown_at = pane.shown_at;
         let back_anim = pane.back_anim;
-        // folder change: fade in + move up 6 px (back: moves down)
-        let k = prog(shown_at, 160.0, self.shooting);
-        let dy = (1.0 - k) * if back_anim { -6.0 } else { 6.0 };
+        if animating_sel {
+            self.anim();
+        }
+        // folder change: the new view fades in and settles from 8 px (back: from above)
+        let k = prog(shown_at, 300.0, self.shooting);
+        let dy = (1.0 - k) * if back_anim { -8.0 } else { 8.0 };
         self.gfx.clip(list);
-        if k < 1.0 {
-            self.gfx.opacity_layer(list, k.max(0.05));
+        if k != 1.0 {
+            self.gfx.opacity_layer(list, k.clamp(0.05, 1.0));
             self.anim();
         }
         if rows.is_empty() {
@@ -917,106 +1185,175 @@ impl App {
         let menu_rows: Vec<std::path::PathBuf> = self.menu.as_ref().map(|m| m.paths.clone()).unwrap_or_default();
         let drop_target = self.drag_in.as_ref().and_then(|d| d.target.clone());
         let inline = self.inline.as_ref().filter(|i| i.pane == p).map(|i| (i.path.clone(), i.field.clone()));
-        if grid {
-            let cols = grid_cols(list);
-            let (x0, y0) = (list.x + 20.0, list.y + 14.0 - scroll + dy);
-            for (i, it) in rows.iter().enumerate() {
-                let r = Rect::new(x0 + (i % cols) as f32 * 150.0, y0 + (i / cols) as f32 * 156.0, 140.0, 150.0);
-                if r.b() < list.y || r.y > list.b() {
-                    continue;
+        let to_win = |r: Rect| Rect::new(r.x, list.y + r.y - scroll + dy, r.w, r.h);
+        let rad = if pc { R_CARD } else { R_CTRL };
+        // selection fill of one item: fades in, or slides from the previous item
+        let sel_fill = |a: &mut App, i: usize, r: Rect, path: &std::path::PathBuf| {
+            let mut fr = r;
+            let mut alpha = 1.0;
+            if let Some((from, at)) = slide {
+                let k = crate::motion::since(at, Spring::Snappy, a.shooting);
+                let f = to_win(from);
+                fr = Rect::new(f.x + (r.x - f.x) * k, f.y + (r.y - f.y) * k, f.w + (r.w - f.w) * k, f.h + (r.h - f.h) * k);
+            } else if let Some(at) = sel_fade.get(path) {
+                alpha = crate::motion::since(*at, Spring::Snappy, a.shooting).clamp(0.0, 1.0);
+            }
+            let _ = i;
+            a.gfx.fill_round(fr, rad, t.sel.a(alpha));
+            fr
+        };
+        let n = rows.len();
+        // which items can be on screen
+        let (first, last) = if grid || pc {
+            (0, n)
+        } else {
+            let rh = row_h(self, cur, p);
+            let f = ((scroll - 4.0 - dy.abs()) / rh).floor().max(0.0) as usize;
+            (f.min(n), (((scroll + list.h + dy.abs()) / rh).ceil() as usize + 1).min(n))
+        };
+        let pl = if pc { Some(pc_lay(self, cur, p, list)) } else { None };
+        if let Some(l) = pl {
+            // section titles of the This PC page
+            let hy = list.y + l.head_d - scroll + dy;
+            self.gfx.text("Drives", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
+            if l.n_d < n {
+                let hy = list.y + l.head_p - scroll + dy;
+                self.gfx.text("Pinned", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
+            }
+        }
+        for i in first..last {
+            let it = &rows[i];
+            let r = to_win(item_rect(self, cur, p, i));
+            if r.b() < list.y || r.y > list.b() {
+                continue;
+            }
+            let h = Hit::Row(p, i);
+            let is_sel = sel.contains(&it.path);
+            let (hk, pk) = (self.hk(h), self.pk(h));
+            let target = drop_target.as_ref() == Some(&it.path);
+            if target {
+                self.gfx.fill_round(r, rad, t.sel);
+                self.gfx.stroke_round(r, rad, t.accent, 1.5);
+            } else if is_sel {
+                sel_fill(self, i, r, &it.path);
+                if grid || pc {
+                    self.gfx.stroke_round(r, rad, t.sel_stroke.a(if slide.is_some() { 0.0 } else { 1.0 }), 1.0);
                 }
-                let is_sel = sel.contains(&it.path);
-                let hov = self.hov(Hit::Row(p, i));
-                if is_sel || drop_target.as_ref() == Some(&it.path) {
-                    self.gfx.fill_round(r, 6.0, t.sel);
-                    self.gfx.stroke_round(r, 6.0, if drop_target.as_ref() == Some(&it.path) { t.accent } else { t.sel_stroke }, 1.0);
-                } else if hov || menu_rows.contains(&it.path) {
-                    self.gfx.fill_round(r, 6.0, t.hover);
+            } else if menu_rows.contains(&it.path) {
+                self.gfx.fill_round(r, rad, t.hover);
+                self.gfx.stroke_round(r, rad, t.stroke, 1.0);
+            }
+            if !target {
+                self.gfx.fill_round(r, rad, t.hover.a(t.hover.3 * hk * if is_sel { 0.6 } else { 1.0 }));
+                self.gfx.fill_round(r, rad, t.press.a(t.press.3 * pk * 0.8));
+            }
+            if focus == Some(i) {
+                self.gfx.stroke_round(r, rad, t.accent, 1.0);
+            }
+            if let Some(l) = pl {
+                if i < l.n_d {
+                    self.paint_drive_tile(r, it, t);
+                } else {
+                    ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(r.x + 12.0, r.cy() - 16.0, 32.0, 32.0));
+                    self.gfx.text(&it.name, Rect::new(r.x + 56.0, r.y + 9.0, r.w - 66.0, 20.0), Font::Ui, fs, 400, Align::Left, t.text);
+                    self.gfx.text(&it.folder, Rect::new(r.x + 56.0, r.y + 29.0, r.w - 66.0, 18.0), Font::Ui, fs2, 400, Align::Left, t.text3);
                 }
+            } else if grid {
                 let th = Rect::new(r.x + 6.0, r.y + 6.0, 128.0, 96.0);
                 let has_thumb = matches!(it.kind, Kind::Img | Kind::Video | Kind::Pdf);
                 let bmp = if has_thumb { self.thumb_bitmap(&it.path) } else { None };
                 if let Some(b) = bmp {
                     let (bw, bh) = self.thumbs.get(&it.path).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
-                    // cover the 128 x 96 box
                     let s = (th.w / bw).max(th.h / bh);
                     let (cw, chh) = (th.w / s, th.h / s);
                     let src = Rect::new((bw - cw) / 2.0, (bh - chh) / 2.0, cw, chh);
                     self.gfx.bitmap_src(&b, th, src, 1.0);
-                    self.gfx.stroke_round(th, 5.0, t.stroke, 1.0);
+                    self.gfx.stroke_round(th, R_CTRL, t.stroke, 1.0);
                 } else {
                     ficons::draw(&self.gfx, t, it.kind, Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0));
                 }
                 self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, r.y + 108.0, 128.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
-                self.hit(Rect::new(r.x, r.y.max(list.y), r.w, (r.b().min(list.b()) - r.y.max(list.y)).max(0.0)), Hit::Row(p, i));
-            }
-        } else {
-            let rh = row_h(self, cur, p);
-            let small = view == View::List && !pane_searching;
-            let first = ((scroll - 4.0) / rh).floor().max(0.0) as usize;
-            for i in first..rows.len() {
-                let it = &rows[i];
-                let y = list.y + 4.0 + i as f32 * rh - scroll + dy;
-                if y > list.b() {
-                    break;
-                }
-                let r = Rect::new(list.x + 6.0, y, list.w - 12.0, rh);
-                let is_sel = sel.contains(&it.path);
-                let hov = self.hov(Hit::Row(p, i));
-                if drop_target.as_ref() == Some(&it.path) {
-                    self.gfx.fill_round(r, 5.0, t.sel);
-                    self.gfx.stroke_round(r, 5.0, t.accent, 1.5);
-                } else if is_sel {
-                    self.gfx.fill_round(r, 5.0, t.sel);
-                } else if menu_rows.contains(&it.path) {
-                    self.gfx.fill_round(r, 5.0, t.hover);
-                    self.gfx.stroke_round(r, 5.0, t.stroke, 1.0);
-                } else if hov {
-                    self.gfx.fill_round(r, 5.0, t.hover);
-                }
-                if focus == Some(i) {
-                    self.gfx.stroke_round(r, 5.0, t.accent, 1.0);
-                }
-                let isz = if small { 16.0 } else { 20.0 };
+            } else {
+                let rh = r.h;
                 ficons::draw(&self.gfx, t, it.kind, Rect::new(r.x + 10.0, r.cy() - isz / 2.0, isz, isz));
-                let r_size = Rect::new(r.r() - 10.0 - sw, r.y, sw, rh);
-                let r_date = Rect::new(r_size.x - 12.0 - dw, r.y, dw, rh);
-                let nx = r.x + 10.0 + isz + 10.0;
-                let nw = r_date.x - 12.0 - nx;
+                let cp = col_pos(self, r, r.x + 10.0 + isz + 10.0);
+                let (nx, nw) = cp.name;
                 let name = self.display_name(it);
-                if let Some((ip, f)) = inline.as_ref().filter(|x| x.0 == it.path) {
-                    let _ = ip;
+                if let Some((_, f)) = inline.as_ref().filter(|x| x.0 == it.path) {
                     let fr = Rect::new(nx - 6.0, r.y + (rh - 26.0) / 2.0, nw + 6.0, 26.0);
                     self.field_box(fr, true, t);
                     self.field_text(f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 13.0, true, t, &[]);
                 } else if pane_searching {
                     let spans: Vec<Span> = it.hl.iter().map(|(s, l)| Span { start: *s, len: *l, color: t.accent_text, weight: 600, italic: false }).collect();
-                    self.gfx.text_spans(&name, Rect::new(nx, r.y + 5.0, nw, 20.0), Font::Ui, 13.0, 400, t.text, &spans);
-                    self.gfx.text(&it.folder, Rect::new(nx, r.y + 25.0, nw, 16.0), Font::Ui, 12.0, 400, Align::Left, t.text3);
+                    self.gfx.text_spans(&name, Rect::new(nx, r.y + 5.0, nw, 20.0), Font::Ui, fs, 400, t.text, &spans);
+                    self.gfx.text(&it.folder, Rect::new(nx, r.y + 25.0, nw, 16.0), Font::Ui, fs2, 400, Align::Left, t.text3);
                 } else {
-                    self.gfx.text(&name, Rect::new(nx, r.y, nw, rh), Font::Ui, if small { 12.5 } else { 13.0 }, 400, Align::Left, t.text);
+                    self.gfx.text(&name, Rect::new(nx, r.y, nw, rh), Font::Ui, if small { fs - 0.5 } else { fs }, 400, Align::Left, t.text);
                 }
-                let date = if it.kind == Kind::Drive { it.folder.clone() } else { fmt::date(it.modified, narrow) };
-                self.gfx.text(&date, Rect::new(r_date.x, r.y, r_date.w, rh), Font::Ui, 12.0, 400, Align::Left, t.text2);
-                let size = it.size.map(fmt::size).unwrap_or_default();
-                self.gfx.text(&size, r_size, Font::Ui, 12.0, 400, Align::Right, t.text2);
-                self.hit(Rect::new(r.x, r.y.max(list.y), r.w, (r.b().min(list.b()) - r.y.max(list.y)).max(0.0)), Hit::Row(p, i));
+                if let Some((x, w)) = cp.date {
+                    let date = if it.kind == Kind::Drive { it.folder.clone() } else { fmt::date(it.modified, w < 130.0) };
+                    self.gfx.text(&date, Rect::new(x, r.y, w, rh), Font::Ui, fs2, 400, Align::Left, t.text2);
+                }
+                if let Some((x, w)) = cp.ty {
+                    let ty = if it.kind == Kind::Drive { "Drive".to_string() } else { ficons::type_label(&it.name, it.is_dir) };
+                    self.gfx.text(&ty, Rect::new(x, r.y, w, rh), Font::Ui, fs2, 400, Align::Left, t.text2);
+                }
+                if let Some((x, w)) = cp.size {
+                    let size = it.size.map(fmt::size).unwrap_or_default();
+                    self.gfx.text(&size, Rect::new(x, r.y, w, rh), Font::Ui, fs2, 400, Align::Right, t.text2);
+                }
             }
+            self.hit(Rect::new(r.x, r.y.max(list.y), r.w, (r.b().min(list.b()) - r.y.max(list.y)).max(0.0)), h);
         }
-        if k < 1.0 {
+        if k != 1.0 {
             self.gfx.pop_layer();
+        }
+        // rubber-band selection rectangle
+        if let Some(m) = self.marquee.as_ref().filter(|m| m.pane == p) {
+            let (ax, ay) = (m.x0, list.y + m.y0 - scroll);
+            let mr = Rect::new(ax.min(m.x1), ay.min(m.y1), (ax - m.x1).abs(), (ay - m.y1).abs());
+            self.gfx.fill_round(mr, 2.0, t.accent.a(0.16));
+            self.gfx.stroke_round(mr, 2.0, t.accent.a(0.85), 1.0);
         }
         // scroll bar
         if max > 0.0 {
-            let track = Rect::new(list.r() - 8.0, list.y + 4.0, 6.0, list.h - 8.0);
-            let th = (track.h * list.h / ch).max(30.0);
+            let track = Rect::new(list.r() - 8.0, list.y + 4.0, 6.0, (list.h - 8.0).max(0.0));
+            let th = (track.h * list.h / ch).max(30.0).min(track.h);
             let ty = track.y + (track.h - th) * (scroll / max);
-            let wide = self.hov(Hit::Scroll(p)) || self.drag_scroll.is_some();
-            let bw = if wide { 6.0 } else { 3.0 };
-            self.gfx.fill_round(Rect::new(track.r() - bw - 1.0, ty, bw, th), bw / 2.0, t.text3.a(if wide { 0.7 } else { 0.45 }));
+            let wk = if self.drag_scroll.is_some() { 1.0 } else { self.hk(Hit::Scroll(p)) };
+            let bw = 3.0 + 3.0 * wk;
+            self.gfx.fill_round(Rect::new(track.r() - bw - 1.0, ty, bw, th), bw / 2.0, t.text3.a(0.45 + 0.25 * wk));
             self.hit(track, Hit::Scroll(p));
         }
         self.gfx.unclip();
+    }
+
+    /// One drive of the This PC page: drive image, name, usage bar (red above 90 % full), "X free of Y".
+    fn paint_drive_tile(&mut self, r: Rect, it: &Item, t: &Theme) {
+        let root = it.path.to_string_lossy().to_string();
+        let d = self.drives.iter().find(|d| d.root.eq_ignore_ascii_case(&root)).cloned();
+        // drive image: a slab with a lighter top face and a status light
+        let ix = r.x + 12.0;
+        let iy = r.cy() - 14.0;
+        let body = Rect::new(ix, iy + 10.0, 40.0, 16.0);
+        self.gfx.fill_round(Rect::new(ix + 2.0, iy + 4.0, 36.0, 12.0), 3.0, t.page_stroke.mix(t.page, 0.55));
+        self.gfx.fill_round(body, 3.5, t.page_stroke.mix(t.text2, 0.25));
+        self.gfx.fill_round(body.inset(1.0, 1.0), 3.0, t.page.mix(t.page_stroke, 0.35));
+        self.gfx.ellipse(body.x + 7.0, body.cy(), 1.6, t.ok, true, 1.0);
+        if d.as_ref().map(|d| d.kind == "network").unwrap_or(false) {
+            self.gfx.glyph(0xE8CE, Rect::new(ix + 22.0, iy - 2.0, 16.0, 16.0), 12.0, t.text2);
+        }
+        let tx = r.x + 64.0;
+        let tw = r.w - 64.0 - 14.0;
+        self.gfx.text(&it.name, Rect::new(tx, r.y + 8.0, tw, 20.0), Font::Ui, self.look.text(), 400, Align::Left, t.text);
+        if let Some(d) = d.filter(|d| d.total > 0) {
+            let used = 1.0 - d.free as f32 / d.total as f32;
+            let bar = Rect::new(tx, r.y + 31.0, tw, 6.0);
+            self.gfx.fill_round(bar, 3.0, t.track);
+            self.gfx.fill_round(Rect::new(bar.x, bar.y, (bar.w * used).max(6.0), 6.0), 3.0, if used > 0.9 { t.danger } else { t.accent });
+            let s = format!("{} free of {}", fmt::size(d.free), fmt::size(d.total));
+            self.gfx.text(&s, Rect::new(tx, r.y + 41.0, tw, 18.0), Font::Ui, self.look.small_text(), 400, Align::Left, t.text2);
+        }
     }
 
     pub fn display_name(&self, it: &Item) -> String {
@@ -1078,9 +1415,9 @@ impl App {
             let w = 10.0 + 14.0 + 8.0 + lw + 8.0 + if active { 56.0 + 8.0 + pw + 4.0 } else { 0.0 } + cw + 10.0;
             let xr = Rect::new(r.r() - 8.0 - w, y + 3.0, w, 24.0);
             if self.xfer_open {
-                self.gfx.fill_round(xr, 4.0, t.press);
+                self.gfx.fill_round(xr, R_SMALL, t.press);
             } else if self.hov(Hit::Xfer) {
-                self.gfx.fill_round(xr, 4.0, t.hover);
+                self.gfx.fill_round(xr, R_SMALL, t.hover);
             }
             let mut xx = xr.x + 10.0;
             self.gfx.glyph(if paused { 0xE769 } else { 0xE8C8 }, Rect::new(xx, xr.y, 14.0, xr.h), 13.0, t.text);
@@ -1103,89 +1440,11 @@ impl App {
         }
     }
 
-    fn paint_pill(&mut self, t: &Theme) {
-        let c = content_rect(self);
-        let pane = self.pane();
-        if pane.loc == Loc::Settings || self.pv.is_some() {
-            return;
-        }
-        let sel = pane.selected();
-        let recycle = pane.loc == Loc::RecycleBin;
-        let mut buttons: Vec<(u8, &str, u32)> = vec![];
-        let count;
-        if sel.is_empty() {
-            count = String::new();
-            if !recycle {
-                buttons.push((10, "Paste", 0xE77F));
-                buttons.push((11, "New folder", 0xE8F4));
-            }
-            buttons.push((12, "Select all", 0xE8B3));
-        } else if recycle {
-            count = format!("{} selected", sel.len());
-            buttons.push((13, "Restore", 0xE777));
-            buttons.push((3, "Delete", 0xE74D));
-        } else {
-            let bytes: u64 = sel.iter().filter_map(|i| i.size).sum();
-            count = format!("{} selected", sel.len());
-            let _ = bytes;
-            buttons.push((0, "Copy", 0xE8C8));
-            buttons.push((1, "Cut", 0xE8C6));
-            buttons.push((2, "Rename", 0xE8AC));
-            buttons.push((3, "Delete", 0xE74D));
-            let archive = sel.len() == 1 && sel[0].is_archive();
-            buttons.push(if archive { (4, "Extract", 0xE8B5) } else { (4, "Zip", 0xF012) });
-        }
-        let bytes: u64 = sel.iter().filter_map(|i| i.size).sum();
-        let size_s = if sel.is_empty() { String::new() } else { format!(" · {}", fmt::size(bytes)) };
-        let narrow = c.w < 720.0;
-        let cw = if count.is_empty() { 0.0 } else { self.gfx.measure(&count, Font::Ui, 12.0, 600) + self.gfx.measure(&size_s, Font::Ui, 12.0, 400) + 8.0 };
-        let mut widths = vec![];
-        for (_, label, _) in &buttons {
-            widths.push(if narrow && buttons.len() > 4 && *label == "Zip" { 0.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 12.0 });
-        }
-        let total = 16.0 + cw + widths.iter().sum::<f32>() + 2.0 * buttons.len() as f32 + 36.0 + 6.0;
-        let r = Rect::new(c.x + (c.w - total) / 2.0, self.h - 44.0 - 48.0, total, 48.0);
-        let a = if t.dark { 0.40 } else { 0.14 };
-        self.gfx.shadow(r, 24.0, 8.0, 18.0, a);
-        self.gfx.fill_round(r, 24.0, t.glass);
-        self.gfx.stroke_round(r, 24.0, t.glass_stroke, 1.0);
-        self.gfx.stroke_round(r.inset(-1.0, -1.0), 25.0, if t.dark { C(0.0, 0.0, 0.0, 0.35) } else { C(0.06, 0.09, 0.16, 0.07) }, 1.0);
-        self.hit(r, Hit::Block);
-        let mut x = r.x + 16.0;
-        if !count.is_empty() {
-            let w1 = self.gfx.measure(&count, Font::Ui, 12.0, 600);
-            self.gfx.text(&count, Rect::new(x, r.y, w1 + 2.0, r.h), Font::Ui, 12.0, 600, Align::Left, t.text);
-            self.gfx.text(&size_s, Rect::new(x + w1, r.y, 100.0, r.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
-            x += cw;
-        }
-        let paste_ok = !crate::dnd::clipboard_files().0.is_empty();
-        for (i, (id, label, glyph)) in buttons.iter().enumerate() {
-            if widths[i] == 0.0 {
-                continue;
-            }
-            let br = Rect::new(x, r.y + 6.0, widths[i], 36.0);
-            let h = Hit::Pill(*id);
-            let dis = *id == 10 && !paste_ok;
-            if !dis && self.pressed == h && self.hov(h) {
-                self.gfx.fill_round(br, 18.0, t.press);
-            } else if !dis && self.hov(h) {
-                self.gfx.fill_round(br, 18.0, t.hover);
-            }
-            let fg = if dis { t.text_dis } else { t.text };
-            self.gfx.glyph(*glyph, Rect::new(br.x + 12.0, br.y, 14.0, br.h), 14.0, fg);
-            self.gfx.text(label, Rect::new(br.x + 34.0, br.y, br.w - 40.0, br.h), Font::Ui, 13.0, 400, Align::Left, fg);
-            self.hit(br, h);
-            x += widths[i] + 2.0;
-        }
-        let mr = Rect::new(x, r.y + 6.0, 36.0, 36.0);
-        self.icon_btn(mr, 0xE712, 14.0, t.text, Hit::Pill(5), 18.0, t);
-    }
-
     // ------------------------------------------------------------------ what is this file?
     fn paint_whatis(&mut self, t: &Theme) {
         let m = self.main_rect();
         let r = Rect::new(m.r() - WHATIS_W, m.y, WHATIS_W, m.h);
-        self.gfx.fill(r, t.layer);
+        self.gfx.fill(r, t.layer.a(self.look.layer_alpha()));
         self.gfx.fill(Rect::new(r.x, r.y, 1.0, r.h), t.stroke);
         self.hit(r, Hit::Block);
         let Some(w) = self.whatis.as_ref() else { return };
@@ -1196,7 +1455,7 @@ impl App {
         let hr = Rect::new(r.x + 1.0, r.y, r.w - 1.0, 44.0);
         self.gfx.glyph(0xF4A5, Rect::new(hr.x + 15.0, hr.y, 16.0, hr.h), 15.0, t.accent_text);
         self.gfx.text("What is this file?", Rect::new(hr.x + 41.0, hr.y, 200.0, hr.h), Font::Ui, 13.0, 600, Align::Left, t.text);
-        self.icon_btn(Rect::new(hr.r() - 36.0, hr.y + 8.0, 28.0, 28.0), 0xE711, 10.0, t.text2, Hit::WhatIs(0), 4.0, t);
+        self.icon_btn(Rect::new(hr.r() - 36.0, hr.y + 8.0, 28.0, 28.0), 0xE711, 10.0, t.text2, Hit::WhatIs(0), R_SMALL, t);
         self.gfx.fill(Rect::new(hr.x, hr.b() - 1.0, hr.w, 1.0), t.divider);
         // file
         let mut y = hr.b() + 16.0;
@@ -1217,8 +1476,8 @@ impl App {
         let (font, size, lh) = if rtl { (Font::Fa, 14.0, 28.0) } else { (Font::Ui, 13.0, 20.0) };
         let th = self.gfx.para_height(&text, cw - 32.0, font, size, lh, rtl);
         let card = Rect::new(r.x + 16.0, y, cw, th + 28.0);
-        self.gfx.fill_round(card, 8.0, t.card);
-        self.gfx.stroke_round(card, 8.0, t.stroke, 1.0);
+        self.gfx.fill_round(card, R_CARD, t.card);
+        self.gfx.stroke_round(card, R_CARD, t.stroke, 1.0);
         self.gfx.para(&text, Rect::new(card.x + 16.0, card.y + 14.0, cw - 32.0, th + 4.0), font, size, 400, if rtl { Align::Right } else { Align::Left }, color, lh, rtl, 0);
         y = card.b() + 16.0;
         for (k, v) in &facts {
@@ -1254,8 +1513,8 @@ impl App {
 
     // ------------------------------------------------------------------ settings
     fn set_card(&mut self, r: Rect, t: &Theme) {
-        self.gfx.fill_round(r, 8.0, t.card);
-        self.gfx.stroke_round(r, 8.0, t.stroke, 1.0);
+        self.gfx.fill_round(r, R_CARD, t.card);
+        self.gfx.stroke_round(r, R_CARD, t.stroke, 1.0);
     }
 
     fn set_row(&mut self, x: f32, y: f32, w: f32, h: f32, glyph: u32, title: &str, sub: &str, first: bool, t: &Theme) {
@@ -1274,38 +1533,139 @@ impl App {
     fn paint_settings(&mut self, t: &Theme) {
         let c = content_rect(self);
         self.hit(c, Hit::ListBg(0));
+        let max = (self.settings_h - c.h).max(0.0);
+        if self.pane().scroll > max && self.settings_h > 0.0 {
+            self.pane_mut().scroll = max;
+        }
         let scroll = self.pane().scroll;
         self.gfx.clip(c);
-        let colw = (c.w - 40.0 - 12.0) / 2.0;
+        // one column on a narrow window
+        let one = c.w < 760.0;
+        let colw = if one { c.w - 40.0 } else { (c.w - 40.0 - 12.0) / 2.0 };
         let lx = c.x + 20.0;
-        let rx = lx + colw + 12.0;
+        let rx = if one { lx } else { lx + colw + 12.0 };
         let mut y = c.y + 16.0 - scroll;
         // Default file manager
         let is_def = fmcore::defaultfm::is_default();
         let r = Rect::new(lx, y, colw, 120.0);
         self.set_card(r, t);
         let big = Rect::new(r.x + 16.0, r.y + 16.0, 40.0, 40.0);
-        self.gfx.fill_round(big, 8.0, t.sel);
+        self.gfx.fill_round(big, R_CTRL, t.sel);
         self.gfx.glyph(0xEC50, big, 20.0, t.accent_text);
         self.gfx.text("Default file manager", Rect::new(r.x + 70.0, r.y + 16.0, colw - 90.0, 20.0), Font::Ui, 14.0, 600, Align::Left, t.text);
-        let sub = if is_def { "Win Tools Files opens folders and Win+E now" } else { "Windows Explorer opens folders and Win+E now" };
+        let sub = if is_def { "Rust File Explorer opens folders and Win+E now" } else { "Windows Explorer opens folders and Win+E now" };
         self.gfx.text(sub, Rect::new(r.x + 70.0, r.y + 38.0, colw - 90.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
         let b1w = self.gfx.measure("Set as default file manager", Font::Ui, 13.0, 400) + 26.0;
         self.button(Rect::new(r.x + 70.0, r.y + 70.0, b1w, 32.0), "Set as default file manager", 0, if is_def { Btn::Disabled } else { Btn::Accent }, Hit::Set(1), t);
         let b2w = self.gfx.measure("Restore Explorer", Font::Ui, 13.0, 400) + 26.0;
         self.button(Rect::new(r.x + 70.0 + b1w + 8.0, r.y + 70.0, b2w, 32.0), "Restore Explorer", 0, if is_def { Btn::Std } else { Btn::Disabled }, Hit::Set(2), t);
         y = r.b() + 12.0;
-        // Look
-        let r = Rect::new(lx, y, colw, 38.0 + 2.0 * 52.0);
+        // Personalize: theme, background, transparency, accent, corners
+        let lk = self.look.clone();
+        let rows_h = 38.0 + 48.0 * 3.0 + 48.0 + 44.0 + if self.accent_field.is_some() { 44.0 } else { 0.0 } + 48.0 + 4.0;
+        let r = Rect::new(lx, y, colw, rows_h);
         self.set_card(r, t);
-        self.gfx.text("Look", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
+        self.gfx.text("Personalize", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
         let mut ry = r.y + 38.0;
-        self.set_row(r.x, ry, r.w, 52.0, 0xE790, "Theme", "", true, t);
-        let theme_label = ["Same as Windows", "Light", "Dark"][self.ui.theme as usize % 3];
-        self.dropdown(Rect::new(r.r() - 16.0 - 150.0, ry + 10.0, 150.0, 32.0), theme_label, Hit::Set(3), t, Font::Ui);
-        ry += 52.0;
-        self.set_row(r.x, ry, r.w, 52.0, 0xE771, "Accent color", "From Windows", false, t);
-        self.gfx.ellipse(r.r() - 16.0 - 12.0, ry + 26.0, 12.0, t.accent, true, 1.0);
+        let dw = 168.0f32.min(r.w * 0.45);
+        let dd = |a: &mut App, ry: f32, glyph: u32, title: &str, val: &str, id: u8, first: bool| {
+            a.set_row(r.x, ry, r.w, 48.0, glyph, title, "", first, t);
+            a.dropdown(Rect::new(r.r() - 16.0 - dw, ry + 8.0, dw, 32.0), val, Hit::Set(id), t, Font::Ui);
+        };
+        dd(self, ry, 0xE790, "Theme", crate::look::THEMES[lk.theme as usize % 3], 3, true);
+        ry += 48.0;
+        let bd = if self.can_mica { crate::look::BACKDROPS[lk.backdrop as usize % 4] } else { "Solid (needs Windows 11)" };
+        dd(self, ry, 0xE771, "Background", bd, 20, false);
+        ry += 48.0;
+        dd(self, ry, 0xE7B3, "Transparency", crate::look::TRANSPARENCY[lk.transparency as usize % 4], 21, false);
+        ry += 48.0;
+        // accent: Windows, presets, custom
+        self.set_row(r.x, ry, r.w, 48.0, 0xE790, "Accent color", match lk.accent {
+            None => "From Windows",
+            Some(c) => crate::look::ACCENTS.iter().find(|a| a.1 == c).map(|a| a.0).unwrap_or("Custom"),
+        }, false, t);
+        ry += 48.0;
+        let mut sx = r.x + 46.0;
+        let sel_i: u8 = match lk.accent {
+            None => 40,
+            Some(c) => crate::look::ACCENTS.iter().position(|a| a.1 == c).map(|i| 41 + i as u8).unwrap_or(50),
+        };
+        let wa = self.windows_accent();
+        for id in 40u8..=50 {
+            if (42..50).contains(&id) && sx + 30.0 * 2.0 > r.r() - 12.0 && id != 50 {
+                continue;
+            }
+            let col = match id {
+                40 => wa,
+                50 => lk.accent.map(C::hex).unwrap_or(t.layer2),
+                k => C::hex(crate::look::ACCENTS[(k - 41) as usize].1),
+            };
+            let sr = Rect::new(sx, ry + 4.0, 28.0, 28.0);
+            let h = Hit::Set(id);
+            let hk = self.hk(h);
+            if sel_i == id {
+                self.gfx.ellipse(sr.cx(), sr.cy(), 13.5, t.text, false, 2.0);
+            } else if hk > 0.0 {
+                self.gfx.ellipse(sr.cx(), sr.cy(), 13.5, t.text3.a(hk), false, 1.0);
+            }
+            self.gfx.ellipse(sr.cx(), sr.cy(), 10.0, col, true, 1.0);
+            self.gfx.ellipse(sr.cx(), sr.cy(), 10.0, t.text.a(0.14), false, 1.0);
+            if id == 50 && sel_i != 50 {
+                self.gfx.glyph(0xE710, sr, 10.0, t.text2);
+            }
+            self.hit(sr, h);
+            sx += 32.0;
+        }
+        ry += 44.0;
+        if let Some(f) = self.accent_field.clone() {
+            let fr = Rect::new(r.x + 46.0, ry, 130.0, 32.0);
+            self.field_box(fr, true, t);
+            self.field_text(&f, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, true, t, &[]);
+            self.hit(fr, Hit::Set(50));
+            let aw = self.gfx.measure("Apply", Font::Ui, 13.0, 400) + 26.0;
+            self.button(Rect::new(fr.r() + 8.0, ry, aw, 32.0), "Apply", 0, Btn::Accent, Hit::Set(51), t);
+            ry += 44.0;
+        }
+        dd(self, ry, 0xE8B3, "Corners", crate::look::CORNERS[lk.square as usize], 25, false);
+        y = r.b() + 12.0;
+        // Layout: density, text and icon size, sidebar, columns, start page
+        let rows_h = 38.0 + 48.0 * 5.0 + 3.0 * 44.0 + 30.0 + 3.0 * 44.0 + 30.0 + 48.0 + 4.0;
+        let r = Rect::new(lx, y, colw, rows_h);
+        self.set_card(r, t);
+        self.gfx.text("Layout", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
+        let mut ry = r.y + 38.0;
+        let dd = |a: &mut App, ry: f32, glyph: u32, title: &str, val: &str, id: u8, first: bool| {
+            a.set_row(r.x, ry, r.w, 48.0, glyph, title, "", first, t);
+            a.dropdown(Rect::new(r.r() - 16.0 - dw, ry + 8.0, dw, 32.0), val, Hit::Set(id), t, Font::Ui);
+        };
+        dd(self, ry, 0xE8FD, "Density", crate::look::DENSITY[lk.density as usize % 2], 22, true);
+        ry += 48.0;
+        dd(self, ry, 0xE8D2, "Text size", crate::look::SIZES3[lk.font as usize % 3], 23, false);
+        ry += 48.0;
+        dd(self, ry, 0xE8B9, "Icon size", crate::look::SIZES3[lk.icons as usize % 3], 24, false);
+        ry += 48.0;
+        let sw_label = crate::look::SIDEBAR_WIDTHS.iter().find(|w| (w.1 - lk.side_w).abs() < 1.0).map(|w| w.0.to_string()).unwrap_or_else(|| if lk.side_w < 1.0 { "Icons only".into() } else { format!("{} px", lk.side_w.round()) });
+        dd(self, ry, 0xE700, "Sidebar width", &sw_label, 26, false);
+        ry += 48.0;
+        let sub = |a: &mut App, ry: &mut f32, title: &str| {
+            a.gfx.fill(Rect::new(r.x, *ry, r.w, 1.0), t.divider);
+            a.gfx.text(title, Rect::new(r.x + 46.0, *ry + 8.0, 300.0, 20.0), Font::Ui, 12.0, 600, Align::Left, t.text3);
+            *ry += 30.0;
+        };
+        sub(self, &mut ry, "Sidebar sections");
+        for (title, on, id) in [("Drives", lk.show_drives, 28u8), ("Pinned", lk.show_pinned, 27), ("Recent", lk.show_recent, 29)] {
+            self.gfx.text(title, Rect::new(r.x + 46.0, ry, r.w - 120.0, 44.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+            self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, 44.0), on, Hit::Set(id), t);
+            ry += 44.0;
+        }
+        sub(self, &mut ry, "Columns");
+        for (title, on, id) in [("Date modified", lk.col_date, 30u8), ("Type", lk.col_type, 31), ("Size", lk.col_size, 32)] {
+            self.gfx.text(title, Rect::new(r.x + 46.0, ry, r.w - 120.0, 44.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+            self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, 44.0), on, Hit::Set(id), t);
+            ry += 44.0;
+        }
+        let start_label = self.start_options().into_iter().find(|o| o.1 == lk.start).map(|o| o.0).unwrap_or_else(|| "This PC".into());
+        dd(self, ry, 0xE80F, "Start page", &start_label, 33, false);
         y = r.b() + 12.0;
         // Files and folders
         let rows: [(u32, &str, &str, bool, u8); 4] = [
@@ -1324,8 +1684,9 @@ impl App {
             self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, h), *on, Hit::Set(*id), t);
             ry += h;
         }
-        // right column: search and AI
-        let mut y = c.y + 16.0 - scroll;
+        // right column: search and AI (below the left one on a narrow window)
+        let left_end = y + 4.0 * 48.0 + 38.0 + 4.0 + 12.0 + 4.0;
+        let mut y = if one { left_end } else { c.y + 16.0 - scroll };
         let ev = match self.set.ev_running {
             None => "Checking...".to_string(),
             Some(true) => format!("Running · {} items", fmt::thousands(self.set.ev_total as u64)),
@@ -1419,13 +1780,13 @@ impl App {
         self.set_card(r, t);
         self.gfx.text("Command line for agents", Rect::new(r.x + 16.0, r.y + 12.0, 240.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
         let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join("wfm.exe").is_file())).unwrap_or(false);
-        let st = if on_path { "wfm is on PATH" } else { "wfm.exe is next to wfiles.exe" };
+        let st = if on_path { "wfm is on PATH" } else { "wfm.exe is next to RustFileExplorer.exe" };
         let sw = self.gfx.measure(st, Font::Ui, 12.0, 400);
         self.gfx.ellipse(r.r() - 16.0 - sw - 10.0, r.y + 22.0, 4.0, if on_path { t.ok } else { t.text3 }, true, 1.0);
         self.gfx.text(st, Rect::new(r.r() - 16.0 - sw - 1.0, r.y + 12.0, sw + 2.0, 20.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
         let box_ = Rect::new(r.x + 12.0, r.y + 44.0, r.w - 24.0, 12.0 + 25.0 * cli.len() as f32);
-        self.gfx.fill_round(box_, 6.0, t.code_bg);
-        self.gfx.stroke_round(box_, 6.0, t.stroke, 1.0);
+        self.gfx.fill_round(box_, R_CTRL, t.code_bg);
+        self.gfx.stroke_round(box_, R_CTRL, t.stroke, 1.0);
         let mut cy = box_.y + 6.0;
         for (cmd, args, what) in cli {
             let cwid = self.gfx.measure(cmd, Font::Mono, 12.0, 600);
@@ -1434,6 +1795,7 @@ impl App {
             self.gfx.text(what, Rect::new(box_.x + 12.0 + 196.0, cy, box_.w - 220.0, 25.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
             cy += 25.0;
         }
+        self.settings_h = r.b() + 16.0 + scroll - c.y;
         self.gfx.unclip();
     }
 
@@ -1445,14 +1807,15 @@ impl App {
         if self.xfer_open {
             self.paint_transfers(t);
         }
+        self.paint_closing(t);
         if self.menu.is_some() {
-            self.paint_menu(t);
+            self.paint_menu(t, None);
         }
         if self.drop.is_some() {
-            self.paint_drop(false, t);
+            self.paint_drop(false, t, None);
         }
         if self.sub.is_some() {
-            self.paint_drop(true, t);
+            self.paint_drop(true, t, None);
         }
         if self.palette.is_some() {
             self.paint_palette(t);
@@ -1460,13 +1823,13 @@ impl App {
         if self.rename.is_some() {
             self.paint_rename(t);
             if self.drop.is_some() {
-                self.paint_drop(false, t);
+                self.paint_drop(false, t, None);
             }
         }
         if self.pv.is_some() {
             self.paint_preview(t);
             if self.drop.is_some() {
-                self.paint_drop(false, t);
+                self.paint_drop(false, t, None);
             }
         }
         if self.confirm.is_some() {
@@ -1474,6 +1837,35 @@ impl App {
         }
         if self.drag_in.is_some() {
             self.paint_ghost(t);
+        }
+    }
+
+    /// Menus that were just closed fade out quickly (accelerating), without hits.
+    fn paint_closing(&mut self, t: &Theme) {
+        if let Some((m, at)) = self.menu_out.take() {
+            let o = crate::motion::lin(at, 130.0);
+            if o < 1.0 && !self.shooting {
+                let keep = self.menu.replace(m);
+                self.no_hits = true;
+                self.paint_menu(t, Some(o));
+                self.no_hits = false;
+                if let Some(m) = std::mem::replace(&mut self.menu, keep) {
+                    self.menu_out = Some((m, at));
+                }
+            }
+        }
+        if let Some((d, sub, at)) = self.drop_out.take() {
+            let o = crate::motion::lin(at, 130.0);
+            if o < 1.0 && !self.shooting {
+                let keep = if sub { self.sub.replace(d) } else { self.drop.replace(d) };
+                self.no_hits = true;
+                self.paint_drop(sub, t, Some(o));
+                self.no_hits = false;
+                let back = if sub { std::mem::replace(&mut self.sub, keep) } else { std::mem::replace(&mut self.drop, keep) };
+                if let Some(d) = back {
+                    self.drop_out = Some((d, sub, at));
+                }
+            }
         }
     }
 
@@ -1492,8 +1884,8 @@ impl App {
         let uw = if undo { self.gfx.measure("Undo", Font::Ui, 13.0, 400) + 12.0 + 14.0 + 8.0 + 12.0 } else { 0.0 };
         let w = 16.0 + 16.0 + 12.0 + tw + bw + 12.0 + uw + 8.0 + 28.0 + 6.0;
         let r = Rect::new(m.x + 24.0, self.h - 42.0 - 48.0 + (1.0 - k) * 12.0, w, 48.0);
-        self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.max(0.05));
-        self.card(r, 8.0, t, false);
+        self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.clamp(0.05, 1.0));
+        self.card(r, R_MENU, t, false);
         self.hit(r, Hit::Block);
         self.gfx.glyph(0xE73E, Rect::new(r.x + 16.0, r.y, 16.0, r.h), 14.0, t.ok);
         self.gfx.text(&text, Rect::new(r.x + 44.0, r.y, tw + 2.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
@@ -1503,9 +1895,9 @@ impl App {
             self.button(Rect::new(x, r.y + 8.0, uw, 32.0), "Undo", 0xE7A7, Btn::Std, Hit::Toast(1), t);
             x += uw + 8.0;
         }
-        self.icon_btn(Rect::new(x, r.y + 10.0, 28.0, 28.0), 0xE711, 10.0, t.text2, Hit::Toast(0), 4.0, t);
+        self.icon_btn(Rect::new(x, r.y + 10.0, 28.0, 28.0), 0xE711, 10.0, t.text2, Hit::Toast(0), R_SMALL, t);
         self.gfx.pop_layer();
-        if k < 1.0 {
+        if k != 1.0 {
             self.anim();
         }
     }
@@ -1527,6 +1919,7 @@ impl App {
 
     fn menu_rows(&mut self, r: Rect, items: &[MItem], y0: f32, hit_of: impl Fn(usize) -> Hit, t: &Theme) {
         let mut y = y0;
+        let any_icon = items.iter().any(|x| x.glyph != 0 || x.icon.is_some() || x.swatch.is_some());
         for (i, it) in items.iter().enumerate() {
             if it.sep {
                 self.gfx.fill(Rect::new(r.x, y + 4.0, r.w, 1.0), t.divider);
@@ -1535,14 +1928,39 @@ impl App {
             let ir = Rect::new(r.x + 4.0, y, r.w - 8.0, 32.0);
             let h = hit_of(i);
             let open_sub = it.sub && self.sub.as_ref().map(|s| s.anchor.y == ir.y && s.child).unwrap_or(false);
-            if it.enabled && (self.hov(h) || open_sub) {
-                self.gfx.fill_round(ir, 5.0, t.hover);
+            if it.enabled {
+                let hk = if open_sub { 1.0 } else { self.hk(h) };
+                self.gfx.fill_round(ir, R_CTRL, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(ir, R_CTRL, t.press.a(t.press.3 * self.pk(h) * 0.8));
             }
             let fg = if it.enabled { t.text } else { t.text_dis };
-            if it.glyph != 0 {
+            let ib = Rect::new(ir.x + 10.0, ir.cy() - 8.0, 16.0, 16.0);
+            if let Some(c) = it.swatch {
+                let col = if c == u32::MAX { self.windows_accent() } else { C::hex(c) };
+                self.gfx.ellipse(ib.cx(), ib.cy(), 7.5, col, true, 1.0);
+                self.gfx.ellipse(ib.cx(), ib.cy(), 7.5, t.text.a(0.18), false, 1.0);
+            } else if let Some(icon) = it.icon.clone() {
+                // the shell entry's own icon, drawn at 16 DIP like ours
+                let key = std::path::PathBuf::from(format!("menuicon:{}:{}", it.label, icon.width));
+                if self.bmp_target != self.gfx.target_id() {
+                    self.bitmaps.clear();
+                    self.bmp_target = self.gfx.target_id();
+                }
+                let bmp = match self.bitmaps.get(&key) {
+                    Some(b) => b.clone(),
+                    None => {
+                        let b = self.gfx.make_bitmap(icon.width, icon.height, &icon.bgra);
+                        self.bitmaps.insert(key, b.clone());
+                        b
+                    }
+                };
+                if let Some(b) = bmp {
+                    self.gfx.bitmap(&b, ib, if it.enabled { 1.0 } else { 0.4 });
+                }
+            } else if it.glyph != 0 {
                 self.gfx.glyph(it.glyph, Rect::new(ir.x + 10.0, ir.y, 16.0, ir.h), 16.0, fg);
             }
-            let tx = if it.glyph != 0 || items.iter().any(|x| x.glyph != 0) { ir.x + 38.0 } else { ir.x + 12.0 };
+            let tx = if any_icon { ir.x + 38.0 } else { ir.x + 12.0 };
             let kw = if it.keys.is_empty() { 0.0 } else { self.gfx.measure(&it.keys, Font::Ui, 12.0, 400) + 4.0 };
             self.gfx.text(&it.label, Rect::new(tx, ir.y, ir.r() - tx - kw - 30.0, ir.h), Font::Ui, 13.0, if it.bold { 600 } else { 400 }, Align::Left, fg);
             if !it.keys.is_empty() {
@@ -1559,15 +1977,33 @@ impl App {
         }
     }
 
-    fn paint_menu(&mut self, t: &Theme) {
+    /// The Windows accent (for the "Windows accent" swatch).
+    pub fn windows_accent(&self) -> C {
+        crate::theme::make(self.t.dark, None).accent
+    }
+
+    /// Open / close motion of a popup: (opacity, scale, y offset). `out` = closing progress 0..1.
+    fn pop_motion(&self, at: Instant, out: Option<f32>) -> (f32, f32, f32) {
+        if let Some(o) = out {
+            let k = crate::motion::fade_out(o);
+            return (1.0 - k, 1.0 - 0.02 * k, -3.0 * k);
+        }
+        let k = prog(at, 150.0, self.shooting);
+        ((k * 1.8).clamp(0.0, 1.0), 0.96 + 0.04 * k, -(1.0 - k) * crate::motion::POP_SLIDE)
+    }
+
+    fn paint_menu(&mut self, t: &Theme, out: Option<f32>) {
         let Some(r) = self.menu_rect() else { return };
         let m = self.menu.as_ref().unwrap();
-        let k = prog(m.at, 150.0, self.shooting);
+        let (op, sc, dy) = self.pop_motion(m.at, out);
+        let moving = out.is_none() && prog(m.at, 150.0, self.shooting) != 1.0;
+        let (ax, ay) = (m.x.clamp(r.x, r.r()), if m.y > r.y { r.b() } else { r.y });
         let items = m.items.clone();
         let bg = m.bg;
         let loading = m.loading;
-        self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.max(0.05));
-        self.card(Rect::new(r.x, r.y - (1.0 - k) * 4.0, r.w, r.h), 8.0, t, false);
+        self.gfx.opacity_layer(r.inset(-30.0, -30.0), op.max(0.02));
+        self.gfx.push_scale(ax, ay, sc, 0.0, dy);
+        self.card(r, R_MENU, t, false);
         self.hit(r, Hit::Block);
         let mut y = r.y + 4.0;
         if !bg {
@@ -1575,7 +2011,7 @@ impl App {
             let slot = (r.w - 20.0) / 4.0;
             for (i, (id, g)) in qs.iter().enumerate() {
                 let br = Rect::new(r.x + 10.0 + slot * i as f32 + (slot - 40.0) / 2.0, y + 4.0, 40.0, 36.0);
-                self.icon_btn(br, *g, 16.0, t.text, Hit::MenuQuick(*id), 5.0, t);
+                self.icon_btn(br, *g, 16.0, t.text, Hit::MenuQuick(*id), R_CTRL, t);
             }
             y += 46.0;
             self.gfx.fill(Rect::new(r.x, y - 1.0, r.w, 1.0), t.divider);
@@ -1586,8 +2022,9 @@ impl App {
             let ly = r.b() - 36.0;
             self.gfx.text("More from apps...", Rect::new(r.x + 42.0, ly, 200.0, 32.0), Font::Ui, 12.0, 400, Align::Left, t.text3);
         }
+        self.gfx.pop_xf();
         self.gfx.pop_layer();
-        if k < 1.0 {
+        if moving {
             self.anim();
         }
     }
@@ -1609,21 +2046,26 @@ impl App {
         Some(Rect::new(x, y, d.width, h))
     }
 
-    fn paint_drop(&mut self, sub: bool, t: &Theme) {
+    fn paint_drop(&mut self, sub: bool, t: &Theme, out: Option<f32>) {
         let Some(r) = self.drop_rect(sub) else { return };
         let d = if sub { self.sub.as_ref().unwrap() } else { self.drop.as_ref().unwrap() };
-        let k = prog(d.at, 150.0, self.shooting);
+        let (op, sc, dy) = self.pop_motion(d.at, out);
+        let moving = out.is_none() && prog(d.at, 150.0, self.shooting) != 1.0;
+        let (ax, ay) = if d.child { (r.x, r.y) } else { (d.anchor.cx().clamp(r.x, r.r()), if d.anchor.y < r.y { r.y } else { r.b() }) };
+        let dy = if d.child { 0.0 } else { dy };
         let items = d.items.clone();
-        self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.max(0.05));
-        self.card(r, 8.0, t, false);
+        self.gfx.opacity_layer(r.inset(-30.0, -30.0), op.max(0.02));
+        self.gfx.push_scale(ax, ay, sc, if d.child { -(1.0 - sc) * 60.0 } else { 0.0 }, dy);
+        self.card(r, R_MENU, t, false);
         self.hit(r, Hit::Block);
         if sub {
             self.menu_rows(r, &items, r.y + 4.0, Hit::SubItem, t);
         } else {
             self.menu_rows(r, &items, r.y + 4.0, Hit::Drop, t);
         }
+        self.gfx.pop_xf();
         self.gfx.pop_layer();
-        if k < 1.0 {
+        if moving {
             self.anim();
         }
     }
@@ -1652,7 +2094,7 @@ impl App {
         }
         let total_h = 12.0 + 36.0 + hs.iter().sum::<f32>() + if jobs.is_empty() { 48.0 } else { 0.0 };
         let r = Rect::new(self.w - 10.0 - w, self.h - 38.0 - total_h, w, total_h);
-        self.card(r, 8.0, t, false);
+        self.card(r, R_MENU, t, false);
         self.hit(r, Hit::Block);
         self.gfx.text("Transfers", Rect::new(r.x + 16.0, r.y + 8.0, 200.0, 32.0), Font::Ui, 14.0, 600, Align::Left, t.text);
         let all_paused = jobs.iter().filter(|j| j.active()).all(|j| j.paused()) && jobs.iter().any(|j| j.active());
@@ -1671,7 +2113,7 @@ impl App {
             }
             let jr = Rect::new(r.x + 16.0, y + 10.0, r.w - 32.0, hs[i] - 22.0);
             let ic = Rect::new(jr.x, jr.y, 32.0, 32.0);
-            self.gfx.fill_round(ic, 6.0, t.layer2);
+            self.gfx.fill_round(ic, R_CTRL, t.layer2);
             let (g, gc) = match &j.state {
                 crate::jobs::State::Done | crate::jobs::State::Undone => (0xE73E, t.ok),
                 crate::jobs::State::Failed(_) | crate::jobs::State::Cancelled => (0xE7BA, t.warn),
@@ -1708,8 +2150,8 @@ impl App {
             // actions
             if j.active() {
                 let pr = Rect::new(jr.r() - 62.0 + 6.0, jr.y - 2.0, 30.0, 30.0);
-                self.icon_btn(pr, if j.paused() || j.state == crate::jobs::State::Waiting && j.paused() { 0xE768 } else { 0xE769 }, 13.0, t.text, Hit::Job(j.id, 0), 5.0, t);
-                self.icon_btn(Rect::new(pr.r() + 2.0, pr.y, 30.0, 30.0), 0xE711, 11.0, t.text, Hit::Job(j.id, 1), 5.0, t);
+                self.icon_btn(pr, if j.paused() || j.state == crate::jobs::State::Waiting && j.paused() { 0xE768 } else { 0xE769 }, 13.0, t.text, Hit::Job(j.id, 0), R_CTRL, t);
+                self.icon_btn(Rect::new(pr.r() + 2.0, pr.y, 30.0, 30.0), 0xE711, 11.0, t.text, Hit::Job(j.id, 1), R_CTRL, t);
             } else if j.state == crate::jobs::State::Done && !j.journal.is_empty() {
                 let uw = 12.0 + 14.0 + 8.0 + self.gfx.measure("Undo", Font::Ui, 13.0, 400) + 10.0;
                 self.button(Rect::new(jr.r() - uw + 6.0, jr.y - 2.0, uw, 30.0), "Undo", 0xE7A7, Btn::Ghost, Hit::Job(j.id, 2), t);
@@ -1718,8 +2160,8 @@ impl App {
                 && let Some(c) = j.clashes.iter().find(|c| c.choice.is_none())
             {
                 let cr = Rect::new(bx, yy + 26.0, bw + 26.0, 170.0);
-                self.gfx.fill_round(cr, 6.0, t.warn_fill);
-                self.gfx.stroke_round(cr, 6.0, t.warn_stroke, 1.0);
+                self.gfx.fill_round(cr, R_CTRL, t.warn_fill);
+                self.gfx.stroke_round(cr, R_CTRL, t.warn_stroke, 1.0);
                 self.gfx.glyph(0xE7BA, Rect::new(cr.x + 12.0, cr.y + 10.0, 14.0, 18.0), 14.0, t.warn);
                 let name = c.src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.gfx.text(&name, Rect::new(cr.x + 34.0, cr.y + 10.0, cr.w - 46.0, 18.0), Font::Ui, 12.5, 600, Align::Left, t.text);
@@ -1740,11 +2182,11 @@ impl App {
                 if others > 0 {
                     let bxr = Rect::new(cr.x + 12.0, cr.y + 144.0, 18.0, 18.0);
                     if j.same_for_rest {
-                        self.gfx.fill_round(bxr, 4.0, t.accent);
+                        self.gfx.fill_round(bxr, R_SMALL, t.accent);
                         self.gfx.glyph(0xE73E, bxr, 11.0, t.on_accent);
                     } else {
-                        self.gfx.fill_round(bxr, 4.0, t.field);
-                        self.gfx.stroke_round(bxr, 4.0, t.field_bottom, 1.0);
+                        self.gfx.fill_round(bxr, R_SMALL, t.field);
+                        self.gfx.stroke_round(bxr, R_SMALL, t.field_bottom, 1.0);
                     }
                     let lab = format!("Same choice for the other {others} conflict{}", if others == 1 { "" } else { "s" });
                     self.gfx.text(&lab, Rect::new(bxr.r() + 8.0, bxr.y - 1.0, cr.w - 50.0, 20.0), Font::Ui, 12.0, 400, Align::Left, t.text);
@@ -1766,8 +2208,8 @@ impl App {
         let h = 48.0 + if groups > 0 { 30.0 } else { 0.0 } + if actions > 0 { 30.0 } else { 0.0 } + 40.0 * items.len() as f32 + 6.0;
         let o = self.omni_rect();
         let r = Rect::new(o.x, 44.0 - (1.0 - k) * 8.0, 720.0f32.min(self.w - o.x - 10.0), h);
-        self.gfx.opacity_layer(r.inset(-40.0, -40.0), k.max(0.05));
-        self.card(r, 8.0, t, false);
+        self.gfx.opacity_layer(r.inset(-40.0, -40.0), k.clamp(0.05, 1.0));
+        self.card(r, R_MENU, t, false);
         self.hit(r, Hit::Block);
         let ir = Rect::new(r.x, r.y, r.w, 48.0);
         self.gfx.glyph(0xE721, Rect::new(ir.x + 16.0, ir.y, 16.0, ir.h), 15.0, t.text2);
@@ -1784,10 +2226,10 @@ impl App {
             }
             let rr = Rect::new(r.x + 6.0, y, r.w - 12.0, 40.0);
             if i == sel {
-                self.gfx.fill_round(rr, 5.0, t.sel);
+                self.gfx.fill_round(rr, R_CTRL, t.sel);
                 self.gfx.fill_round(Rect::new(rr.x, rr.y + 13.0, 3.0, 14.0), 1.5, t.accent);
             } else if self.hov(Hit::Pal(i)) {
-                self.gfx.fill_round(rr, 5.0, t.hover);
+                self.gfx.fill_round(rr, R_CTRL, t.hover);
             }
             if *folder {
                 ficons::draw(&self.gfx, t, Kind::Folder, Rect::new(rr.x + 12.0, rr.cy() - 9.0, 18.0, 18.0));
@@ -1819,7 +2261,7 @@ impl App {
             y += 40.0;
         }
         self.gfx.pop_layer();
-        if k < 1.0 {
+        if k != 1.0 {
             self.anim();
         }
     }
@@ -1835,8 +2277,8 @@ impl App {
         let w = 800.0f32.min(self.w - 40.0);
         let h = 20.0 + 44.0 + 16.0 + 18.0 + 6.0 + 34.0 + 16.0 + 33.0 + 31.0 * shown as f32 + 16.0 + 68.0;
         let r = Rect::new(((self.w - w) / 2.0).max(190.0f32.min(self.w - w - 20.0)), (self.h - h) / 2.0 + (1.0 - k) * 8.0, w, h);
-        self.gfx.opacity_layer(r.inset(-60.0, -60.0), k.max(0.05));
-        self.card(r, 10.0, t, true);
+        self.gfx.opacity_layer(r.inset(-60.0, -60.0), k.clamp(0.05, 1.0));
+        self.card(r, R_MENU, t, true);
         self.hit(r, Hit::Block);
         self.gfx.text(&format!("Rename {n} item{}", if n == 1 { "" } else { "s" }), Rect::new(r.x + 24.0, r.y + 20.0, 300.0, 44.0), Font::Display, 20.0, 600, Align::Left, t.text);
         // mode segmented + suggest names
@@ -1846,8 +2288,8 @@ impl App {
             x -= sw;
             let br = Rect::new(x, r.y + 22.0, sw, 32.0);
             if mode == 3 {
-                self.gfx.fill_round(br, 5.0, t.sel);
-                self.gfx.stroke_round(br, 5.0, t.sel_stroke, 1.0);
+                self.gfx.fill_round(br, R_CTRL, t.sel);
+                self.gfx.stroke_round(br, R_CTRL, t.sel_stroke, 1.0);
                 self.gfx.glyph(0xF4A5, Rect::new(br.x + 12.0, br.y, 14.0, br.h), 13.0, t.accent_text);
                 self.gfx.text("Suggest names", Rect::new(br.x + 34.0, br.y, sw - 40.0, br.h), Font::Ui, 13.0, 400, Align::Left, t.text);
                 self.hit(br, Hit::Dlg(13));
@@ -1860,17 +2302,17 @@ impl App {
         let ws: Vec<f32> = labels.iter().map(|l| self.gfx.measure(l, Font::Ui, 13.0, 600) + 28.0).collect();
         let segw: f32 = ws.iter().sum::<f32>() + 2.0 * 4.0;
         let seg = Rect::new(x - segw, r.y + 20.0, segw, 36.0);
-        self.gfx.fill_round(seg, 6.0, t.layer2);
-        self.gfx.stroke_round(seg, 6.0, t.stroke, 1.0);
+        self.gfx.fill_round(seg, R_CTRL, t.layer2);
+        self.gfx.stroke_round(seg, R_CTRL, t.stroke, 1.0);
         let mut sx = seg.x + 3.0;
         for (i, l) in labels.iter().enumerate() {
             let sr = Rect::new(sx, seg.y + 3.0, ws[i], 30.0);
             let on = mode == i as u8;
             if on {
-                self.gfx.fill_round(sr, 4.0, t.card);
-                self.gfx.stroke_round(sr, 4.0, t.stroke, 1.0);
+                self.gfx.fill_round(sr, R_SMALL, t.card);
+                self.gfx.stroke_round(sr, R_SMALL, t.stroke, 1.0);
             } else if self.hov(Hit::Dlg(10 + i as u8)) {
-                self.gfx.fill_round(sr, 4.0, t.hover);
+                self.gfx.fill_round(sr, R_SMALL, t.hover);
             }
             self.gfx.text(l, sr, Font::Ui, 13.0, if on { 600 } else { 400 }, Align::Center, if on { t.text } else { t.text2 });
             self.hit(sr, Hit::Dlg(10 + i as u8));
@@ -1911,7 +2353,7 @@ impl App {
                 self.hit(pr, Hit::Dlg(20));
                 let ir = Rect::new(pr.r() - 66.0, pr.y + 4.0, 60.0, 26.0);
                 if self.hov(Hit::Dlg(21)) {
-                    self.gfx.fill_round(ir, 4.0, t.hover);
+                    self.gfx.fill_round(ir, R_SMALL, t.hover);
                 }
                 self.gfx.text("Insert", Rect::new(ir.x + 8.0, ir.y, 40.0, ir.h), Font::Ui, 12.0, 400, Align::Left, t.text);
                 self.gfx.glyph(0xE70D, Rect::new(ir.r() - 16.0, ir.y, 9.0, ir.h), 8.0, t.text2);
@@ -1989,7 +2431,7 @@ impl App {
         self.button(Rect::new(fr.r() - 24.0 - rw, fr.y + 17.0, rw, 32.0), "Rename", 0, if ok { Btn::Accent } else { Btn::Disabled }, Hit::Dlg(1), t);
         self.button(Rect::new(fr.r() - 24.0 - rw - 8.0 - rw, fr.y + 17.0, rw, 32.0), "Cancel", 0, Btn::Std, Hit::Dlg(0), t);
         self.gfx.pop_layer();
-        if k < 1.0 {
+        if k != 1.0 {
             self.anim();
         }
     }
@@ -2008,10 +2450,10 @@ impl App {
         let fin = Rect::new((self.w - w) / 2.0, (self.h - h) / 2.0, w, h);
         // grows from the row to the centre
         let r = Rect::new(from.x + (fin.x - from.x) * k, from.y + (fin.y - from.y) * k, from.w + (fin.w - from.w) * k, from.h + (fin.h - from.h) * k);
-        self.gfx.opacity_layer(fin.inset(-60.0, -60.0), k.max(0.05));
-        self.card(r, 10.0, t, true);
+        self.gfx.opacity_layer(fin.inset(-60.0, -60.0), k.clamp(0.05, 1.0));
+        self.card(r, R_MENU, t, true);
         self.hit(r, Hit::Block);
-        if k < 1.0 {
+        if k != 1.0 {
             self.anim();
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2020,7 +2462,7 @@ impl App {
         let hr = Rect::new(r.x, r.y, r.w, 56.0);
         ficons::draw(&self.gfx, t, ficons::kind_of(&name, is_dir), Rect::new(hr.x + 18.0, hr.cy() - 12.0, 24.0, 24.0));
         let mut bx = hr.r() - 10.0 - 36.0;
-        self.icon_btn(Rect::new(bx, hr.y + 10.0, 36.0, 36.0), 0xE711, 12.0, t.text, Hit::Pv(0), 5.0, t);
+        self.icon_btn(Rect::new(bx, hr.y + 10.0, 36.0, 36.0), 0xE711, 12.0, t.text, Hit::Pv(0), R_CTRL, t);
         bx -= 12.0;
         self.gfx.fill(Rect::new(bx, hr.y + 18.0, 1.0, 20.0), t.divider);
         bx -= 12.0;
@@ -2148,8 +2590,8 @@ impl App {
             self.gfx.text(&s, Rect::new(fr.cx() - sw / 2.0, fr.y, sw + 2.0, fr.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
             let up = Rect::new(fr.cx() - sw / 2.0 - 34.0, fr.y + 4.0, 28.0, 28.0);
             let dn = Rect::new(fr.cx() + sw / 2.0 + 6.0, fr.y + 4.0, 28.0, 28.0);
-            self.icon_btn(up, 0xE70E, 9.0, if page > 0 { t.text } else { t.text_dis }, Hit::Pv(6), 4.0, t);
-            self.icon_btn(dn, 0xE70D, 9.0, if page + 1 < pages { t.text } else { t.text_dis }, Hit::Pv(7), 4.0, t);
+            self.icon_btn(up, 0xE70E, 9.0, if page > 0 { t.text } else { t.text_dis }, Hit::Pv(6), R_SMALL, t);
+            self.icon_btn(dn, 0xE70D, 9.0, if page + 1 < pages { t.text } else { t.text_dis }, Hit::Pv(7), R_SMALL, t);
         }
         self.gfx.pop_layer();
     }
@@ -2165,7 +2607,7 @@ impl App {
         let vw = self.gfx.measure(verb, Font::Ui, 12.5, 400);
         let tw = self.gfx.measure(&target, Font::Ui, 12.5, 600);
         let r = Rect::new(x + 14.0, y + 14.0, 10.0 + 24.0 + 16.0 + vw + tw + 14.0, 40.0);
-        self.card(r, 8.0, t, false);
+        self.card(r, R_MENU, t, false);
         let k0 = d.paths.first().map(|p| ficons::kind_of(&p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p.is_dir())).unwrap_or(Kind::File);
         ficons::draw(&self.gfx, t, k0, Rect::new(r.x + 10.0, r.cy() - 12.0, 24.0, 24.0));
         let bs = n.to_string();

@@ -1,4 +1,4 @@
-//! wtm: Win Tools Task Manager on the command line. Every action of the window is here, so an agent or script never
+//! wtm: Rust Task Manager on the command line. Every action of the window is here, so an agent or script never
 //! needs the GUI. Output is a readable table by default and JSON with --json. Exit code 0 = ok, 1 = error, 2 = usage.
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use wt::procs::{self, Proc, Sampler, fmt_bytes};
 use wt::{perf, services, startup};
 
 const HELP: &str = "\
-wtm - Win Tools Task Manager CLI (for agents and scripts)
+wtm - Rust Task Manager CLI (for agents and scripts)
 
 USAGE: wtm <command> [args] [--json]
 
@@ -37,9 +37,9 @@ System
   service <start|stop|restart|info> <name>
   startup                            startup apps, scheduled tasks at logon and third-party auto services
   startup <enable|disable> <name>
-  default                            is Win Tools the default Task Manager? (read only; the window has the button)
+  default                            is Rust Task Manager the default Task Manager? (read only; the window has the button)
 
-Window (the open Win Tools window)
+Window (the open Rust Task Manager window)
   gui <command>                      drive the open window: show, search WORDS, select PID, expand, tab NAME,
                                      pane NAME, flyout NAME, sort, theme light|dark, state, shot FILE.bmp, quit, ...
 
@@ -504,8 +504,8 @@ fn cmd_startup(action: Option<&String>, name: Option<&String>) -> R {
 
 fn cmd_default() -> R {
     let ifeo = wt::reg::read_string(wt::reg::HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", "Debugger");
-    let ours = ifeo.as_deref().map(|d| d.to_lowercase().contains("wintask")).unwrap_or(false);
-    let text = format!("default Task Manager: {}\n", if ours { "Win Tools" } else { "Windows" });
+    let ours = ifeo.as_deref().map(|d| { let d = d.to_lowercase(); d.contains("rusttaskmanager") || d.contains("wintask") }).unwrap_or(false);
+    let text = format!("default Task Manager: {}\n", if ours { "Rust Task Manager" } else { "Windows" });
     Ok(Out { v: json!({"ok": true, "win_tools_is_default": ours, "debugger": ifeo}), text })
 }
 

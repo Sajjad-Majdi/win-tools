@@ -1,4 +1,4 @@
-//! wfm: Win Tools Files on the command line. Every file-manager action is here, so an agent or script never needs
+//! wfm: Rust File Explorer on the command line. Every file-manager action is here, so an agent or script never needs
 //! the GUI. Output is a readable table by default and one-line JSON with --json. Exit code 0 = ok, 1 = error,
 //! 2 = usage.
 use fmcore::list::SortKey;
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const HELP: &str = "\
-wfm - Win Tools Files CLI (for agents and scripts)
+wfm - Rust File Explorer CLI (for agents and scripts)
 
 USAGE: wfm <command> [args] [--json]
 
@@ -65,7 +65,7 @@ Agents: Save / Open dialogs
   dialog save --path <full path> [--hwnd H] [--overwrite] [--desktop NAME]
        types the full path into the open Save dialog and presses Save
 
-Window (wfiles.exe must be running; every command answers with one line of JSON)
+Window (RustFileExplorer.exe must be running; every command answers with one line of JSON)
   gui state                               tabs, panes, path, view, selection, overlays, timings
   gui open <path> | gui search <words> | gui select <name...> | gui select-all | gui clear
   gui tab new [path] | tab close [N] | tab N        gui view details|list|grid     gui split on|off
@@ -73,6 +73,10 @@ Window (wfiles.exe must be running; every command answers with one line of JSON)
   gui transfers | gui copy | gui cut | gui paste | gui delete | gui undo | gui newfolder <name>
   gui key <keys e.g. ctrl+shift+n> | gui type <text> | gui click X Y | gui rclick X Y | gui dblclick X Y
   gui theme light|dark|system | gui size W H | gui shot <file.png> | gui quit
+  gui shot-real <file.png>                capture the real window as Windows composes it (PrintWindow);
+                                          start it with --offscreen so nothing shows on the screen
+  gui drag X0 Y0 X1 Y1 [ctrl|shift]       a mouse drag sent to the window only (no real cursor)
+  gui look [key value]                    show or change a Settings > Personalize value
   default status                          is wfiles the default file manager? (set/restore only from
                                           Settings, or: default set --yes / default restore --yes)
   ev <words...> [--top N]                 Everything IPC query (no es.exe), with timing
@@ -449,7 +453,7 @@ fn cmd_menu(a: &Args) -> R {
         let text = if i.parent.is_empty() { i.text.clone() } else { format!("{} > {}", i.parent, i.text) };
         t += &format!("{:<22} {}{}\n", if i.verb.is_empty() { "-" } else { &i.verb }, text, if i.enabled { "" } else { "  (disabled)" });
     }
-    Ok(Out { v: json!({"ok": true, "items": l.iter().map(|i| json!({"verb": i.verb, "text": i.text, "parent": i.parent, "enabled": i.enabled})).collect::<Vec<_>>()}), text: t })
+    Ok(Out { v: json!({"ok": true, "items": l.iter().map(|i| json!({"verb": i.verb, "text": i.text, "parent": i.parent, "enabled": i.enabled, "icon": i.icon.as_ref().map(|c| format!("{}x{}", c.width, c.height))})).collect::<Vec<_>>()}), text: t })
 }
 
 fn cmd_eject(a: &Args) -> R {
@@ -765,6 +769,9 @@ fn cmd_gui(a: &Args) -> R {
     if line.is_empty() {
         return Err(usage("gui needs a command"));
     }
+    if line[0] == "shot-real" {
+        return gui_shot_real(line.get(1..).map(|r| r.join(" ")).unwrap_or_default().trim());
+    }
     let reply = fmcore::pipe::send(&line.join(" ")).map_err(fail)?;
     let v: Value = serde_json::from_str(&reply).unwrap_or_else(|_| json!({"ok": false, "error": reply}));
     if v["ok"] == json!(false) {
@@ -773,6 +780,49 @@ fn cmd_gui(a: &Args) -> R {
     let text = format!("{}
 ", serde_json::to_string_pretty(&v).unwrap());
     Ok(Out { v, text })
+}
+
+/// The window as Windows composes it (DWM), not our own offscreen paint: PrintWindow with PW_RENDERFULLCONTENT.
+/// Run from this process so the window's thread is free to answer.
+fn gui_shot_real(file: &str) -> R {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    if file.is_empty() {
+        return Err(usage("gui shot-real <file.png>"));
+    }
+    let _ = fmcore::pipe::send("paint");
+    let reply = fmcore::pipe::send("state").map_err(fail)?;
+    let st: Value = serde_json::from_str(&reply).map_err(|_| fail("bad state reply".into()))?;
+    let hw = st["hwnd"].as_i64().ok_or_else(|| fail("the window gave no hwnd".into()))?;
+    let hwnd = HWND(hw as isize as *mut _);
+    unsafe {
+        let mut rc = RECT::default();
+        GetWindowRect(hwnd, &mut rc).map_err(|e| fail(e.message()))?;
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let dc = CreateCompatibleDC(None);
+        let bi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() }, ..Default::default() };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| fail(e.message()))?;
+        let old = SelectObject(dc, bmp.into());
+        // PW_RENDERFULLCONTENT = 2
+        let ok = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool();
+        let _ = GdiFlush();
+        let mut px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+        SelectObject(dc, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(dc);
+        if !ok {
+            return Err(fail("PrintWindow failed".into()));
+        }
+        thumb::save_png(&thumb::Image { width: w as u32, height: h as u32, bgra: px }, Path::new(file)).map_err(fail)?;
+        Ok(Out { v: json!({"ok": true, "file": file, "size": [w, h], "window": [rc.left, rc.top]}), text: format!("saved {file} ({w}x{h})
+") })
+    }
 }
 
 fn cmd_default(a: &Args) -> R {
@@ -788,7 +838,7 @@ fn cmd_default(a: &Args) -> R {
                 return Err(usage(&format!("default {what} changes how Windows opens folders; add --yes")));
             }
             if what == "set" {
-                let exe = std::env::current_exe().map_err(|e| fail(e.to_string()))?.with_file_name("wfiles.exe");
+                let exe = std::env::current_exe().map_err(|e| fail(e.to_string()))?.with_file_name("RustFileExplorer.exe");
                 fmcore::defaultfm::set(&exe).map_err(fail)?;
             } else {
                 fmcore::defaultfm::restore().map_err(fail)?;

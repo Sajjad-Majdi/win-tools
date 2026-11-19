@@ -1,4 +1,4 @@
-Win Tools (Task Manager and Files)
+Rust Task Manager and Rust File Explorer
 Copyright (c) 2026 Sajjad. All rights reserved.
 
 Third-party parts

@@ -3,37 +3,46 @@
 use super::app::*;
 use super::gfx::{Align, Font, Rect};
 use super::model;
+use super::motion;
 use super::paint::Btn;
 use crate::explain::Verdict;
 
 const NUM: [&str; 11] = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
 
 impl App {
-    pub fn paint_pane(&mut self, pr: Rect) {
+    /// The right pane. Opening: it springs in from the right and fades in; `closed`: it slides out and fades.
+    pub fn paint_pane(&mut self, pr: Rect, closed: Option<std::time::Instant>) {
         let t = self.t;
         self.pane_rect = pr;
         self.view_h[3] = pr.h;
         let Some(at) = self.pane.as_ref().map(|p| p.at) else { return };
-        let p = self.anim(at, 200);
-        let dx = (1.0 - p) * 24.0;
+        let (a, dx) = match closed {
+            None => (self.tween_in(at, motion::NORMAL, motion::decel), (1.0 - self.spring_in(at, motion::PANE)) * 32.0),
+            Some(c) => match self.leaving(c) {
+                Some(q) => (1.0 - q, q * 40.0),
+                None => {
+                    self.mo.borrow_mut().ghost_pane = None;
+                    return;
+                }
+            },
+        };
+        let old = self.gfx.push_alpha(a);
         self.gfx.fill(Rect::new(pr.x, pr.y, pr.w, pr.h), t.layer);
         self.gfx.vline(pr.x, pr.y, pr.b(), t.line);
         self.hit(pr, Hit::Block);
         self.gfx.clip(Rect::new(pr.x + 1.0, pr.y, pr.w - 1.0, pr.h));
-        self.gfx.transform(Some((dx, 0.0, 1.0, 0.0, 0.0)));
+        self.gfx.push_move(dx, 0.0);
         let kind = self.pane.as_ref().map(|p| p.kind).unwrap();
         let h = match kind {
             PaneKind::Details => self.paint_details(pr),
             PaneKind::Free => self.paint_free(pr),
         };
-        self.gfx.transform(None);
+        self.gfx.pop_xf();
         self.gfx.unclip();
         self.content_h[3] = h;
         self.clamp_scroll();
         self.scrollbar(pr, 3);
-        if p < 1.0 {
-            self.animate(60);
-        }
+        self.gfx.pop_alpha(old);
     }
 
     /// Close button at the pane's top right.

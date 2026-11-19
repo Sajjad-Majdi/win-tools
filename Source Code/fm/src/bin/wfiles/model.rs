@@ -107,6 +107,7 @@ pub enum SortCol {
     Name,
     Date,
     Size,
+    Type,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,6 +202,13 @@ pub struct Pane {
     pub kb: bool,
     /// item to select once the listing arrives (after "up", new folder, rename)
     pub want: Option<PathBuf>,
+    /// smooth / momentum scrolling (follows its target), and the value it last wrote to `scroll`
+    pub sf: crate::motion::Follow,
+    pub sf_written: f32,
+    /// selection as last painted, newly selected rows (fade in), a single selection's slide (from rect, when)
+    pub sel_seen: HashSet<PathBuf>,
+    pub sel_fade: std::collections::HashMap<PathBuf, Instant>,
+    pub slide: Option<(crate::gfx::Rect, Instant)>,
 }
 
 impl Pane {
@@ -225,6 +233,11 @@ impl Pane {
             hidden_count: 0,
             kb: false,
             want: None,
+            sf: crate::motion::Follow::default(),
+            sf_written: 0.0,
+            sel_seen: HashSet::new(),
+            sel_fade: std::collections::HashMap::new(),
+            slide: None,
         }
     }
     /// The rows currently shown: search results in search mode, else the folder.
@@ -247,6 +260,10 @@ impl Pane {
         self.loc.path().map(|p| p.to_path_buf())
     }
     pub fn sort_items(&mut self) {
+        // This PC keeps its own order: drives by letter, then the pinned folders as in the sidebar
+        if self.loc == Loc::ThisPc {
+            return;
+        }
         let (col, desc) = self.sort;
         let cmp = |a: &Item, b: &Item| {
             // folders before files always (reviewer fix), then the column
@@ -258,6 +275,7 @@ impl Pane {
                 SortCol::Name => fmcore::list::natural_cmp(&a.name, &b.name),
                 SortCol::Date => a.modified.cmp(&b.modified),
                 SortCol::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                SortCol::Type => a.ext().cmp(&b.ext()),
             };
             let o = if o == std::cmp::Ordering::Equal { fmcore::list::natural_cmp(&a.name, &b.name) } else { o };
             if desc { o.reverse() } else { o }

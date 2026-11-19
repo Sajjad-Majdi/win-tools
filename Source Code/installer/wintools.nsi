@@ -1,4 +1,5 @@
-; Win Tools installer (one per app): per-user, no admin, Start menu shortcut, uninstaller.
+; Installer for Rust Task Manager / Rust File Explorer (one per app): per-user, no admin, Start menu shortcut, uninstaller.
+; OLDEXE / OLDNAME: the 0.1.0 names (Win Tools ...). An upgrade removes that copy; files still in use go at the next restart.
 ; "Set as default" is NOT done here: it stays a button inside the app that the user clicks.
 ; Built by tools\release.ps1, which passes: APPID, APPNAME, EXE, CLI, ICON, VERSION, STAGE, OUTFILE.
 Unicode true
@@ -17,7 +18,6 @@ Caption "${APPNAME} ${VERSION} Setup"
 BrandingText "${APPNAME} ${VERSION}"
 OutFile "${OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\${APPNAME}"
-InstallDirRegKey HKCU "Software\${APPID}" "InstallDir"
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "${APPNAME}"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
@@ -42,6 +42,7 @@ VIAddVersionKey "LegalCopyright" "Sajjad"
 !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPID}"
 
 Section "${APPNAME}"
+  ReadRegStr $R0 HKCU "Software\${APPID}" "InstallDir"
   SetOutPath "$INSTDIR"
   ; an older copy may be open: replace it on the next start if the file is in use
   SetOverwrite try
@@ -63,6 +64,20 @@ Section "${APPNAME}"
   WriteRegStr HKCU "${UNINST}" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "${UNINST}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST}" "NoRepair" 1
+
+!ifdef OLDEXE
+  ; 0.1.0 used another exe name and folder: remove that copy (an open window is left alone; in-use files go on restart)
+  Delete "$SMPROGRAMS\${OLDNAME}.lnk"
+  Delete /REBOOTOK "$INSTDIR\${OLDEXE}"
+  StrCmp $R0 "" old_done
+  StrCmp $R0 $INSTDIR old_done
+  Delete /REBOOTOK "$R0\${OLDEXE}"
+  Delete /REBOOTOK "$R0\${CLI}"
+  Delete /REBOOTOK "$R0\LICENSES.txt"
+  Delete /REBOOTOK "$R0\uninstall.exe"
+  RMDir /REBOOTOK "$R0"
+  old_done:
+!endif
 SectionEnd
 
 Section "Uninstall"

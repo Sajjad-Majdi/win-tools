@@ -5,6 +5,7 @@ use super::data::{self, Ctl, HistAnomaly, Shared, WM_DATA};
 use super::gfx::{Gfx, Rect};
 use super::model::{self, Group, Hist, SortKey};
 use super::prefs::{self, Prefs};
+use super::motion;
 use super::theme::{self, Theme};
 use crate::explain::Answer;
 use crate::procs::{self, Proc};
@@ -42,7 +43,7 @@ const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
 const TIMER_TRIM: usize = 3;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
     None,
     Block,
@@ -99,6 +100,13 @@ pub enum Hit {
     KeyRemove,
     KeyLink,
     Scroll(u8),
+    /// Settings > Accent: 0 system, 1..=8 presets, 9 custom
+    Accent(u8),
+    Hue,
+    HexField,
+    /// Settings > Columns: 0 Type, 1 PID, 2 Disk, 3 Network, 4 GPU
+    ColPill(u8),
+    DefSort,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -154,6 +162,7 @@ pub struct PaneInfo {
     pub cmdline: String,
 }
 
+#[derive(Clone)]
 pub struct Pane {
     pub kind: PaneKind,
     pub key: String,
@@ -172,8 +181,10 @@ pub enum MenuKind {
     Sort,
     StartupSort,
     Chips,
+    DefSort,
 }
 
+#[derive(Clone)]
 pub struct Menu {
     pub kind: MenuKind,
     pub x: f32,
@@ -192,6 +203,7 @@ pub struct EndJob {
     pub disable: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Dialog {
     pub title: String,
     pub body: String,
@@ -204,6 +216,7 @@ pub enum ToastAct {
     Relaunch(String, String),
 }
 
+#[derive(Clone)]
 pub struct Toast {
     pub text: String,
     pub code: String,
@@ -259,7 +272,7 @@ pub struct App {
     pub hover: Hit,
     pub pressed: Hit,
     pub nc_hover: Hit,
-    nc_down: Hit,
+    pub nc_down: Hit,
     pub page: u8,
     pub pane: Option<Pane>,
     pane_result: Arc<Mutex<Option<(u32, PaneInfo, bool)>>>,
@@ -267,8 +280,20 @@ pub struct App {
     pub menu: Option<Menu>,
     pub dialog: Option<Dialog>,
     pub toast: Option<Toast>,
-    pub slides: HashMap<u8, (f32, f32, Instant)>,
-    anim_until: Instant,
+    /// every running animation (fades, springs, transitions, closing overlays)
+    pub mo: std::cell::RefCell<Mo>,
+    anim_until: std::cell::Cell<Instant>,
+    /// --offscreen: test window far off the screen (never activated, never moved onto a monitor)
+    pub offscreen: bool,
+    /// window is active (caption glyphs dim when not); `active_force` overrides it for tests
+    pub active: bool,
+    pub active_force: Option<bool>,
+    /// Settings > Accent > Custom: hex field being typed and the hue strip's place
+    pub hex_focus: bool,
+    pub hex_buf: String,
+    pub hue_rect: Rect,
+    /// Settings > Accent > Custom is open
+    pub custom_open: bool,
     pub w: f32,
     pub h: f32,
     ipc_in: Arc<Mutex<Vec<(String, std::sync::mpsc::Sender<String>)>>>,
@@ -297,6 +322,42 @@ pub struct App {
     pub view_h: [f32; 4],
     /// bring the selected row into view on the next paint (after the layout is known)
     pub want_scroll_sel: bool,
+    /// list row height (Settings > Density)
+    pub row_h: f32,
+}
+
+/// Everything that is moving right now. Lives in a RefCell so painting code (`&self`) can advance it.
+#[derive(Default)]
+pub struct Mo {
+    pub fades: HashMap<u64, motion::Tween>,
+    pub springs: HashMap<u64, motion::Spring>,
+    pub vals: HashMap<(u64, u8), motion::Tween>,
+    pub row_y: HashMap<u64, motion::Tween>,
+    pub row_in: HashMap<u64, motion::Tween>,
+    pub prev_rows: HashMap<u64, f32>,
+    pub prev_query: String,
+    pub scroll: [Option<motion::Spring>; 4],
+    /// the selection a highlight was last drawn for, and when it appeared
+    pub sel_prev: Option<(u64, Instant)>,
+    /// overlays as last drawn, and the ones that are closing (drawn fading out)
+    pub last_flyout: Option<(u8, Instant)>,
+    pub last_menu: Option<Menu>,
+    pub last_toast: Option<Toast>,
+    pub last_dialog: Option<Dialog>,
+    pub last_pane: Option<(Pane, f32)>,
+    pub ghost_flyout: Option<(u8, Instant, Instant)>,
+    pub ghost_menu: Option<(Menu, Instant)>,
+    pub ghost_toast: Option<(Toast, Instant)>,
+    pub ghost_dialog: Option<(Dialog, Instant)>,
+    pub ghost_pane: Option<(Pane, f32, Instant)>,
+}
+
+/// Key of a per-clickable animation: `tag` tells hover, press, knob, ... apart.
+pub fn hid(tag: u8, h: Hit) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    (tag, h).hash(&mut s);
+    s.finish()
 }
 
 pub fn ease(p: f32) -> f32 {
@@ -320,35 +381,279 @@ impl App {
         ease(p)
     }
 
-    /// Ask for animation frames for the next `ms`.
-    pub fn animate(&mut self, ms: u64) {
+    /// Spring progress (0 -> 1, may overshoot) of something that started at `at`; asks for frames until it settles.
+    pub fn spring_in(&self, at: Instant, c: motion::Cfg) -> f32 {
+        if self.shooting {
+            return 1.0;
+        }
+        let e = at.elapsed().as_secs_f32();
+        if e < motion::settle(c) {
+            self.animate(30);
+            motion::spring(e, c)
+        } else {
+            1.0
+        }
+    }
+
+    /// Eased progress 0..1 over `ms` from `at` along `curve`; asks for frames until done.
+    pub fn tween_in(&self, at: Instant, ms: f32, curve: fn(f32) -> f32) -> f32 {
+        if self.shooting {
+            return 1.0;
+        }
+        let p = at.elapsed().as_secs_f32() * 1000.0 / ms;
+        if p < 1.0 {
+            self.animate(30);
+        }
+        curve(p.clamp(0.0, 1.0))
+    }
+
+    /// Ask for animation frames for the next `ms`. The timer stops by itself when nothing moves.
+    pub fn animate(&self, ms: u64) {
         let until = Instant::now() + Duration::from_millis(ms + 20);
-        if until > self.anim_until {
-            self.anim_until = until;
+        if until > self.anim_until.get() {
+            self.anim_until.set(until);
         }
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_ANIM, 15, None);
         }
     }
 
-    /// Animated x for a sliding pill (tabs, segmented controls): moves from the old target to the new one.
+    /// Animated x for a sliding pill (tabs, segmented controls): a spring toward the selected item.
     pub fn slide(&mut self, key: u8, target: f32) -> f32 {
+        self.glide(0x5000 + key as u64, target, motion::GLIDE).0
+    }
+
+    /// A named spring toward `target`: (position, velocity). First use starts at the target.
+    pub fn glide(&self, id: u64, target: f32, c: motion::Cfg) -> (f32, f32) {
+        let mut mo = self.mo.borrow_mut();
+        let sp = mo.springs.entry(id).or_insert_with(|| motion::Spring::new(target, 0.2));
+        if self.shooting {
+            sp.snap(target);
+            return (target, 0.0);
+        }
+        let x = sp.step(target, c, Instant::now());
+        if sp.moving() {
+            self.animate(30);
+        }
+        (x, sp.v)
+    }
+
+    /// Fade level 0..1 for something that is `on` (hover fills): in over FAST, out over NORMAL, decelerating.
+    pub fn fade(&self, id: u64, on: bool) -> f32 {
+        if self.shooting {
+            return on as u8 as f32;
+        }
         let now = Instant::now();
-        match self.slides.get(&key).copied() {
-            None => {
-                self.slides.insert(key, (target, target, now));
-                target
+        let tgt = on as u8 as f32;
+        let mut mo = self.mo.borrow_mut();
+        let Some(tw) = mo.fades.get_mut(&id) else {
+            if on {
+                let mut tw = motion::Tween::fixed(0.0);
+                tw.retarget(1.0, motion::FAST, now, motion::decel);
+                mo.fades.insert(id, tw);
+                self.animate(motion::FAST as u64);
             }
-            Some((from, to, at)) => {
-                let p = if self.shooting { 1.0 } else { ease(at.elapsed().as_secs_f32() * 1000.0 / 167.0) };
-                let cur = from + (to - from) * p;
-                if (to - target).abs() > 0.5 {
-                    self.slides.insert(key, (cur, target, now));
-                    self.animate(170);
-                    cur
-                } else {
-                    cur
+            return 0.0;
+        };
+        if tw.to != tgt {
+            tw.retarget(tgt, if on { motion::FAST } else { motion::NORMAL }, now, motion::decel);
+        }
+        let v = tw.value(now, motion::decel);
+        if tw.done(now) {
+            if !on {
+                mo.fades.remove(&id);
+            }
+        } else {
+            self.animate(30);
+        }
+        v
+    }
+
+    /// Hover level of a clickable (fades in and out).
+    pub fn hov(&self, h: Hit) -> f32 {
+        self.fade(hid(0, h), self.hover == h)
+    }
+
+    /// Press depth of a clickable: a spring to 1 while held, back to 0 (with a small bounce) when let go.
+    pub fn press_depth(&self, h: Hit) -> f32 {
+        let down = self.pressed == h && self.hover == h;
+        let id = hid(2, h);
+        if self.shooting {
+            return down as u8 as f32;
+        }
+        let mut mo = self.mo.borrow_mut();
+        if !down && !mo.springs.contains_key(&id) {
+            return 0.0;
+        }
+        let sp = mo.springs.entry(id).or_insert_with(|| motion::Spring::new(0.0, 0.004));
+        let x = sp.step(down as u8 as f32, motion::PRESS, Instant::now());
+        if sp.moving() || down {
+            self.animate(30);
+        } else {
+            mo.springs.remove(&id);
+        }
+        x
+    }
+
+    /// Start the press-scale (0.97 at full press) around `r` for clickable `h`; pair with `press_end`.
+    pub fn press_begin(&self, r: Rect, h: Hit) -> bool {
+        let d = self.press_depth(h);
+        if d.abs() < 0.002 {
+            return false;
+        }
+        self.gfx.push_scale(r.cx(), r.cy(), 1.0 - motion::PRESS_SCALE * d);
+        true
+    }
+
+    pub fn press_end(&self, on: bool) {
+        if on {
+            self.gfx.pop_xf();
+        }
+    }
+
+    /// A value that glides to `target` when it changes (numbers and bars after a new sample).
+    pub fn tv(&self, id: u64, slot: u8, target: f32) -> f32 {
+        if self.shooting {
+            return target;
+        }
+        let now = Instant::now();
+        let mut mo = self.mo.borrow_mut();
+        let tw = mo.vals.entry((id, slot)).or_insert_with(|| motion::Tween::fixed(target));
+        tw.used = now;
+        if (tw.to - target).abs() > (target.abs() * 1e-4).max(1e-6) {
+            tw.retarget(target, motion::VALUE, now, motion::decel);
+        }
+        if !tw.done(now) {
+            self.animate(30);
+        }
+        tw.value(now, motion::decel)
+    }
+
+    /// Where row `id` is drawn now (it slides when the list re-orders) and its opacity (new rows fade in).
+    pub fn row_motion(&self, id: u64, y: f32) -> (f32, f32) {
+        if self.shooting {
+            return (y, 1.0);
+        }
+        let now = Instant::now();
+        let mo = self.mo.borrow();
+        // a row that changes place dims while it passes other rows, so crossing rows do not read as a jumble
+        let (dy, dim) = match mo.row_y.get(&id) {
+            Some(tw) if !tw.done(now) => {
+                self.animate(30);
+                let far = ((tw.to - tw.from).abs() / self.row_h).min(3.0) / 3.0;
+                (tw.value(now, motion::standard), 1.0 - 0.65 * far.max(0.4) * (tw.progress(now) * std::f32::consts::PI).sin())
+            }
+            _ => (y, 1.0),
+        };
+        let a = match mo.row_in.get(&id) {
+            Some(tw) if !tw.done(now) => {
+                self.animate(30);
+                tw.value(now, motion::decel)
+            }
+            _ => 1.0,
+        };
+        (dy, a * dim)
+    }
+
+    /// Remember where each row is, and start slides for rows that moved (not while the search text changes).
+    fn note_rows(&mut self) {
+        let now = Instant::now();
+        let ids: Vec<(u64, f32)> = self.rows.iter().map(|r| (self.row_id(r.k), r.y)).collect();
+        let mut mo = self.mo.borrow_mut();
+        let same = mo.prev_query == self.query && !mo.prev_rows.is_empty();
+        let mut moved = false;
+        if same {
+            for (id, y) in &ids {
+                match mo.prev_rows.get(id).copied() {
+                    Some(py) if (py - y).abs() > 0.5 => {
+                        let cur = mo.row_y.get(id).filter(|t| !t.done(now)).map(|t| t.value(now, motion::standard)).unwrap_or(py);
+                        mo.row_y.insert(*id, motion::Tween { from: cur, to: *y, at: now, ms: motion::MOVE, used: now });
+                        moved = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        mo.row_in.insert(*id, motion::Tween { from: 0.0, to: 1.0, at: now, ms: motion::NORMAL, used: now });
+                        moved = true;
+                    }
                 }
+            }
+        } else {
+            mo.row_y.clear();
+            mo.row_in.clear();
+        }
+        mo.row_y.retain(|_, t| !t.done(now));
+        mo.row_in.retain(|_, t| !t.done(now));
+        mo.prev_rows = ids.into_iter().collect();
+        mo.prev_query = self.query.clone();
+        drop(mo);
+        if moved {
+            self.animate(motion::MOVE as u64);
+        }
+    }
+
+    /// Stable identity of a list row (survives re-ordering).
+    pub fn row_id(&self, k: RowK) -> u64 {
+        use std::hash::{Hash, Hasher};
+        match k {
+            RowK::Group(gi) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                self.groups.get(gi).map(|g| g.key.as_str()).unwrap_or("").hash(&mut h);
+                h.finish() & !(0xFF << 56)
+            }
+            RowK::Child(gi, mi) => (1 << 56) | self.groups.get(gi).and_then(|g| g.members.get(mi)).map(|m| m.pid as u64).unwrap_or(0),
+            RowK::Startup(i) => (2 << 56) | i as u64,
+            RowK::Service(i) => (3 << 56) | i as u64,
+            RowK::Sec(s, _) => (4 << 56) | s as u64,
+            RowK::PinSep => 5 << 56,
+        }
+    }
+
+    // ------------------------------------------------------------------ scrolling (momentum with a soft stop)
+    /// Scroll area `k` by `delta` with momentum: the target moves, a critically damped spring follows it.
+    pub fn scroll_by(&mut self, k: usize, delta: f32) {
+        let max = (self.content_h[k] - self.view_h[k]).max(0.0);
+        let cur = self.scroll[k];
+        let mut mo = self.mo.borrow_mut();
+        let sp = mo.scroll[k].get_or_insert_with(|| motion::Spring::new(cur, 0.25));
+        sp.target = (sp.target + delta).clamp(0.0, max);
+        drop(mo);
+        if self.shooting {
+            self.set_scroll(k, (cur + delta).clamp(0.0, max));
+        } else {
+            self.animate(60);
+        }
+    }
+
+    /// Glide area `k` to `v`.
+    pub fn scroll_smooth(&mut self, k: usize, v: f32) {
+        let d = v - self.mo.borrow().scroll[k].map(|s| s.target).unwrap_or(self.scroll[k]);
+        self.scroll_by(k, d);
+    }
+
+    /// Jump area `k` to `v` (stops any glide).
+    pub fn set_scroll(&mut self, k: usize, v: f32) {
+        self.mo.borrow_mut().scroll[k] = None;
+        self.scroll[k] = v;
+        self.clamp_scroll();
+    }
+
+    /// Advance the scroll springs (once per frame, before painting).
+    fn tick_scroll(&mut self) {
+        let now = Instant::now();
+        for k in 0..4 {
+            let max = (self.content_h[k] - self.view_h[k]).max(0.0);
+            let mut mo = self.mo.borrow_mut();
+            let Some(sp) = mo.scroll[k].as_mut() else { continue };
+            let tgt = sp.target.clamp(0.0, max);
+            let x = sp.step(tgt, motion::SCROLL, now);
+            let moving = sp.moving();
+            if !moving {
+                mo.scroll[k] = None;
+            }
+            drop(mo);
+            self.scroll[k] = x.clamp(0.0, max);
+            if moving {
+                self.animate(30);
             }
         }
     }
@@ -360,13 +665,38 @@ impl App {
             (None, 2) => true,
             _ => theme::system_dark(),
         };
-        theme::make(dark)
+        let transp = if self.backdrop_on() || self.gfx.offscreen() { self.prefs.transp } else { self.prefs.transp.min(1) };
+        theme::make(dark, self.prefs.accent, transp)
     }
 
     pub fn apply_theme(&mut self) {
         self.t = self.theme_now();
         set_dark_frame(self.hwnd, self.t.dark);
         self.invalidate();
+    }
+
+    /// Is a DWM backdrop (Mica, Mica Alt, Acrylic) showing behind the window?
+    pub fn backdrop_on(&self) -> bool {
+        self.mica && self.prefs.backdrop != 3
+    }
+
+    /// Apply the look settings that live outside the colour theme: backdrop, corners, text size, row height.
+    pub fn apply_look(&mut self) {
+        if self.mica {
+            set_backdrop(self.hwnd, [2, 4, 3, 1][self.prefs.backdrop.min(3) as usize]);
+        }
+        set_corners(self.hwnd, self.prefs.corners == 0);
+        self.gfx.font_scale.set([0.93, 1.0, 1.1][self.prefs.font.min(2) as usize]);
+        self.gfx.corner.set(if self.prefs.corners == 0 { 1.0 } else { 0.0 });
+        self.row_h = if self.prefs.density == 0 { 30.0 } else { ROW_H };
+        self.build_rows();
+        self.apply_theme();
+    }
+
+    /// Width of the right pane (Settings > Side pane width); Free up memory is a little wider.
+    pub fn pane_w(&self, kind: PaneKind) -> f32 {
+        let w = [336.0, PANE_W, 432.0][self.prefs.pane.min(2) as usize];
+        if kind == PaneKind::Free { w + FREE_W - PANE_W } else { w }
     }
 
     pub fn lang_is_fa(&self) -> bool {
@@ -510,12 +840,12 @@ impl App {
             let sv: Vec<usize> = self.services_all.iter().enumerate().filter(|(_, s)| model::service_matches(s, &toks)).map(|(i, _)| i).collect();
             push(&mut rows, &mut y, RowK::Sec(0, hits.len()), 32.0);
             for (gi, kids) in &hits {
-                push(&mut rows, &mut y, RowK::Group(*gi), ROW_H);
+                push(&mut rows, &mut y, RowK::Group(*gi), self.row_h);
                 let g = &self.groups[*gi];
                 if g.members.len() > 1 {
                     let all: Vec<usize> = if kids.is_empty() || self.expanded.contains(&g.key) { (0..g.members.len()).collect() } else { kids.clone() };
                     for mi in all {
-                        push(&mut rows, &mut y, RowK::Child(*gi, mi), ROW_H);
+                        push(&mut rows, &mut y, RowK::Child(*gi, mi), self.row_h);
                     }
                 }
             }
@@ -538,11 +868,11 @@ impl App {
             let rest: Vec<usize> = (0..self.groups.len()).filter(|&i| !self.groups[i].hung).collect();
             for (n, list) in [&pinned, &rest].iter().enumerate() {
                 for &gi in list.iter() {
-                    push(&mut rows, &mut y, RowK::Group(gi), ROW_H);
+                    push(&mut rows, &mut y, RowK::Group(gi), self.row_h);
                     let g = &self.groups[gi];
                     if g.members.len() > 1 && self.expanded.contains(&g.key) {
                         for mi in 0..g.members.len() {
-                            push(&mut rows, &mut y, RowK::Child(gi, mi), ROW_H);
+                            push(&mut rows, &mut y, RowK::Child(gi, mi), self.row_h);
                         }
                     }
                 }
@@ -554,6 +884,7 @@ impl App {
         self.content_h[0] = y + 4.0;
         self.rows = rows;
         self.clamp_scroll();
+        self.note_rows();
     }
 
     pub fn clamp_scroll(&mut self) {
@@ -617,10 +948,12 @@ impl App {
         self.w = pw as f32 / self.gfx.scale();
         self.h = ph as f32 / self.gfx.scale();
         self.hits.clear();
+        self.tick_scroll();
+        self.track_ghosts();
         let t = self.t;
         self.gfx.begin();
         // Mica shows through transparent pixels of the window target; screenshots use the solid fallback
-        if self.mica && !self.gfx.offscreen() {
+        if self.backdrop_on() && !self.gfx.offscreen() {
             self.gfx.clear(super::gfx::C(0.0, 0.0, 0.0, 0.0));
         } else {
             self.gfx.clear(t.mica);
@@ -650,10 +983,13 @@ impl App {
 
     /// Hover / press fill for a clickable rect (call before drawing its content).
     pub fn hp(&self, r: Rect, rad: f32, h: Hit) {
-        if self.pressed == h && self.hover == h {
-            self.gfx.fill_round(r, rad, self.t.prs);
-        } else if self.hover == h {
-            self.gfx.fill_round(r, rad, self.t.hov);
+        let hv = self.hov(h);
+        let pd = self.press_depth(h).clamp(0.0, 1.0);
+        if hv > 0.0 {
+            self.gfx.fill_round(r, rad, self.t.hov.fade(hv));
+        }
+        if pd > 0.0 {
+            self.gfx.fill_round(r, rad, self.t.prs.fade(pd));
         }
     }
 
@@ -687,21 +1023,46 @@ impl App {
             SelectObject(dc, old);
             let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(dc);
-            let mut f = Vec::with_capacity(54 + n);
-            f.extend_from_slice(b"BM");
-            f.extend_from_slice(&((54 + n) as u32).to_le_bytes());
-            f.extend_from_slice(&[0, 0, 0, 0]);
-            f.extend_from_slice(&54u32.to_le_bytes());
-            f.extend_from_slice(&40u32.to_le_bytes());
-            f.extend_from_slice(&w.to_le_bytes());
-            f.extend_from_slice(&(-h).to_le_bytes());
-            f.extend_from_slice(&1u16.to_le_bytes());
-            f.extend_from_slice(&32u16.to_le_bytes());
-            f.extend_from_slice(&[0; 24]);
-            f.extend_from_slice(&px);
             self.icon_target = 0;
             self.invalidate();
-            std::fs::write(path, f).map_err(|e| e.to_string())
+            write_bmp(path, w, h, &px)
+        }
+    }
+
+    /// Capture the real window as DWM composes it (caption buttons, backdrop) with PrintWindow(PW_RENDERFULLCONTENT).
+    /// Works for a window that is off every monitor (`--offscreen`), so nothing is ever shown on the screen.
+    fn shot_real(&mut self, path: &str) -> Result<(), String> {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> windows::core::BOOL;
+        }
+        unsafe {
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut wr);
+            let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+            let dc = CreateCompatibleDC(None);
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| e.message())?;
+            let old = SelectObject(dc, bmp.into());
+            // PW_RENDERFULLCONTENT = 2: ask DWM for the composed window, including Direct2D content
+            let ok = PrintWindow(self.hwnd, dc, 2).as_bool();
+            let _ = GdiFlush();
+            let n = (w * h * 4) as usize;
+            let mut px = std::slice::from_raw_parts(bits as *const u8, n).to_vec();
+            let transparent = px.chunks_exact(4).filter(|p| p[3] == 0).count();
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+            if !ok {
+                return Err("PrintWindow failed".into());
+            }
+            self.last_action = format!("shot-real {w}x{h}, {:.0}% transparent pixels", transparent as f64 * 100.0 / (n / 4).max(1) as f64);
+            write_bmp(path, w, h, &px)
         }
     }
 
@@ -776,12 +1137,13 @@ impl App {
     pub fn scroll_to(&mut self, i: usize) {
         let Some(r) = self.rows.get(i) else { return };
         let lh = self.view_h[0];
-        if r.y < self.scroll[0] {
-            self.scroll[0] = r.y - 4.0;
-        } else if r.y + r.h > self.scroll[0] + lh {
-            self.scroll[0] = r.y + r.h - lh + 4.0;
+        let (ry, rh) = (r.y, r.h);
+        let cur = self.mo.borrow().scroll[0].map(|s| s.target).unwrap_or(self.scroll[0]);
+        if ry < cur {
+            self.scroll_smooth(0, ry - 4.0);
+        } else if ry + rh > cur + lh {
+            self.scroll_smooth(0, ry + rh - lh + 4.0);
         }
-        self.clamp_scroll();
     }
 
     /// pid or (part of) a name -> select that row (expands its group for a child pid)
@@ -991,7 +1353,7 @@ impl App {
         let Some(p) = self.proc(pid).cloned() else { return };
         let was_open = self.pane.as_ref().map(|p| p.kind == PaneKind::Details).unwrap_or(false);
         self.pane = Some(Pane { kind: PaneKind::Details, key: g.key.clone(), pid, open, info: PaneInfo::default(), loading: true, ai_loading: false, keep_open: false, at: if was_open { Instant::now() - Duration::from_secs(1) } else { Instant::now() } });
-        self.scroll[3] = 0.0;
+        self.set_scroll(3, 0.0);
         self.animate(220);
         let out = self.pane_result.clone();
         let hwnd = self.hwnd.0 as isize;
@@ -1043,7 +1405,7 @@ impl App {
             self.pane = None;
         } else {
             self.pane = Some(Pane { kind: PaneKind::Free, key: String::new(), pid: 0, open: [false; 3], info: PaneInfo::default(), loading: false, ai_loading: false, keep_open: false, at: Instant::now() });
-            self.scroll[3] = 0.0;
+            self.set_scroll(3, 0.0);
             self.flyout = None;
             self.animate(220);
         }
@@ -1261,7 +1623,33 @@ impl App {
             self.order_prev.clear();
             self.rebuild_groups(false);
         }
+        let p = &self.prefs;
+        if (old.backdrop, old.corners, old.font, old.density) != (p.backdrop, p.corners, p.font, p.density) {
+            self.apply_look();
+        } else if (old.accent, old.transp) != (p.accent, p.transp) {
+            self.apply_theme();
+        }
+        if old.sort != self.prefs.sort
+            && let Some(s) = SortKey::parse(&self.prefs.sort)
+        {
+            self.set_sort(s);
+        }
         self.invalidate();
+    }
+
+    /// Settings > Accent > Custom: set the accent from a hue (0..360) at a pleasant saturation.
+    pub fn set_hue(&mut self, hue: f32) {
+        let c = theme::from_hsl(hue, 0.78, 0.45);
+        let rgb = ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32;
+        self.hex_buf = theme::hex(c);
+        self.set_pref(|p| p.accent = Some(rgb));
+    }
+
+    /// Settings > Accent > Custom: the hex field is complete -> apply it.
+    fn hex_apply(&mut self) {
+        if let Some(rgb) = prefs::parse_hex(&self.hex_buf) {
+            self.set_pref(|p| p.accent = Some(rgb));
+        }
     }
 
     // ------------------------------------------------------------------ input
@@ -1277,7 +1665,15 @@ impl App {
     fn mouse_down(&mut self, x: f32, y: f32, double: bool) {
         let h = self.hit_at(x, y);
         self.pressed = h;
+        self.animate(motion::FAST as u64);
         self.key_focus = h == Hit::KeyField || (self.key_focus && matches!(h, Hit::KeySave | Hit::KeyTest));
+        if self.hex_focus && h != Hit::HexField {
+            self.hex_focus = false;
+            self.hex_apply();
+        }
+        if h == Hit::Hue {
+            self.hue_at(x);
+        }
         self.search_focus = h == Hit::Search || h == Hit::SearchClear || (self.search_focus && self.searching() && !matches!(h, Hit::Tab(_) | Hit::Settings));
         match h {
             Hit::Row(i) | Hit::Chevron(i) => {
@@ -1458,6 +1854,12 @@ impl App {
             Hit::Seg(g, i) => match g {
                 0 => self.set_pref(|p| p.theme = i),
                 1 => self.set_pref(|p| p.interval_ms = [500, 1000, 2000, 5000][i as usize]),
+                3 => self.set_pref(|p| p.backdrop = i),
+                4 => self.set_pref(|p| p.transp = i),
+                5 => self.set_pref(|p| p.density = i),
+                6 => self.set_pref(|p| p.font = i),
+                7 => self.set_pref(|p| p.corners = i),
+                8 => self.set_pref(|p| p.pane = i),
                 _ => {
                     let l = if i == 1 { "fa" } else { "en" };
                     if !self.test {
@@ -1470,6 +1872,8 @@ impl App {
                 0 => self.set_pref(|p| p.merge = !p.merge),
                 1 => self.set_pref(|p| p.ask_end = !p.ask_end),
                 2 => self.set_pref(|p| p.show_pid = !p.show_pid),
+                4 => self.set_pref(|p| p.tiles = !p.tiles),
+                5 => self.set_pref(|p| p.chips = !p.chips),
                 _ => {
                     let on = !self.ai_on;
                     self.set_ai(on)
@@ -1484,7 +1888,49 @@ impl App {
             Hit::KeyTest => self.key_test(),
             Hit::KeyRemove => self.key_remove(),
             Hit::KeyLink => self.open_key_page(),
+            Hit::Accent(i) => {
+                if i == 0 {
+                    self.custom_open = false;
+                    self.set_pref(|p| p.accent = None);
+                } else if let Some((_, rgb)) = theme::PRESETS.get(i as usize - 1) {
+                    self.custom_open = false;
+                    let rgb = *rgb;
+                    self.set_pref(|p| p.accent = Some(rgb));
+                } else {
+                    self.custom_open = !self.custom_open;
+                    if self.custom_open {
+                        let cur = self.prefs.accent.unwrap_or(0x0078D4);
+                        self.hex_buf = format!("#{cur:06X}");
+                        if self.prefs.accent.is_none() {
+                            self.set_pref(|p| p.accent = Some(cur));
+                        }
+                    }
+                }
+            }
+            Hit::HexField => {
+                self.hex_focus = true;
+                self.key_focus = false;
+                self.search_focus = false;
+            }
+            Hit::ColPill(i) => self.set_pref(|p| match i {
+                0 => p.col_type = !p.col_type,
+                1 => p.show_pid = !p.show_pid,
+                2 => p.col_disk = !p.col_disk,
+                3 => p.col_net = !p.col_net,
+                _ => p.col_gpu = !p.col_gpu,
+            }),
+            Hit::DefSort => {
+                self.menu = Some(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now() });
+            }
             _ => {}
+        }
+    }
+
+    /// Hue strip: pick the hue under x.
+    fn hue_at(&mut self, x: f32) {
+        let r = self.hue_rect;
+        if r.w > 0.0 {
+            self.set_hue(((x - r.x) / r.w).clamp(0.0, 1.0) * 359.0);
         }
     }
 
@@ -1497,6 +1943,12 @@ impl App {
                 }
             }
             MenuKind::StartupSort => self.startup_sort = i,
+            MenuKind::DefSort => {
+                if let Some(s) = SortKey::MENU.get(i as usize) {
+                    let name = s.label().to_lowercase();
+                    self.set_pref(|p| p.sort = name);
+                }
+            }
             MenuKind::Chips => {
                 let chips = self.chips();
                 if let Some(c) = chips.get(3 + i as usize) {
@@ -1541,8 +1993,7 @@ impl App {
         } else {
             0
         };
-        self.scroll[k] -= d / 120.0 * ROW_H * 3.0;
-        self.clamp_scroll();
+        self.scroll_by(k, -d / 120.0 * self.row_h * 3.0);
         self.invalidate();
     }
 
@@ -1556,6 +2007,14 @@ impl App {
             return false;
         }
         match VIRTUAL_KEY(vk) {
+            VK_BACK if self.hex_focus => {
+                self.hex_buf.pop();
+            }
+            VK_RETURN if self.hex_focus => {
+                self.hex_focus = false;
+                self.hex_apply();
+            }
+            VK_ESCAPE if self.hex_focus => self.hex_focus = false,
             VK_BACK if self.key_focus => {
                 self.key_buf.pop();
             }
@@ -1584,8 +2043,8 @@ impl App {
             VK_RETURN if self.dialog.is_some() => self.dialog = None,
             VK_DOWN => self.move_sel(1),
             VK_UP => self.move_sel(-1),
-            VK_PRIOR => self.scroll[0] -= self.list_rect.h - ROW_H,
-            VK_NEXT => self.scroll[0] += self.list_rect.h - ROW_H,
+            VK_PRIOR => self.scroll_by(0, -(self.list_rect.h - self.row_h)),
+            VK_NEXT => self.scroll_by(0, self.list_rect.h - self.row_h),
             VK_RIGHT if !self.search_focus => {
                 if let Some(Sel::Group(k)) = self.sel.clone() {
                     self.expanded.insert(k);
@@ -1603,6 +2062,7 @@ impl App {
             VK_DELETE if self.page == 0 => self.end_selected(shift),
             VK_F5 => self.ctl.now.store(true, Relaxed),
             VK_F if ctrl => self.search_focus = true,
+            VK_OEM_COMMA if ctrl => self.set_page(2),
             VK_C if ctrl && shift => self.copy_command(),
             VK_BACK => {
                 if ctrl {
@@ -1611,7 +2071,7 @@ impl App {
                 } else {
                     self.query.pop();
                 }
-                self.scroll[0] = 0.0;
+                self.set_scroll(0, 0.0);
                 self.build_rows();
             }
             _ => return false,
@@ -1645,10 +2105,23 @@ impl App {
             self.invalidate();
             return;
         }
+        if self.hex_focus {
+            if ch.is_ascii_hexdigit() && self.hex_buf.trim_start_matches('#').len() < 6 {
+                if !self.hex_buf.starts_with('#') {
+                    self.hex_buf.insert(0, '#');
+                }
+                self.hex_buf.push(ch.to_ascii_uppercase());
+                if self.hex_buf.len() == 7 {
+                    self.hex_apply();
+                }
+            }
+            self.invalidate();
+            return;
+        }
         // typing anywhere searches
         self.query.push(ch);
         self.search_focus = true;
-        self.scroll[0] = 0.0;
+        self.set_scroll(0, 0.0);
         self.page = 0;
         self.flyout = None;
         self.build_rows();
@@ -1711,6 +2184,14 @@ impl App {
             "first_paint_ms": self.first_paint_ms,
             "full_data_ms": self.full_data_ms,
             "test_mode": self.test,
+            "offscreen": self.offscreen,
+            "active": self.is_active(),
+            "caption": {"hover": format!("{:?}", self.nc_hover), "down": format!("{:?}", self.nc_down)},
+            "sysmenu": SYSMENU_STATE.lock().unwrap().clone(),
+            "prefs": self.prefs.to_json(),
+            "backdrop_on": self.backdrop_on(),
+            "row_h": self.row_h,
+            "animating": Instant::now() < self.anim_until.get(),
             "last_action": self.last_action,
         })
     }
@@ -1725,8 +2206,95 @@ impl App {
         unsafe {
             match cmd {
                 "show" => {
-                    let _ = ShowWindow(self.hwnd, SW_RESTORE);
-                    let _ = SetForegroundWindow(self.hwnd);
+                    if self.offscreen {
+                        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                    } else {
+                        let _ = ShowWindow(self.hwnd, SW_RESTORE);
+                        let _ = SetForegroundWindow(self.hwnd);
+                    }
+                }
+                "shot-real" => {
+                    if arg.is_empty() {
+                        return err("shot-real needs a .bmp path");
+                    }
+                    // draw the latest frame first, then let DWM compose it
+                    let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                    let _ = DwmFlush();
+                    return match self.shot_real(&arg) {
+                        Ok(()) => json!({"ok": true, "file": arg, "note": self.last_action}).to_string(),
+                        Err(e) => err(&e),
+                    };
+                }
+                "nc" => {
+                    // caption buttons, the same code paths WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN / WM_NCMOUSELEAVE use:
+                    // nc hover|down|leave min|max|close  (no real mouse, no message to any other window)
+                    let h = match parts.get(2).copied().unwrap_or("") {
+                        "min" => Hit::Min,
+                        "max" => Hit::Max,
+                        "close" => Hit::Close,
+                        _ => Hit::None,
+                    };
+                    match a1 {
+                        "hover" => self.nc_move(h),
+                        "down" => {
+                            self.nc_move(h);
+                            self.nc_down = h;
+                        }
+                        "leave" => {
+                            self.nc_hover = Hit::None;
+                            self.nc_down = Hit::None;
+                        }
+                        _ => return err("nc hover|down|leave min|max|close"),
+                    }
+                }
+                "nchit" => {
+                    // what WM_NCHITTEST answers at client DIP x y
+                    let x: f32 = a1.parse().unwrap_or(0.0);
+                    let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    let code = self.nc_hit(x, y, IsZoomed(self.hwnd).as_bool());
+                    let name = match code {
+                        HTMINBUTTON => "HTMINBUTTON",
+                        HTMAXBUTTON => "HTMAXBUTTON",
+                        HTCLOSE => "HTCLOSE",
+                        HTCAPTION => "HTCAPTION",
+                        HTCLIENT => "HTCLIENT",
+                        HTTOP => "HTTOP",
+                        HTTOPRIGHT => "HTTOPRIGHT",
+                        HTTOPLEFT => "HTTOPLEFT",
+                        _ => "other",
+                    };
+                    return json!({"ok": true, "code": code, "name": name}).to_string();
+                }
+                "active" => {
+                    self.active_force = match a1 {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None,
+                    }
+                }
+                "sysmenu" => {
+                    if a1 == "close" {
+                        let _ = EndMenu();
+                    } else if self.offscreen {
+                        return err("the system menu would open on a monitor; use the hidden desktop for it");
+                    } else {
+                        // the same message Alt+Space produces
+                        let _ = PostMessageW(Some(self.hwnd), WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0x20));
+                    }
+                }
+                "sysmenu-cmd" => {
+                    let sc = match a1 {
+                        "restore" => SC_RESTORE,
+                        "min" | "minimize" => SC_MINIMIZE,
+                        "max" | "maximize" => SC_MAXIMIZE,
+                        "close" => SC_CLOSE,
+                        _ => return err("sysmenu-cmd restore|min|max|close"),
+                    };
+                    let _ = PostMessageW(Some(self.hwnd), WM_SYSCOMMAND, WPARAM(sc as usize), LPARAM(0));
+                }
+                "glyphs" => {
+                    let (font, missing) = self.gfx.icon_check(&GLYPHS_USED);
+                    return json!({"ok": true, "icon_font": font, "checked": GLYPHS_USED.len(), "missing": missing.iter().map(|c| format!("{c:X}")).collect::<Vec<_>>()}).to_string();
                 }
                 "quit" => {
                     let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1746,7 +2314,7 @@ impl App {
                     self.query = arg.clone();
                     self.search_focus = !arg.is_empty();
                     self.page = 0;
-                    self.scroll[0] = 0.0;
+                    self.set_scroll(0, 0.0);
                     self.build_rows();
                 }
                 "select" => {
@@ -1876,8 +2444,11 @@ impl App {
                 "scroll" => {
                     // scroll <px> [pane]: absolute scroll of the current page (or the right pane)
                     let k = if parts.get(2) == Some(&"pane") { 3 } else { self.page as usize };
-                    self.scroll[k] = a1.parse().unwrap_or(0.0);
-                    self.clamp_scroll();
+                    if parts.get(2) == Some(&"smooth") || parts.get(3) == Some(&"smooth") {
+                        self.scroll_smooth(k, a1.parse().unwrap_or(0.0));
+                    } else {
+                        self.set_scroll(k, a1.parse().unwrap_or(0.0));
+                    }
                 }
                 "toast" => {
                     if a1 == "close" {
@@ -1914,7 +2485,65 @@ impl App {
                             self.set_pref(|p| p.interval_ms = ms)
                         }
                         "ai" => self.set_ai(b),
-                        _ => return err("set merge|ask_end|show_pid|ai on|off, set interval <ms>"),
+                        "theme" => {
+                            let i = ["system", "light", "dark"].iter().position(|x| *x == v).unwrap_or(0) as u8;
+                            self.set_pref(|p| p.theme = i)
+                        }
+                        "backdrop" => {
+                            let Some(i) = ["mica", "mica-alt", "acrylic", "solid"].iter().position(|x| *x == v) else { return err("set backdrop mica|mica-alt|acrylic|solid") };
+                            self.set_pref(|p| p.backdrop = i as u8)
+                        }
+                        "transparency" => {
+                            let Some(i) = ["off", "low", "medium", "high"].iter().position(|x| *x == v) else { return err("set transparency off|low|medium|high") };
+                            self.set_pref(|p| p.transp = i as u8)
+                        }
+                        "accent" => {
+                            let acc = if v == "system" {
+                                None
+                            } else if let Some(i) = theme::PRESETS.iter().position(|p| p.0.eq_ignore_ascii_case(v)) {
+                                Some(theme::PRESETS[i].1)
+                            } else if let Some(rgb) = prefs::parse_hex(v) {
+                                Some(rgb)
+                            } else {
+                                return err("set accent system|blue|purple|pink|red|orange|gold|green|teal|#RRGGBB");
+                            };
+                            self.custom_open = acc.is_some() && !theme::PRESETS.iter().any(|p| Some(p.1) == acc);
+                            if let Some(a) = acc {
+                                self.hex_buf = format!("#{a:06X}");
+                            }
+                            self.set_pref(|p| p.accent = acc)
+                        }
+                        "density" => self.set_pref(|p| p.density = (v != "compact") as u8),
+                        "text" => {
+                            let i = ["small", "medium", "large"].iter().position(|x| *x == v).unwrap_or(1) as u8;
+                            self.set_pref(|p| p.font = i)
+                        }
+                        "corners" => self.set_pref(|p| p.corners = (v == "square") as u8),
+                        "pane" => {
+                            let i = ["narrow", "medium", "wide"].iter().position(|x| *x == v).unwrap_or(1) as u8;
+                            self.set_pref(|p| p.pane = i)
+                        }
+                        "summary" => self.set_pref(|p| p.tiles = b),
+                        "chips" => self.set_pref(|p| p.chips = b),
+                        "col" => {
+                            let on = parts.get(3).map(|x| *x == "on").unwrap_or(true);
+                            match v {
+                                "type" => self.set_pref(|p| p.col_type = on),
+                                "pid" => self.set_pref(|p| p.show_pid = on),
+                                "disk" => self.set_pref(|p| p.col_disk = on),
+                                "network" => self.set_pref(|p| p.col_net = on),
+                                "gpu" => self.set_pref(|p| p.col_gpu = on),
+                                _ => return err("set col type|pid|disk|network|gpu on|off"),
+                            }
+                        }
+                        "sort" => {
+                            if SortKey::parse(v).is_none() {
+                                return err("set sort impact|cpu|memory|disk|network|gpu|name");
+                            }
+                            let name = v.to_lowercase();
+                            self.set_pref(|p| p.sort = name)
+                        }
+                        _ => return err("set merge|ask_end|show_pid|ai|summary|chips on|off, set interval <ms>, set theme|backdrop|transparency|accent|density|text|corners|pane|sort <value>, set col <name> on|off"),
                     }
                 }
                 "ai" => match a1 {
@@ -2108,6 +2737,162 @@ fn lparam_xy(lp: LPARAM) -> (i32, i32) {
     ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32)
 }
 
+/// Caption buttons: Windows 11 size (46 x 32 DIPs) at the top right.
+pub const CAP_W: f32 = 46.0;
+pub const CAP_H: f32 = 32.0;
+
+/// Glyphs the window draws from the icon font (checked by `wtm gui glyphs`).
+pub const GLYPHS_USED: [u32; 24] = [
+    0xE921, 0xE922, 0xE923, 0xE8BB, 0xE713, 0xE721, 0xE711, 0xE72C, 0xE946, 0xE712, 0xEA99, 0xE8CB, 0xE70D, 0xE76C, 0xE790, 0xE771, 0xE81E, 0xE8D2, 0xE8A9, 0xE739, 0xE89F, 0xE895, 0xE9D2, 0xE70F,
+];
+
+/// Last window menu shown: its items and whether it is open (for `wtm gui state`).
+static SYSMENU_STATE: Mutex<serde_json::Value> = Mutex::new(serde_json::Value::Null);
+
+impl App {
+    pub fn is_active(&self) -> bool {
+        self.active_force.unwrap_or(self.active)
+    }
+
+    /// What WM_NCHITTEST answers at client point (x, y) in DIPs.
+    pub fn nc_hit(&self, x: f32, y: f32, maxed: bool) -> u32 {
+        let caps = x >= self.w - CAP_W * 3.0 && y < CAP_H;
+        if !maxed {
+            // resize edges; over the caption buttons only a thin top band resizes, the corner still does
+            let b = 6.0;
+            let top = if caps && x < self.w - b { 2.0 } else { b };
+            let (l, r, t, bt) = (x < b, x > self.w - b, y < top, y > self.h - b);
+            let code = match (l, r, t, bt) {
+                (true, _, true, _) => HTTOPLEFT,
+                (_, true, true, _) => HTTOPRIGHT,
+                (true, _, _, true) => HTBOTTOMLEFT,
+                (_, true, _, true) => HTBOTTOMRIGHT,
+                (true, ..) => HTLEFT,
+                (_, true, ..) => HTRIGHT,
+                (_, _, true, _) => HTTOP,
+                (.., true) => HTBOTTOM,
+                _ => 0,
+            };
+            if code != 0 {
+                return code;
+            }
+        }
+        if caps {
+            // answered even under a dialog, so Snap Layouts and the buttons always work
+            let i = ((x - (self.w - CAP_W * 3.0)) / CAP_W) as usize;
+            return [HTMINBUTTON, HTMAXBUTTON, HTCLOSE][i.min(2)];
+        }
+        if y < TITLE_H && self.dialog.is_none() {
+            return match self.hit_at(x, y) {
+                Hit::None => HTCAPTION,
+                _ => HTCLIENT,
+            };
+        }
+        HTCLIENT
+    }
+
+    /// The pointer moved onto caption button `h` (or off them, Hit::None).
+    pub fn nc_move(&mut self, h: Hit) {
+        if h != self.nc_hover {
+            self.nc_hover = h;
+            if h != Hit::None {
+                self.hover = Hit::None;
+            }
+            if self.nc_down != h {
+                self.nc_down = Hit::None;
+            }
+            self.invalidate();
+        }
+    }
+
+    /// Minimize / maximize / restore from a caption button (blocked for the off-screen test window).
+    fn caption_cmd(&mut self, sc: u32) {
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_SYSCOMMAND, WPARAM(sc as usize), LPARAM(0));
+        }
+    }
+}
+
+/// Where Alt+Space opens the window menu: the window's top-left, under the title bar.
+fn sysmenu_origin(hwnd: HWND, s: f32) -> (i32, i32) {
+    let mut wr = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut wr);
+    }
+    (wr.left + (8.0 * s) as i32, wr.top + (TITLE_H * s) as i32)
+}
+
+/// The window menu (Restore, Move, Size, Minimize, Maximize, Close). The window has no WS_SYSMENU (so DWM
+/// draws no caption buttons over Mica), so it is shown here and its choice is sent as WM_SYSCOMMAND.
+fn show_sysmenu(hwnd: HWND, x: i32, y: i32) {
+    unsafe {
+        let mut m = GetSystemMenu(hwnd, false);
+        let own = m.is_invalid() || GetMenuItemCount(Some(m)) <= 0;
+        if own {
+            m = CreatePopupMenu().unwrap_or_default();
+            for (id, label) in [(SC_RESTORE, "&Restore"), (SC_MOVE, "&Move"), (SC_SIZE, "&Size"), (SC_MINIMIZE, "Mi&nimize"), (SC_MAXIMIZE, "Ma&ximize"), (0, ""), (SC_CLOSE, "&Close	Alt+F4")] {
+                if id == 0 {
+                    let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+                } else {
+                    let w = wide(label);
+                    let _ = AppendMenuW(m, MF_STRING, id as usize, PCWSTR(w.as_ptr()));
+                }
+            }
+        }
+        let maxed = IsZoomed(hwnd).as_bool();
+        let iconic = IsIconic(hwnd).as_bool();
+        let st = |on: bool| MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED };
+        let items = [(SC_RESTORE, maxed || iconic, "restore"), (SC_MOVE, !maxed && !iconic, "move"), (SC_SIZE, !maxed && !iconic, "size"), (SC_MINIMIZE, !iconic, "minimize"), (SC_MAXIMIZE, !maxed, "maximize"), (SC_CLOSE, true, "close")];
+        for (id, on, _) in items {
+            let _ = EnableMenuItem(m, id, st(on));
+        }
+        let _ = SetMenuDefaultItem(m, SC_CLOSE, 0);
+        let list: serde_json::Map<String, serde_json::Value> = items.iter().map(|(_, on, n)| (n.to_string(), serde_json::Value::Bool(*on))).collect();
+        *SYSMENU_STATE.lock().unwrap() = serde_json::json!({"open": true, "own_menu": own, "enabled": list});
+        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, None, hwnd, None);
+        SYSMENU_STATE.lock().unwrap()["open"] = serde_json::Value::Bool(false);
+        if own {
+            let _ = DestroyMenu(m);
+        }
+        if cmd.0 != 0 {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd.0 as usize), LPARAM(0));
+        }
+    }
+}
+
+/// DWMWA_SYSTEMBACKDROP_TYPE: 1 none, 2 Mica, 3 Acrylic, 4 Mica Alt.
+fn set_backdrop(hwnd: HWND, kind: i32) {
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const i32 as *const _, 4);
+    }
+}
+
+/// DWMWA_WINDOW_CORNER_PREFERENCE: 2 round, 1 do not round.
+fn set_corners(hwnd: HWND, round: bool) {
+    let v: i32 = if round { 2 } else { 1 };
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &v as *const i32 as *const _, 4);
+    }
+}
+
+/// Save 32-bit top-down BGRA pixels as a BMP file.
+fn write_bmp(path: &str, w: i32, h: i32, px: &[u8]) -> Result<(), String> {
+    let n = px.len();
+    let mut f = Vec::with_capacity(54 + n);
+    f.extend_from_slice(b"BM");
+    f.extend_from_slice(&((54 + n) as u32).to_le_bytes());
+    f.extend_from_slice(&[0, 0, 0, 0]);
+    f.extend_from_slice(&54u32.to_le_bytes());
+    f.extend_from_slice(&40u32.to_le_bytes());
+    f.extend_from_slice(&w.to_le_bytes());
+    f.extend_from_slice(&(-h).to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&32u16.to_le_bytes());
+    f.extend_from_slice(&[0; 24]);
+    f.extend_from_slice(px);
+    std::fs::write(path, f).map_err(|e| e.to_string())
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
@@ -2138,36 +2923,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut pt = POINT { x: sx, y: sy };
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let (x, y) = (pt.x as f32 / s, pt.y as f32 / s);
-                let maxed = IsZoomed(hwnd).as_bool();
-                let b = 6.0;
-                if !maxed {
-                    let (l, r, t, bt) = (x < b, x > app.w - b, y < b, y > app.h - b);
-                    let code = match (l, r, t, bt) {
-                        (true, _, true, _) => HTTOPLEFT,
-                        (_, true, true, _) => HTTOPRIGHT,
-                        (true, _, _, true) => HTBOTTOMLEFT,
-                        (_, true, _, true) => HTBOTTOMRIGHT,
-                        (true, ..) => HTLEFT,
-                        (_, true, ..) => HTRIGHT,
-                        (_, _, true, _) => HTTOP,
-                        (.., true) => HTBOTTOM,
-                        _ => 0,
-                    };
-                    if code != 0 {
-                        return LRESULT(code as isize);
-                    }
-                }
-                if y < TITLE_H && app.dialog.is_none() {
-                    return LRESULT(match app.hit_at(x, y) {
-                        Hit::Min => HTMINBUTTON,
-                        Hit::Max => HTMAXBUTTON,
-                        Hit::Close => HTCLOSE,
-                        Hit::None => HTCAPTION,
-                        _ if app.menu.is_some() => HTCLIENT,
-                        _ => HTCLIENT,
-                    } as isize);
-                }
-                LRESULT(HTCLIENT as isize)
+                LRESULT(app.nc_hit(x, y, IsZoomed(hwnd).as_bool()) as isize)
             }
             WM_NCMOUSEMOVE => {
                 let h = match wp.0 as u32 {
@@ -2177,35 +2933,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     _ => Hit::None,
                 };
                 if h != app.nc_hover {
-                    app.nc_hover = h;
-                    app.hover = Hit::None;
+                    app.nc_move(h);
                     let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: hwnd, dwHoverTime: 0 };
                     let _ = TrackMouseEvent(&mut tme);
-                    app.invalidate();
                 }
+                // DefWindowProc keeps the Windows 11 Snap Layouts flyout working over HTMAXBUTTON
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_NCMOUSELEAVE => {
                 app.nc_hover = Hit::None;
+                app.nc_down = Hit::None;
                 app.invalidate();
                 LRESULT(0)
             }
-            WM_NCLBUTTONDOWN => match wp.0 as u32 {
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => match wp.0 as u32 {
+                // caption buttons are pressed and released here, so Windows never draws its own over Mica
                 HTMINBUTTON | HTMAXBUTTON | HTCLOSE => {
                     app.nc_down = app.nc_hover;
+                    app.animate(motion::FAST as u64);
+                    app.invalidate();
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             },
             WM_NCLBUTTONUP => {
                 let d = std::mem::replace(&mut app.nc_down, Hit::None);
+                app.invalidate();
                 match (wp.0 as u32, d) {
-                    (HTMINBUTTON, Hit::Min) => {
-                        let _ = ShowWindow(hwnd, SW_MINIMIZE);
-                    }
-                    (HTMAXBUTTON, Hit::Max) => {
-                        let _ = ShowWindow(hwnd, if IsZoomed(hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE });
-                    }
+                    (HTMINBUTTON, Hit::Min) => app.caption_cmd(SC_MINIMIZE),
+                    (HTMAXBUTTON, Hit::Max) => app.caption_cmd(if IsZoomed(hwnd).as_bool() { SC_RESTORE } else { SC_MAXIMIZE }),
                     (HTCLOSE, Hit::Close) => {
                         let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
@@ -2213,18 +2969,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
+            WM_NCRBUTTONUP if wp.0 as u32 == HTCAPTION => {
+                // right-click on the title bar: the window menu
+                let (sx, sy) = lparam_xy(lp);
+                if !app.offscreen {
+                    show_sysmenu(hwnd, sx, sy);
+                }
+                LRESULT(0)
+            }
+            WM_SYSCHAR if wp.0 == 0x20 => {
+                // Alt+Space: the window menu at the top-left, under the title bar
+                if !app.offscreen {
+                    let (x, y) = sysmenu_origin(hwnd, s);
+                    show_sysmenu(hwnd, x, y);
+                }
+                LRESULT(0)
+            }
+            WM_SYSCOMMAND => {
+                let sc = (wp.0 & 0xFFF0) as u32;
+                if sc == SC_KEYMENU && lp.0 == 0x20 {
+                    if !app.offscreen {
+                        let (x, y) = sysmenu_origin(hwnd, s);
+                        show_sysmenu(hwnd, x, y);
+                    }
+                    return LRESULT(0);
+                }
+                if sc == SC_CLOSE {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    return LRESULT(0);
+                }
+                if app.offscreen && [SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_MOVE, SC_SIZE].contains(&sc) {
+                    // the test window never moves onto a monitor
+                    app.last_action = format!("window command {sc:#X} blocked (offscreen test window)");
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_NCACTIVATE => {
+                app.active = wp.0 != 0;
+                app.invalidate();
+                // with a custom frame DWM draws nothing here; -1 keeps DefWindowProc from repainting a frame
+                DefWindowProcW(hwnd, msg, wp, LPARAM(-1))
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = lparam_xy(lp);
                 let (x, y) = (x as f32 / s, y as f32 / s);
                 if let Some((k, y0, s0)) = app.drag_scroll {
                     let (view, ch) = (app.view_h[k as usize], app.content_h[k as usize]);
                     let th = (view * view / ch.max(1.0)).max(30.0);
-                    app.scroll[k as usize] = s0 + (y - y0) * (ch - view) / (view - th).max(1.0);
-                    app.clamp_scroll();
+                    app.set_scroll(k as usize, s0 + (y - y0) * (ch - view) / (view - th).max(1.0));
                     app.invalidate();
                     return LRESULT(0);
                 }
                 app.nc_hover = Hit::None;
+                app.nc_down = Hit::None;
+                if app.pressed == Hit::Hue {
+                    app.hue_at(x);
+                    app.invalidate();
+                    return LRESULT(0);
+                }
                 let h = app.hit_at(x, y);
                 if h != app.hover {
                     app.hover = h;
@@ -2312,10 +3115,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if app.toast.is_some() && !toast_live {
                         app.toast = None;
                     }
-                    if Instant::now() > app.anim_until && app.toast.is_none() {
+                    if Instant::now() > app.anim_until.get() && app.toast.is_none() {
                         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                     }
-                    if app.toast.is_some() && Instant::now() > app.anim_until {
+                    if app.toast.is_some() && Instant::now() > app.anim_until.get() {
                         // keep a slow tick for the toast's auto-hide
                         SetTimer(Some(hwnd), TIMER_ANIM, 250, None);
                     }
@@ -2352,6 +3155,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_ACTIVATE => {
+                app.active = (wp.0 & 0xFFFF) != 0;
                 if (wp.0 & 0xFFFF) == 0 {
                     app.menu = None;
                     app.shift = false;
@@ -2424,7 +3228,9 @@ pub fn run(software: bool) -> i32 {
     let started = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let arg_after = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
-    let test = args.iter().any(|a| a == "--test");
+    // --offscreen: a test window far off every monitor, no taskbar button, never activated (implies --test)
+    let offscreen = args.iter().any(|a| a == "--offscreen");
+    let test = offscreen || args.iter().any(|a| a == "--test");
     let theme_override = match arg_after("--theme").as_deref() {
         Some("light") => Some(false),
         Some("dark") => Some(true),
@@ -2444,7 +3250,7 @@ pub fn run(software: bool) -> i32 {
             (None, 2) => true,
             _ => theme::system_dark(),
         };
-        let t = theme::make(dark0);
+        let t = theme::make(dark0, prefs.accent, prefs.transp);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
@@ -2464,7 +3270,8 @@ pub fn run(software: bool) -> i32 {
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
         let style = if want_mica { WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN } else { WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN };
-        let Ok(hwnd) = CreateWindowExW(WINDOW_EX_STYLE(0), cls, w!("Task Manager"), style, (sw - w) / 2, (sh - h) / 2, w, h, None, None, Some(inst.into()), None) else { return 1 };
+        let (ex, x0, y0) = if offscreen { (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000) } else { (WINDOW_EX_STYLE(0), (sw - w) / 2, (sh - h) / 2) };
+        let Ok(hwnd) = CreateWindowExW(ex, cls, w!("Rust Task Manager"), style, x0, y0, w, h, None, None, Some(inst.into()), None) else { return 1 };
         set_dark_frame(hwnd, t.dark);
         let mica = want_mica && set_mica(hwnd);
         if !mica {
@@ -2525,8 +3332,15 @@ pub fn run(software: bool) -> i32 {
             menu: None,
             dialog: None,
             toast: None,
-            slides: HashMap::new(),
-            anim_until: Instant::now(),
+            mo: std::cell::RefCell::new(Mo::default()),
+            anim_until: std::cell::Cell::new(Instant::now()),
+            offscreen,
+            active: false,
+            active_force: None,
+            hex_focus: false,
+            hex_buf: String::new(),
+            hue_rect: Rect::default(),
+            custom_open: false,
             w: 1180.0,
             h: 760.0,
             ipc_in: Arc::new(Mutex::new(vec![])),
@@ -2551,6 +3365,7 @@ pub fn run(software: bool) -> i32 {
             content_h: [0.0; 4],
             view_h: [600.0; 4],
             want_scroll_sel: false,
+            row_h: ROW_H,
         });
         ctl.icon_px.store((16.0 * GetDpiForWindow(hwnd) as f32 / 96.0).round() as u32, Relaxed);
         let ipc_in = app.ipc_in.clone();
@@ -2567,11 +3382,16 @@ pub fn run(software: bool) -> i32 {
                 rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| r#"{"ok":false,"error":"window busy"}"#.into())
             })
         });
-        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // saved look: backdrop, corners, text size, density, accent; and the default sort
+        if let Some(sk) = SortKey::parse(&(*ptr).prefs.sort) {
+            (*ptr).sort = sk;
+        }
+        (*ptr).apply_look();
         // data may already be there (the first sample takes a few ms)
         (*ptr).take_data();
         trace(&format!("{:.1} ms: data taken ({} procs)", started.elapsed().as_secs_f64() * 1000.0, (*ptr).procs.len()));
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if offscreen { SW_SHOWNOACTIVATE } else { SW_SHOW });
         trace(&format!("{:.1} ms: shown", started.elapsed().as_secs_f64() * 1000.0));
         let _ = UpdateWindow(hwnd);
         trace(&format!("{:.1} ms: first paint done", started.elapsed().as_secs_f64() * 1000.0));

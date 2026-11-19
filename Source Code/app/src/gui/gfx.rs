@@ -3,7 +3,7 @@
 //! Vazirmatn (Regular + SemiBold, subset to Arabic + Latin) is embedded and loaded as an in-memory font collection;
 //! it is also the fallback font for Arabic-script runs inside the Segoe UI text (Persian process names).
 use crate::sys::wide;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -29,6 +29,11 @@ impl C {
     /// multiply the alpha
     pub fn fade(self, f: f32) -> C {
         C(self.0, self.1, self.2, self.3 * f)
+    }
+    /// blend toward `b` by `f` (0 = self, 1 = b), alpha included
+    pub fn mix(self, b: C, f: f32) -> C {
+        let f = f.clamp(0.0, 1.0);
+        C(self.0 + (b.0 - self.0) * f, self.1 + (b.1 - self.1) * f, self.2 + (b.2 - self.2) * f, self.3 + (b.3 - self.3) * f)
     }
     fn d2(self) -> D2D1_COLOR_F {
         D2D1_COLOR_F { r: self.0, g: self.1, b: self.2, a: self.3 }
@@ -111,6 +116,13 @@ pub struct Gfx {
     fallback: Option<IDWriteFontFallback>,
     icon_family: String,
     mono_family: String,
+    /// opacity applied to everything drawn (fading overlays in and out)
+    alpha_mul: Cell<f32>,
+    /// text size factor (Settings > Text size); glyphs keep their size
+    pub font_scale: Cell<f32>,
+    /// corner radius factor (Settings > Corners: 1 rounded, 0 square)
+    pub corner: Cell<f32>,
+    xf_stack: RefCell<Vec<windows_numerics::Matrix3x2>>,
 }
 
 pub enum Seg {
@@ -135,9 +147,11 @@ impl Gfx {
                 let mut exists = windows::core::BOOL(0);
                 c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).is_ok() && exists.as_bool()
             };
-            let icon_family = if has("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.to_string();
+            // the caption and command glyphs need Segoe Fluent Icons (Windows 11); Segoe MDL2 Assets has the same
+            // code points on Windows 10. Check the font really has them, not only that the name exists.
+            let icon_family = if has_glyph(&dw, "Segoe Fluent Icons", 0xE921) { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.to_string();
             let mono_family = if has("Cascadia Mono") { "Cascadia Mono" } else { "Consolas" }.to_string();
-            let mut g = Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, alpha: false, dpi: 96.0, fa: None, fallback: None, icon_family, mono_family };
+            let mut g = Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, alpha: false, dpi: 96.0, fa: None, fallback: None, icon_family, mono_family, alpha_mul: Cell::new(1.0), font_scale: Cell::new(1.0), corner: Cell::new(1.0), xf_stack: RefCell::new(vec![]) };
             g.load_fa();
             Ok(g)
         }
@@ -275,7 +289,7 @@ impl Gfx {
 
     fn b(&self, c: C) -> &ID2D1SolidColorBrush {
         let b = self.brush.as_ref().unwrap();
-        unsafe { b.SetColor(&c.d2()) };
+        unsafe { b.SetColor(&c.fade(self.alpha_mul.get()).d2()) };
         b
     }
 
@@ -294,6 +308,7 @@ impl Gfx {
         if c.3 <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
+        let rad = super::theme::radius(rad, self.corner.get() > 0.5);
         unsafe { self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c)) };
     }
 
@@ -302,6 +317,7 @@ impl Gfx {
             return;
         }
         let r = r.inset(w / 2.0, w / 2.0);
+        let rad = super::theme::radius(rad, self.corner.get() > 0.5);
         unsafe { self.rt().DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c), w, None) };
     }
 
@@ -359,6 +375,57 @@ impl Gfx {
         unsafe { self.rt().PopAxisAlignedClip() };
     }
 
+    /// Multiply everything drawn until `pop_alpha` by `a` (nests). Returns the previous factor.
+    pub fn push_alpha(&self, a: f32) -> f32 {
+        let old = self.alpha_mul.get();
+        self.alpha_mul.set(old * a.clamp(0.0, 1.0));
+        old
+    }
+
+    pub fn pop_alpha(&self, old: f32) {
+        self.alpha_mul.set(old);
+    }
+
+    /// Scale the next draws by `s` around (cx, cy), on top of the current transform. Undo with `pop_xf`.
+    pub fn push_scale(&self, cx: f32, cy: f32, s: f32) {
+        self.push_xf(windows_numerics::Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: cx - cx * s, M32: cy - cy * s });
+    }
+
+    /// Rotate the next draws by `deg` degrees around (cx, cy), on top of the current transform. Undo with `pop_xf`.
+    pub fn push_xf_rotate(&self, cx: f32, cy: f32, deg: f32) {
+        let (sn, cs) = deg.to_radians().sin_cos();
+        self.push_xf(windows_numerics::Matrix3x2 { M11: cs, M12: sn, M21: -sn, M22: cs, M31: cx - cx * cs + cy * sn, M32: cy - cx * sn - cy * cs });
+    }
+
+    /// Move the next draws by (dx, dy), on top of the current transform. Undo with `pop_xf`.
+    pub fn push_move(&self, dx: f32, dy: f32) {
+        self.push_xf(windows_numerics::Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: dx, M32: dy });
+    }
+
+    fn push_xf(&self, m: windows_numerics::Matrix3x2) {
+        unsafe {
+            let mut cur = windows_numerics::Matrix3x2::default();
+            self.rt().GetTransform(&mut cur);
+            self.xf_stack.borrow_mut().push(cur);
+            // m first, then the current transform
+            let r = windows_numerics::Matrix3x2 {
+                M11: m.M11 * cur.M11 + m.M12 * cur.M21,
+                M12: m.M11 * cur.M12 + m.M12 * cur.M22,
+                M21: m.M21 * cur.M11 + m.M22 * cur.M21,
+                M22: m.M21 * cur.M12 + m.M22 * cur.M22,
+                M31: m.M31 * cur.M11 + m.M32 * cur.M21 + cur.M31,
+                M32: m.M31 * cur.M12 + m.M32 * cur.M22 + cur.M32,
+            };
+            self.rt().SetTransform(&r);
+        }
+    }
+
+    pub fn pop_xf(&self) {
+        if let Some(m) = self.xf_stack.borrow_mut().pop() {
+            unsafe { self.rt().SetTransform(&m) };
+        }
+    }
+
     /// Transform for the next draws (slide / scale animations). `None` resets.
     pub fn transform(&self, t: Option<(f32, f32, f32, f32, f32)>) {
         // (dx, dy, scale, cx, cy)
@@ -370,6 +437,7 @@ impl Gfx {
     }
 
     fn format(&self, font: Font, size: f32, weight: u32, align: Align, wrap: bool) -> IDWriteTextFormat {
+        let size = if font == Font::Icon { size } else { size * self.font_scale.get() };
         let key = FmtKey(font, (size * 10.0) as u32, weight, align, wrap);
         if let Some(f) = self.formats.borrow().get(&key) {
             return f.clone();
@@ -625,7 +693,7 @@ impl Gfx {
     }
 
     pub fn bitmap(&self, bmp: &ID2D1Bitmap, r: Rect, opacity: f32) {
-        unsafe { self.rt().DrawBitmap(bmp, Some(&r.d2()), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        unsafe { self.rt().DrawBitmap(bmp, Some(&r.d2()), opacity * self.alpha_mul.get(), D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
     }
 
     /// 32-bit premultiplied BGRA pixels -> bitmap on the current target.
@@ -639,8 +707,34 @@ impl Gfx {
         self.over.as_ref().or(self.base.as_ref()).map(|r| r.as_raw() as usize).unwrap_or(0)
     }
 
+    /// The icon font in use, and the glyphs from `codes` it does not have.
+    pub fn icon_check(&self, codes: &[u32]) -> (String, Vec<u32>) {
+        let missing = codes.iter().copied().filter(|c| !has_glyph(&self.dw, &self.icon_family, *c)).collect();
+        (self.icon_family.clone(), missing)
+    }
+
     /// Is the embedded Persian font loaded?
     pub fn has_fa(&self) -> bool {
         self.fa.is_some()
+    }
+}
+
+/// Does the installed font `family` exist and have a glyph for `code`?
+fn has_glyph(dw: &IDWriteFactory, family: &str, code: u32) -> bool {
+    unsafe {
+        let mut coll = None;
+        if dw.GetSystemFontCollection(&mut coll, false).is_err() {
+            return false;
+        }
+        let Some(c) = coll else { return false };
+        let w = wide(family);
+        let mut idx = 0u32;
+        let mut exists = windows::core::BOOL(0);
+        if c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).is_err() || !exists.as_bool() {
+            return false;
+        }
+        let Ok(fam) = c.GetFontFamily(idx) else { return false };
+        let Ok(font) = fam.GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL) else { return false };
+        font.HasCharacter(code).map(|b| b.as_bool()).unwrap_or(false)
     }
 }

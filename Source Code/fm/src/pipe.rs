@@ -1,4 +1,4 @@
-//! Local control channel of the file manager window: `wfiles.exe` serves `\\.\pipe\wintools-files`, `wfm gui ...`
+//! Local control channel of the file manager window: `RustFileExplorer.exe` serves `\\.\pipe\wintools-files`, `wfm gui ...`
 //! sends one line and reads one reply. Packaged (MSIX) parents may only create pipes under `LOCAL\`, so both
 //! names are tried.
 use crate::util::wide;
@@ -8,6 +8,11 @@ use windows::Win32::System::Pipes::*;
 use windows::core::PCWSTR;
 
 pub const NAME: &str = "wintools-files";
+
+/// The pipe name in use: `WFM_PIPE` when set (test windows use their own pipe so they never meet the real one).
+pub fn name() -> String {
+    std::env::var("WFM_PIPE").ok().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or_else(|| NAME.to_string())
+}
 
 fn pipe(name: &str) -> String {
     format!(r"\\.\pipe\{name}")
@@ -27,16 +32,16 @@ pub fn send(line: &str) -> Result<String, String> {
     let mut h = Err(windows::core::Error::empty());
     // the server re-creates its pipe instance between clients: retry for a short while
     for _ in 0..40 {
-        h = open(&pipe(NAME)).or_else(|_| open(&pipe_local(NAME)));
+        h = open(&pipe(&name())).or_else(|_| open(&pipe_local(&name())));
         if h.is_ok() {
             break;
         }
-        let w1 = wide(&pipe(NAME));
+        let w1 = wide(&pipe(&name()));
         if !unsafe { WaitNamedPipeW(PCWSTR(w1.as_ptr()), 50) }.as_bool() {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
-    let h = h.map_err(|_| "the Win Tools Files window is not running (start wfiles.exe)".to_string())?;
+    let h = h.map_err(|_| "the Rust File Explorer window is not running (start RustFileExplorer.exe)".to_string())?;
     unsafe {
         let mut n = 0u32;
         if WriteFile(h, Some(line.as_bytes()), Some(&mut n), None).is_err() {
@@ -65,8 +70,8 @@ pub fn send(line: &str) -> Result<String, String> {
 
 /// Is a window already serving the pipe?
 pub fn exists() -> bool {
-    let w1 = wide(&pipe(NAME));
-    let w2 = wide(&pipe_local(NAME));
+    let w1 = wide(&pipe(&name()));
+    let w2 = wide(&pipe_local(&name()));
     unsafe { WaitNamedPipeW(PCWSTR(w1.as_ptr()), 1).as_bool() || WaitNamedPipeW(PCWSTR(w2.as_ptr()), 1).as_bool() }
 }
 
@@ -77,7 +82,7 @@ fn create(p: &str) -> HANDLE {
 
 /// Blocking server loop (run it on its own thread). `handle` gets one line and returns the reply.
 pub fn serve(handle: impl Fn(String) -> String) {
-    let (p1, p2) = (pipe(NAME), pipe_local(NAME));
+    let (p1, p2) = (pipe(&name()), pipe_local(&name()));
     let mut cur = p1.clone();
     loop {
         unsafe {

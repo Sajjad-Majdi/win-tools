@@ -23,19 +23,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 pub const TITLE_H: f32 = 40.0;
+/// caption button width (Windows 11: 46 px; they span the title bar height)
+pub const CAP_W: f32 = 46.0;
 pub const BAR_H: f32 = 48.0;
 pub const TOP: f32 = TITLE_H + BAR_H;
-pub const SIDE_W: f32 = 232.0;
 pub const RAIL_W: f32 = 52.0;
 pub const STATUS_H: f32 = 30.0;
 pub const HEADER_H: f32 = 34.0;
-pub const ROW_H: f32 = 32.0;
 pub const ROW2_H: f32 = 46.0;
-pub const LIST_ROW_H: f32 = 26.0;
 pub const STRIP_H: f32 = 48.0;
 pub const PANE_HEAD_H: f32 = 40.0;
 pub const WHATIS_W: f32 = 320.0;
-pub const PILL_SPACE: f32 = 100.0;
 
 pub const WM_BG: u32 = WM_APP + 1;
 pub const WM_IPC: u32 = WM_APP + 2;
@@ -46,6 +44,8 @@ pub const T_ANIM: usize = 1;
 pub const T_RELIST: usize = 2;
 pub const T_SEARCH: usize = 3;
 pub const T_TOAST: usize = 4;
+pub const T_MARQ: usize = 5;
+pub const T_CARET: usize = 9;
 
 /// Results of background work, applied on the UI thread.
 pub enum Msg {
@@ -68,7 +68,7 @@ pub enum Msg {
     AiFlags { ai: bool, meaning: bool },
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
     None,
     Tab(usize),
@@ -87,12 +87,15 @@ pub enum Hit {
     New,
     ViewBtn,
     Side(usize),
+    SideThisPc,
     SideSettings,
+    SideEdge,
+    /// header divider of a column (pane, 0 date / 1 type / 2 size)
+    ColEdge(usize, u8),
     Header(usize, u8),
     Row(usize, usize),
     ListBg(usize),
     PaneHead(usize),
-    Pill(u8),
     Xfer,
     Scope(u8),
     Filter(u8),
@@ -151,7 +154,6 @@ pub enum Act {
     Restore,
     ViewMenu,
     SortMenu,
-    More,
     Transfers,
     Palette,
     Refresh,
@@ -173,11 +175,15 @@ pub struct MItem {
     pub sep: bool,
     pub sub: bool,
     pub checked: bool,
+    /// the shell entry's own icon
+    pub icon: Option<std::sync::Arc<fmcore::menu::Icon>>,
+    /// a colour swatch instead of a glyph (accent picker)
+    pub swatch: Option<u32>,
 }
 
 impl MItem {
     pub fn new(label: &str, glyph: u32, act: Act) -> MItem {
-        MItem { label: label.into(), glyph, keys: String::new(), act, shell: None, value: 0, bold: false, enabled: true, sep: false, sub: false, checked: false }
+        MItem { label: label.into(), glyph, keys: String::new(), act, shell: None, value: 0, bold: false, enabled: true, sep: false, sub: false, checked: false, icon: None, swatch: None }
     }
     pub fn keys(mut self, k: &str) -> MItem {
         self.keys = k.into();
@@ -207,6 +213,7 @@ pub enum DropKind {
     MoveTo,
     More,
     Shell,
+    Look(u8),
 }
 
 pub struct CtxMenu {
@@ -307,7 +314,6 @@ pub struct DragIn {
 
 #[derive(Clone)]
 pub struct UiSettings {
-    pub theme: u8,
     pub sizes: bool,
     pub ext: bool,
     pub hidden: bool,
@@ -387,6 +393,46 @@ pub struct App {
     pub toast_job: Option<u64>,
     pub done_seen: HashSet<u64>,
     pub dragging_out: bool,
+    /// Settings > Personalize (look.json)
+    pub look: crate::look::Look,
+    /// hover and press amounts (eased)
+    pub hov_f: crate::motion::Fades<Hit>,
+    pub press_f: crate::motion::Fades<Hit>,
+    /// menus that are closing (painted fading out, without hits)
+    pub menu_out: Option<(CtxMenu, Instant)>,
+    pub drop_out: Option<(DropMenu, bool, Instant)>,
+    pub marquee: Option<Marquee>,
+    /// press on the empty part of a row: a drag there starts the marquee, not a drag-out
+    pub press_ws: bool,
+    /// sidebar edge drag: (start x, start width)
+    pub side_drag: Option<(f32, f32)>,
+    /// column divider drag: (column, start x, start width)
+    pub col_drag: Option<(u8, f32, f32)>,
+    /// narrow window: the sidebar is open (as the rail) although the window is too narrow for it
+    pub side_open: bool,
+    /// Ctrl / Shift of a test drag (`wfm gui drag ... ctrl`)
+    pub test_mods: Option<(bool, bool)>,
+    /// height of the Settings page (scroll limit)
+    pub settings_h: f32,
+    pub caret_timer: bool,
+    /// hits are not recorded (painting a closing menu)
+    pub no_hits: bool,
+    pub offscreen: bool,
+    /// the OS can draw a backdrop (Windows 11 22H2+, not --no-mica)
+    pub can_mica: bool,
+    pub accent_field: Option<Field>,
+}
+
+/// Rubber-band selection: start in content coordinates (scroll included), end in window coordinates.
+pub struct Marquee {
+    pub pane: usize,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub base: HashSet<PathBuf>,
+    pub ctrl: bool,
+    pub shift: bool,
 }
 
 pub fn trace(msg: &str) {
@@ -440,10 +486,39 @@ impl App {
         });
     }
 
+    /// Ask for the next frame (~60 fps). Only called while something moves; the timer stops itself after one tick.
     pub fn anim(&self) {
         unsafe {
             SetTimer(Some(self.hwnd), T_ANIM, 15, None);
         }
+    }
+
+    /// Hover amount 0..1 of a hit (eased in and out).
+    pub fn hk(&self, h: Hit) -> f32 {
+        if self.shooting { 0.0 } else { self.hov_f.get(h) }
+    }
+
+    /// Press amount 0..1 of a hit.
+    pub fn pk(&self, h: Hit) -> f32 {
+        if self.shooting { 0.0 } else { self.press_f.get(h) }
+    }
+
+    pub fn save_look(&self) {
+        self.look.save();
+    }
+
+    /// Backdrop type and the render target's transparency, live.
+    pub fn apply_backdrop(&mut self) {
+        let on = self.can_mica && self.look.backdrop != 3;
+        unsafe {
+            if self.can_mica {
+                let v: i32 = self.look.dwm_backdrop();
+                let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &v as *const i32 as *const _, 4);
+            }
+        }
+        self.mica = on;
+        self.gfx.set_alpha(on);
+        self.invalidate();
     }
 
     pub fn timer(&self, id: usize, ms: u32) {
@@ -459,23 +534,36 @@ impl App {
     pub fn apply_theme(&mut self) {
         let dark = match self.forced_dark {
             Some(d) => d,
-            None => match self.ui.theme {
+            None => match self.look.theme {
                 1 => false,
                 2 => true,
                 _ => theme::system_dark(),
             },
         };
-        self.t = theme::make(dark);
+        self.t = theme::make(dark, self.look.accent);
+        self.gfx.corner = if self.look.square { 0.0 } else { 1.0 };
         set_dark_frame(self.hwnd, dark);
         self.invalidate();
     }
 
+    /// The sidebar shows as the icon rail: narrow window, split view, or collapsed by its menu button.
     pub fn rail(&self) -> bool {
-        self.w < 1000.0 || self.tab().split()
+        self.w < 1000.0 || self.tab().split() || self.look.side_w < 1.0
+    }
+
+    /// Very narrow window: no sidebar unless opened with the menu button in the top bar.
+    pub fn side_hidden(&self) -> bool {
+        self.w < 640.0 && !self.side_open
     }
 
     pub fn side_w(&self) -> f32 {
-        if self.rail() { RAIL_W } else { SIDE_W }
+        if self.side_hidden() {
+            0.0
+        } else if self.rail() {
+            RAIL_W
+        } else {
+            self.look.side_w
+        }
     }
 
     /// The content layer (right of the sidebar, below the top bar).
@@ -664,7 +752,26 @@ impl App {
                             recycled: None,
                         }
                     })
-                    .collect();
+                    .collect::<Vec<Item>>();
+                let mut items = items;
+                if self.look.show_pinned {
+                    for (name, _, _, l) in &self.side {
+                        if let Loc::Folder(dir) = l {
+                            items.push(Item {
+                                name: name.clone(),
+                                path: dir.clone(),
+                                is_dir: true,
+                                size: None,
+                                modified: 0,
+                                attrs: 0,
+                                kind: crate::ficons::Kind::Folder,
+                                folder: dir.parent().map(|x| x.display().to_string()).unwrap_or_default(),
+                                hl: vec![],
+                                recycled: None,
+                            });
+                        }
+                    }
+                }
                 self.post(Msg::Listed { tab: tab_id, pane: p, seq, res: Ok(items), ms: 0.0 });
             }
             Loc::RecycleBin => {
@@ -1175,7 +1282,8 @@ impl App {
             "preview": self.pv.as_ref().map(|p| json!({"path": p.path, "loaded": p.data.is_some(), "kind": p.data.as_ref().map(|d| format!("{:?}", d.kind)), "meta": p.data.as_ref().map(|d| d.meta.clone())})),
             "toast": self.toast.as_ref().map(|t| format!("{}{}", t.text, t.bold)),
             "jobs": q.jobs.iter().map(|j| json!({"id": j.id, "title": j.title(), "state": format!("{:?}", j.state), "done": j.done, "total": j.total, "clashes": j.open_clashes(), "identical_skipped": j.identical, "errors": j.errors, "dest": j.dest})).collect::<Vec<_>>(),
-            "theme": if self.t.dark { "dark" } else { "light" }, "mica": self.mica,
+            "theme": if self.t.dark { "dark" } else { "light" }, "mica": self.mica, "hwnd": self.hwnd.0 as isize,
+            "look": self.look.to_json(), "marquee": self.marquee.is_some(),
             "size": [self.w, self.h], "rail": self.rail(),
             "drives": self.drives.len(), "sidebar": self.side.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
             "ai_buttons": self.ai_on, "meaning_button": self.meaning_on,
@@ -1298,6 +1406,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if h != app.nc_hover {
                     app.nc_hover = h;
                     app.hover = Hit::None;
+                    app.nc_hover_changed();
                     let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: hwnd, dwHoverTime: 0 };
                     let _ = TrackMouseEvent(&mut tme);
                     app.invalidate();
@@ -1306,12 +1415,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_NCMOUSELEAVE => {
                 app.nc_hover = Hit::None;
+                app.nc_hover_changed();
                 app.invalidate();
                 LRESULT(0)
             }
             WM_NCLBUTTONDOWN => match wp.0 as u32 {
                 HTMINBUTTON | HTMAXBUTTON | HTCLOSE => {
                     app.nc_down = app.nc_hover;
+                    app.invalidate();
                     LRESULT(0)
                 }
                 _ => {
@@ -1336,6 +1447,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_NCLBUTTONDBLCLK => DefWindowProcW(hwnd, msg, wp, lp),
+            // no WS_SYSMENU (it makes DWM draw its own caption buttons under ours): the window menu by hand
+            WM_NCRBUTTONUP if wp.0 as u32 == HTCAPTION => {
+                let (x, y) = lparam_xy(lp);
+                show_window_menu(hwnd, x, y);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = lparam_xy(lp);
                 app.mouse_move(x as f32 / s, y as f32 / s, wp.0 as u32 & 1 != 0);
@@ -1343,6 +1460,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSELEAVE => {
                 app.hover = Hit::None;
+                app.hov_f.only(None);
+                app.anim();
                 app.invalidate();
                 LRESULT(0)
             }
@@ -1385,6 +1504,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.wheel(pt.x as f32 / s, pt.y as f32 / s, d);
                 LRESULT(0)
             }
+            WM_SYSKEYDOWN if wp.0 == 0x73 => {
+                // Alt+F4 (no system menu to do it for us)
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                LRESULT(0)
+            }
+            WM_SYSCHAR if wp.0 == 0x20 => {
+                // Alt+Space: the window menu under the top-left corner
+                let mut pt = POINT { x: 8, y: (TITLE_H * s) as i32 };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                show_window_menu(hwnd, pt.x, pt.y);
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                if app.marquee.is_some() || app.side_drag.is_some() {
+                    app.mouse_up(app.mx, app.my);
+                }
+                LRESULT(0)
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let (c, sh, alt) = mods();
                 if app.key(wp.0 as u16, c, sh, alt || msg == WM_SYSKEYDOWN) {
@@ -1418,7 +1555,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_GETMINMAXINFO => {
                 let mi = &mut *(lp.0 as *mut MINMAXINFO);
                 let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                mi.ptMinTrackSize = POINT { x: (900.0 * dpi) as i32, y: (620.0 * dpi) as i32 };
+                // small enough for a narrow snap column: the sidebar hides, columns drop, the list can shrink to nothing
+                mi.ptMinTrackSize = POINT { x: (360.0 * dpi) as i32, y: (200.0 * dpi) as i32 };
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -1439,6 +1577,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let cur = match app.hover {
+                        _ if app.side_drag.is_some() => IDC_SIZEWE,
+                        _ if app.col_drag.is_some() => IDC_SIZEWE,
+                        Hit::SideEdge | Hit::ColEdge(..) => IDC_SIZEWE,
                         Hit::Omni => IDC_IBEAM,
                         _ if app.path_edit.is_some() && matches!(app.hover, Hit::OmniSearch) => IDC_IBEAM,
                         _ => IDC_ARROW,
@@ -1468,6 +1609,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // remember where we were (start page "Last folder")
+                if let Some(p) = app.pane().loc.path() {
+                    app.look.last = p.display().to_string();
+                    app.save_look();
+                }
                 crate::dnd::revoke(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -1477,7 +1623,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// The window menu (Restore, Move, Size, Minimize, Maximize, Close) at a screen point.
+fn show_window_menu(hwnd: HWND, x: i32, y: i32) {
+    unsafe {
+        let m = GetSystemMenu(hwnd, false);
+        if m.is_invalid() {
+            return;
+        }
+        let maxed = IsZoomed(hwnd).as_bool();
+        let st = |on: bool| if on { MF_ENABLED } else { MF_GRAYED };
+        let _ = EnableMenuItem(m, SC_RESTORE, MF_BYCOMMAND | st(maxed));
+        let _ = EnableMenuItem(m, SC_MOVE, MF_BYCOMMAND | st(!maxed));
+        let _ = EnableMenuItem(m, SC_SIZE, MF_BYCOMMAND | st(!maxed));
+        let _ = EnableMenuItem(m, SC_MAXIMIZE, MF_BYCOMMAND | st(!maxed));
+        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, None, hwnd, None);
+        if cmd.0 != 0 {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd.0 as usize), LPARAM(0));
+        }
+    }
+}
+
 pub struct Opts {
+    pub offscreen: bool,
     pub software: bool,
     pub theme: Option<bool>,
     pub size: Option<(f32, f32)>,
@@ -1495,19 +1662,19 @@ pub fn run(o: Opts) -> i32 {
         let cfg = fmcore::pins::config();
         let ui = &cfg["ui"];
         let uis = UiSettings {
-            theme: ui["theme"].as_u64().unwrap_or(0) as u8,
             sizes: ui["folder_sizes"].as_bool().unwrap_or(true),
             ext: ui["extensions"].as_bool().unwrap_or(true),
             hidden: ui["hidden"].as_bool().unwrap_or(false),
             ask_delete: ui["ask_delete"].as_bool().unwrap_or(false),
             scope_pc: ui["scope_pc"].as_bool().unwrap_or(true),
         };
-        let dark = o.theme.unwrap_or(match uis.theme {
+        let look = crate::look::Look::load();
+        let dark = o.theme.unwrap_or(match look.theme {
             1 => false,
             2 => true,
             _ => theme::system_dark(),
         });
-        let t = theme::make(dark);
+        let t = theme::make(dark, look.accent);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_DBLCLKS,
@@ -1525,20 +1692,31 @@ pub fn run(o: Opts) -> i32 {
         let (w, h) = ((dw * dpi) as i32, (dh * dpi) as i32);
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
-        let Ok(hwnd) = CreateWindowExW(WINDOW_EX_STYLE(0), cls, w!("Win Tools Files"), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, (sw - w) / 2, (sh - h) / 2, w, h, None, None, Some(inst.into()), None) else { return 1 };
+        // No WS_SYSMENU: with it DWM paints its own caption buttons into the extended frame, under our buttons
+        // (the doubled maximize box and heavy x the owner saw). The window menu is shown by hand instead.
+        let mut style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 & !WS_SYSMENU.0) | WS_CLIPCHILDREN;
+        if std::env::var("WFILES_TEST").is_ok() && std::env::var("WFILES_TEST_SYSMENU").is_ok() {
+            // tests only: the old style, to compare what DWM draws
+            style |= WS_SYSMENU;
+        }
+        // --offscreen (tests): far off every monitor, no taskbar button, never activated
+        let (ex, x, y) = if o.offscreen { (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000) } else { (WINDOW_EX_STYLE(0), (sw - w) / 2, (sh - h) / 2) };
+        let Ok(hwnd) = CreateWindowExW(ex, cls, w!("Rust File Explorer"), style, x, y, w, h, None, None, Some(inst.into()), None) else { return 1 };
         set_dark_frame(hwnd, t.dark);
-        // Mica (Windows 11 22H2+): DWM draws the backdrop where the window is transparent (title bar, sidebar)
+        // Backdrop (Windows 11 22H2+): DWM draws Mica / Mica Alt / Acrylic where the window is transparent
         let build = os_build();
-        let mica = !o.no_mica && build >= 22621 && std::env::var("WFILES_NO_MICA").is_err();
-        if mica {
-            let v: i32 = 2; // DWMSBT_MAINWINDOW
+        let can_mica = !o.no_mica && build >= 22621 && std::env::var("WFILES_NO_MICA").is_err();
+        let mica = can_mica && look.backdrop != 3;
+        if can_mica {
+            let v: i32 = look.dwm_backdrop();
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &v as *const i32 as *const _, 4);
             let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
         } else {
             let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 });
         }
         trace(&format!("{:.1} ms: hwnd", started.elapsed().as_secs_f64() * 1000.0));
-        let Ok(gfx) = Gfx::new(hwnd, o.software, mica) else { return 1 };
+        let Ok(mut gfx) = Gfx::new(hwnd, o.software, mica) else { return 1 };
+        gfx.corner = if look.square { 0.0 } else { 1.0 };
         let queue = jobs::new_queue();
         let app = Box::new(App {
             hwnd,
@@ -1605,15 +1783,37 @@ pub fn run(o: Opts) -> i32 {
             toast_job: None,
             done_seen: HashSet::new(),
             dragging_out: false,
+            look,
+            hov_f: crate::motion::Fades::new(crate::motion::FAST, crate::motion::NORMAL),
+            press_f: crate::motion::Fades::new(60.0, crate::motion::NORMAL),
+            menu_out: None,
+            drop_out: None,
+            marquee: None,
+            press_ws: false,
+            side_drag: None,
+            col_drag: None,
+            side_open: false,
+            test_mods: None,
+            settings_h: 0.0,
+            caret_timer: false,
+            no_hits: false,
+            offscreen: o.offscreen,
+            can_mica,
+            accent_field: None,
         });
         let ptr = Box::into_raw(app);
         let app = &mut *ptr;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
-        // first location: the argument (a folder, or a file to select), else Downloads
+        // first location: the argument (a folder, or a file to select), else the start page from Personalize
+        let start = match app.look.start.as_str() {
+            "thispc" => Loc::ThisPc,
+            "last" => Some(PathBuf::from(&app.look.last)).filter(|p| p.is_dir()).map(Loc::Folder).unwrap_or(Loc::ThisPc),
+            p => Some(PathBuf::from(p)).filter(|p| p.is_dir()).map(Loc::Folder).unwrap_or(Loc::ThisPc),
+        };
         let (loc, select) = match o.path.as_deref().map(|p| p.trim_matches('"').trim_start_matches("/select,")) {
             Some(p) if Path::new(p).is_dir() => (Loc::Folder(fmcore::util::abs(p)), None),
             Some(p) if Path::new(p).is_file() => (Loc::Folder(fmcore::util::abs(p).parent().map(|x| x.to_path_buf()).unwrap_or_default()), Some(fmcore::util::abs(p))),
-            _ => (known("Downloads").map(Loc::Folder).unwrap_or(Loc::ThisPc), None),
+            _ => (start, None),
         };
         trace(&format!("{:.1} ms: app struct", started.elapsed().as_secs_f64() * 1000.0));
         app.build_side();
@@ -1672,12 +1872,11 @@ pub fn run(o: Opts) -> i32 {
         }
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         trace(&format!("{:.1} ms: before show", started.elapsed().as_secs_f64() * 1000.0));
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if o.offscreen { SW_SHOWNOACTIVATE } else { SW_SHOW });
         trace(&format!("{:.1} ms: shown", started.elapsed().as_secs_f64() * 1000.0));
         let _ = UpdateWindow(hwnd);
         trace(&format!("{:.1} ms: shown + first paint", started.elapsed().as_secs_f64() * 1000.0));
         crate::dnd::register(hwnd, sink_of);
-        SetTimer(Some(hwnd), 9, 530, None); // caret blink
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);

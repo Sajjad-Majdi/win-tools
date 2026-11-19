@@ -3,6 +3,7 @@
 use super::app::*;
 use super::gfx::{Align, C, Font, Rect};
 use super::model::{self, Res, SortKey};
+use super::motion;
 use crate::procs::Kind;
 use std::time::Instant;
 
@@ -59,15 +60,20 @@ impl App {
     pub fn button(&mut self, r: Rect, label: &str, glyph: u32, style: Btn, small: bool, enabled: bool, h: Hit) {
         let t = self.t;
         let (gs, fs, gap) = if small { (11.0, 12.0, 6.0) } else { (13.0, 13.0, 8.0) };
-        let hov = enabled && self.hover == h;
-        let prs = hov && self.pressed == h;
+        // hover fades in, press dims and springs the button down to 0.97
+        let hv = if enabled { self.hov(h) } else { 0.0 };
+        let pd = if enabled { self.press_depth(h).clamp(0.0, 1.0) } else { 0.0 };
         let (fill, border, bottom, fg) = match (style, enabled) {
             (_, false) => (t.ctl, t.ctl_s, t.ctl_s, t.t3),
-            (Btn::Std, _) => (if prs { t.prs } else if hov { t.ctl_h } else { t.ctl }, t.ctl_s, t.ctl_b, if prs { t.t2 } else { t.t1 }),
-            (Btn::Accent, _) => (if hov { t.acc_h } else { t.acc }, if hov { t.acc_h } else { t.acc }, if hov { t.acc_h } else { t.acc }, t.on_acc),
-            (Btn::Crit, _) => (t.crit_btn.fade(if hov { 0.9 } else { 1.0 }), t.crit_btn, t.crit_btn, t.on_crit),
-            (Btn::Subtle, _) => (if prs { t.prs } else if hov { t.hov } else { C(0.0, 0.0, 0.0, 0.0) }, C(0.0, 0.0, 0.0, 0.0), C(0.0, 0.0, 0.0, 0.0), t.t1),
+            (Btn::Std, _) => (t.ctl.mix(t.ctl_h, hv).mix(t.prs, pd), t.ctl_s, t.ctl_b, t.t1.mix(t.t2, pd)),
+            (Btn::Accent, _) => {
+                let c = t.acc.mix(t.acc_h, hv).fade(1.0 - 0.15 * pd);
+                (c, c, c, t.on_acc.fade(1.0 - 0.2 * pd))
+            }
+            (Btn::Crit, _) => (t.crit_btn.fade(1.0 - 0.1 * hv - 0.1 * pd), t.crit_btn, t.crit_btn, t.on_crit),
+            (Btn::Subtle, _) => (t.hov.fade(hv).mix(t.prs, pd), C(0.0, 0.0, 0.0, 0.0), C(0.0, 0.0, 0.0, 0.0), t.t1),
         };
+        let pressed = self.press_begin(r, h);
         let g = &self.gfx;
         g.fill_round(r, 4.0, fill);
         if border.3 > 0.0 {
@@ -86,6 +92,7 @@ impl App {
         if !label.is_empty() {
             g.text(label, Rect::new(x, r.y, lw + 2.0, r.h), Font::Ui, fs, 400, Align::Left, fg);
         }
+        self.press_end(pressed);
         if enabled {
             self.hit(r, h);
         }
@@ -97,9 +104,11 @@ impl App {
         let lw = self.gfx.measure(label, Font::Ui, 13.0, 400);
         let w = 10.0 + 14.0 + if label.is_empty() { 0.0 } else { 8.0 + lw } + if chevron { 6.0 + 9.0 } else { 0.0 } + 10.0;
         let r = Rect::new(x, y, w.ceil(), 32.0);
-        if on {
-            self.gfx.fill_round(r, 4.0, t.hov);
+        let on_a = self.fade(hid(1, h), on);
+        if on_a > 0.0 {
+            self.gfx.fill_round(r, 4.0, t.hov.fade(on_a));
         }
+        let pressed = enabled && self.press_begin(r, h);
         if enabled {
             self.hp(r, 4.0, h);
             self.hit(r, h);
@@ -113,6 +122,7 @@ impl App {
         if chevron {
             g.glyph(0xE70D, Rect::new(x + 32.0 + lw + 6.0, y + 1.0, 9.0, 32.0), 9.0, t.t2);
         }
+        self.press_end(pressed);
         r.w
     }
 
@@ -138,16 +148,22 @@ impl App {
     pub fn toggle(&mut self, right: f32, cy: f32, on: bool, h: Hit, label: bool) -> f32 {
         let t = self.t;
         let r = Rect::new(right - 40.0, cy - 10.0, 40.0, 20.0);
-        let hov = self.hover == h;
+        let hv = self.hov(h);
+        let (k, kv) = self.glide(hid(3, h), on as u8 as f32, motion::GLIDE);
+        let k = k.clamp(-0.1, 1.1);
+        let pressed = self.press_begin(r, h);
         let g = &self.gfx;
-        if on {
-            g.fill_round(r, 10.0, if hov { t.acc_h } else { t.acc });
-            g.ellipse(r.x + 29.0, cy, 6.0, t.on_acc, true, 0.0);
-        } else {
-            g.fill_round(r, 10.0, if hov { t.hov } else { C(0.0, 0.0, 0.0, 0.0) });
-            g.stroke_round(r, 10.0, t.t2, 1.0);
-            g.ellipse(r.x + 9.0, cy, 5.0, t.t2, true, 0.0);
-        }
+        let kc = k.clamp(0.0, 1.0);
+        g.fill_round(r, 10.0, t.hov.fade(hv * (1.0 - kc)));
+        g.fill_round(r, 10.0, t.acc.mix(t.acc_h, hv).fade(kc));
+        g.stroke_round(r, 10.0, t.t2.fade(1.0 - kc), 1.0);
+        // the knob stretches a little while it travels
+        let stretch = (kv.abs() * 0.6).min(4.0);
+        let kx = r.x + 9.0 + 20.0 * k;
+        let kr = 5.0 + kc;
+        g.fill_round(Rect::new(kx - kr - stretch / 2.0, cy - kr, kr * 2.0 + stretch, kr * 2.0), kr, t.t2.mix(t.on_acc, kc));
+        self.press_end(pressed);
+        let g = &self.gfx;
         let mut w = 40.0;
         if label {
             g.text(if on { "On" } else { "Off" }, Rect::new(r.x - 12.0 - 24.0, cy - 10.0, 24.0, 20.0), Font::Ui, 13.0, 400, Align::Right, t.t1);
@@ -183,10 +199,40 @@ impl App {
             if i != sel {
                 self.hp(ir, 4.0, h);
             }
+            let pressed = self.press_begin(ir, h);
             self.gfx.text(s, ir, Font::Ui, 13.0, 400, Align::Center, if i == sel { t.t1 } else { t.t2 });
+            self.press_end(pressed);
             self.hit(ir, h);
         }
         total
+    }
+
+    /// Selection highlight for a list: `base` is the list's origin row rect (y = top of content at scroll),
+    /// `y` the selected row's content y. A new selection fades in; moving the selection glides the highlight
+    /// with a spring and the accent pill stretches with its speed. `key` names the spring (one per list).
+    pub fn sel_highlight(&mut self, base: Rect, id: u64, y: f32, key: u64) {
+        let t = self.t;
+        let now = Instant::now();
+        let sel_at = {
+            let mut mo = self.mo.borrow_mut();
+            // a new selection, or a far jump (search, Page Down), fades in where it is instead of gliding
+            let far = mo.springs.get(&key).map(|s| (s.x - y).abs() > base.h * 12.0).unwrap_or(true);
+            let at = match mo.sel_prev {
+                Some((_, at)) if !far => at,
+                _ => {
+                    mo.springs.insert(key, motion::Spring::new(y, 0.2));
+                    now
+                }
+            };
+            mo.sel_prev = Some((id, at));
+            at
+        };
+        let a = self.tween_in(sel_at, motion::NORMAL, motion::decel);
+        let (gy, v) = self.glide(key, y, motion::GLIDE);
+        let r = Rect::new(base.x, base.y + gy, base.w, base.h);
+        self.gfx.fill_round(r, 4.0, t.sel.fade(a));
+        let ph = (16.0 * motion::decel(a) + (v.abs() * 0.012).min(10.0)).min(base.h - 8.0);
+        self.gfx.fill_round(Rect::new(r.x, r.cy() - ph / 2.0, 3.0, ph), 1.5, t.acc.fade(a));
     }
 
     /// Exe icon or a glyph stand-in.
@@ -207,10 +253,10 @@ impl App {
         }
         let th = (view.h * view.h / ch).max(30.0);
         let ty = view.y + (view.h - th) * (self.scroll[k as usize] / (ch - view.h));
-        let hot = self.hover == Hit::Scroll(k);
-        let w = if hot { 6.0 } else { 3.0 };
+        let hot = self.hov(Hit::Scroll(k));
+        let w = 3.0 + 3.0 * hot;
         let t = self.t;
-        self.gfx.fill_round(Rect::new(view.r() - 4.0 - w, ty + 2.0, w, th - 4.0), w / 2.0, t.t3.fade(if hot { 0.8 } else { 0.5 }));
+        self.gfx.fill_round(Rect::new(view.r() - 4.0 - w, ty + 2.0, w, th - 4.0), w / 2.0, t.t3.fade(0.5 + 0.3 * hot));
         self.hit(Rect::new(view.r() - 12.0, view.y, 12.0, view.h), Hit::Scroll(k));
     }
 
@@ -255,11 +301,11 @@ impl App {
         }
         let mut x = lr.r() + 18.0;
         if !narrow {
-            let nw = g.text_at("Task Manager", lr.r() + 10.0, 0.0, TITLE_H, 120.0, Font::Ui, 12.0, 400, t.t2);
+            let nw = g.text_at("Rust Task Manager", lr.r() + 10.0, 0.0, TITLE_H, 150.0, Font::Ui, 12.0, 400, t.t2);
             x = lr.r() + 10.0 + nw + 18.0;
         }
         // tabs
-        let tabs = ["Processes", "Startup apps"];
+        let tabs = ["Processes", "Startup apps", "Settings"];
         let mut tab_rects = vec![];
         for (i, l) in tabs.iter().enumerate() {
             let w = (self.gfx.measure(l, Font::Ui, 14.0, 400) + 24.0).ceil();
@@ -270,22 +316,28 @@ impl App {
         for (i, r) in tab_rects.iter().enumerate() {
             let h = Hit::Tab(i as u8);
             self.hp(*r, 4.0, h);
-            let on = self.page == i as u8;
-            self.gfx.text(tabs[i], *r, Font::Ui, 14.0, 400, Align::Center, if on { t.t1 } else { t.t2 });
+            let on = self.fade(hid(1, h), self.page == i as u8);
+            let pressed = self.press_begin(*r, h);
+            self.gfx.text(tabs[i], *r, Font::Ui, 14.0, 400, Align::Center, t.t2.mix(t.t1, on));
+            self.press_end(pressed);
             self.hit(*r, h);
         }
-        if self.page < 2 {
+        {
+            // the pill springs to the new tab and stretches while it moves
             let target = tab_rects[self.page as usize].cx() - 8.0;
-            let px = self.slide(1, target);
-            self.gfx.fill_round(Rect::new(px, 36.0, 16.0, 3.0), 1.5, t.acc);
+            let (px, v) = self.glide(0x5001, target, motion::GLIDE);
+            let st = (v.abs() * 0.02).min(14.0);
+            self.gfx.fill_round(Rect::new(px - st / 2.0, 36.0, 16.0 + st, 3.0), 1.5, t.acc);
         }
         // search, centred on the window
         let sw = if narrow { 280.0 } else { 340.0 };
-        let sr = Rect::new((self.w - sw) / 2.0, 8.0, sw, 32.0);
+        // centred on the window, but never closer than 16 to the last tab
+        let sr = Rect::new(((self.w - sw) / 2.0).max(x + 16.0).round(), 8.0, sw, 32.0);
         let focus = self.search_focus || self.searching();
+        let shv = self.hov(Hit::Search) * if focus { 0.0 } else { 1.0 };
         {
             let g = &self.gfx;
-            g.fill_round(sr, 4.0, if self.hover == Hit::Search && !focus { t.ctl_h } else { t.inp });
+            g.fill_round(sr, 4.0, t.inp.mix(t.ctl_h, shv));
             g.stroke_round(sr, 4.0, t.inp_s, 1.0);
             if focus {
                 g.fill_round(Rect::new(sr.x + 1.0, sr.b() - 2.0, sr.w - 2.0, 2.0), 1.0, t.acc);
@@ -313,28 +365,35 @@ impl App {
             self.gfx.glyph(0xE711, cr, 10.0, t.t2);
             self.hit(cr, Hit::SearchClear);
         }
-        // settings + caption buttons
-        let cx = self.w - 46.0 * 3.0;
-        let st = Rect::new(cx - 6.0 - 40.0, 8.0, 40.0, 32.0);
-        if self.page == 2 {
-            self.gfx.fill_round(st, 4.0, t.hov);
-        }
-        self.hp(st, 4.0, Hit::Settings);
-        self.gfx.glyph(0xE713, st, 16.0, t.t1);
-        self.hit(st, Hit::Settings);
+        // caption buttons (Settings is the third tab, so nothing else sits next to them)
+        let cx = self.w - CAP_W * 3.0;
+        self.paint_caption(cx);
+    }
+
+    /// Windows 11 caption buttons: 46 x 32, Segoe Fluent Icons at 10, hover and press fills that fade,
+    /// close turns #C42B1C with a white glyph; glyphs dim while the window is inactive.
+    fn paint_caption(&mut self, cx: f32) {
+        let t = self.t;
         let maxed = unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(self.hwnd).as_bool() };
         let caps = [(Hit::Min, 0xE921u32), (Hit::Max, if maxed { 0xE923 } else { 0xE922 }), (Hit::Close, 0xE8BB)];
+        let ink = if t.dark { C(1.0, 1.0, 1.0, 1.0) } else { C(0.0, 0.0, 0.0, 1.0) };
+        let active = self.is_active();
+        let base = if active { t.t1 } else { ink.a(if t.dark { 0.37 } else { 0.36 }) };
         for (i, (h, gl)) in caps.iter().enumerate() {
-            let r = Rect::new(cx + i as f32 * 46.0, 0.0, 46.0, TITLE_H);
-            let hov = self.nc_hover == *h;
-            let mut fg = t.t1;
-            if hov {
-                if *h == Hit::Close {
-                    self.gfx.fill(r, C::hex(0xC42B1C));
-                    fg = C::hex(0xFFFFFF);
-                } else {
-                    self.gfx.fill(r, t.hov);
-                }
+            let r = Rect::new(cx + i as f32 * CAP_W, 0.0, CAP_W, CAP_H);
+            let hv = self.fade(hid(5, *h), self.nc_hover == *h);
+            let pv = self.fade(hid(6, *h), self.nc_hover == *h && self.nc_down == *h);
+            let fg;
+            if *h == Hit::Close {
+                // the window's top-right corner is rounded by DWM; the fill follows it
+                let red = C::hex(0xC42B1C);
+                self.gfx.fill(r, red.fade(hv * (1.0 - 0.1 * pv)));
+                fg = base.mix(C(1.0, 1.0, 1.0, 1.0), hv).fade(1.0 - 0.3 * pv);
+            } else {
+                // Fluent subtle fills: hover 6%, pressed 4% (pressed is lighter than hover)
+                let a = 0.06 * hv + (0.04 - 0.06 * hv) * pv;
+                self.gfx.fill(r, ink.a(a.max(0.0)));
+                fg = base.mix(t.t1, hv).fade(1.0 - 0.38 * pv);
             }
             self.gfx.glyph(*gl, r, 10.0, fg);
             self.hit(r, *h);
@@ -384,29 +443,46 @@ impl App {
     // ------------------------------------------------------------------ Processes page
     pub fn paint_processes(&mut self) {
         let t = self.t;
-        self.paint_tiles();
-        let chips = if self.searching() { vec![] } else { self.chips() };
-        let mut y = TITLE_H + TILES_H;
-        if !chips.is_empty() {
-            self.paint_chips(&chips, y + 8.0);
-            y += 8.0 + CHIPS_H;
+        let mut y = TITLE_H;
+        if self.prefs.tiles {
+            self.paint_tiles();
+            y += TILES_H;
+        } else {
+            y -= 8.0;
         }
+        let chips = if self.searching() || !self.prefs.chips { vec![] } else { self.chips() };
+        // the chips row opens and closes with motion (height 0 <-> 30, fade)
+        let ch = self.glide(0x6001, if chips.is_empty() { 0.0 } else { 8.0 + CHIPS_H }, motion::GLIDE).0.max(0.0);
+        if !chips.is_empty() && ch > 1.0 {
+            let a = (ch / (8.0 + CHIPS_H)).clamp(0.0, 1.0);
+            let old = self.gfx.push_alpha(a);
+            self.paint_chips(&chips, y + 8.0 - (8.0 + CHIPS_H - ch) * 0.5);
+            self.gfx.pop_alpha(old);
+        }
+        y += ch;
         let layer = Rect::new(12.0, y + 8.0, self.w - 24.0, self.h - y - 8.0 - 12.0);
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
         self.paint_cmdbar(layer);
-        let pane_w = match self.pane.as_ref().map(|p| p.kind) {
-            Some(PaneKind::Details) => PANE_W,
-            Some(PaneKind::Free) => FREE_W,
-            None => 0.0,
-        };
+        let pane_w = self.pane.as_ref().map(|p| self.pane_w(p.kind)).unwrap_or(0.0);
         let list = Rect::new(layer.x, layer.y + CMD_H, layer.w - pane_w, layer.h - CMD_H);
         self.paint_list(list);
         if pane_w > 0.0 {
             let pr = Rect::new(list.r(), list.y, pane_w, list.h);
-            self.paint_pane(pr);
+            self.paint_pane(pr, None);
         } else {
             self.pane_rect = Rect::default();
+            if let Some((p, w, closed)) = { self.mo.borrow().ghost_pane.clone() } {
+                let pr = Rect::new(list.r() - w, list.y, w, list.h);
+                let saved = self.scroll[3];
+                self.ghost(|a| {
+                    a.pane = Some(p);
+                    a.paint_pane(pr, Some(closed));
+                    a.pane = None;
+                });
+                self.scroll[3] = saved;
+                self.pane_rect = Rect::default();
+            }
         }
         self.gfx.unclip();
         self.paint_toast(layer);
@@ -433,8 +509,15 @@ impl App {
         let tdisk = top(&|g| g.io);
         let tgpu = top(&|g| g.gpu as f64);
         let cpu_first = self.tot[0].len() < 2;
+        // the big numbers glide to each new sample
+        let used = self.tv(0x7000, 1, used as f32) as u64;
+        let disk_rate = self.tv(0x7000, 2, disk_rate as f32) as f64;
+        let disk_pct = self.tv(0x7000, 3, disk_pct);
+        let net_rate = self.tv(0x7000, 4, net_rate as f32) as f64;
+        let gpu = self.tv(0x7000, 5, gpu);
+        let cpu_now = self.tv(0x7000, 0, if cpu_first { self.groups.iter().map(|g| g.cpu).sum::<f32>().min(100.0) } else { s.cpu });
         let items: [(Res, &str, String, String, (String, String), f32, f32); 5] = [
-            (Res::Cpu, "CPU", format!("{:.0}%", if cpu_first { self.groups.iter().map(|g| g.cpu).sum::<f32>().min(100.0) } else { s.cpu }), String::new(), tcpu.map(|(l, v)| (l, model::fmt_pct(v as f32))).unwrap_or_default(), 0.0, 10.0),
+            (Res::Cpu, "CPU", format!("{:.0}%", cpu_now), String::new(), tcpu.map(|(l, v)| (l, model::fmt_pct(v as f32))).unwrap_or_default(), 0.0, 10.0),
             (Res::Mem, "Memory", model::fmt_gb(used), format!("of {}", model::fmt_gb(s.mem_total)), tmem.map(|(l, v)| (l, model::fmt_mem(v as u64))).unwrap_or_default(), 0.0, s.mem_total as f32),
             (Res::Disk, "Disk", format!("{disk_pct:.0}%"), if disk_rate < 1.0 { "0 KB/s".to_string() } else { model::fmt_rate(disk_rate) }, tdisk.map(|(l, v)| (l, model::fmt_rate(v))).unwrap_or_default(), 0.0, 1048576.0),
             (Res::Net, "Network", if net_rate < 1.0 { "0 KB/s".into() } else { model::fmt_rate(net_rate) }, busiest, (String::new(), String::new()), 0.0, 102400.0),
@@ -445,14 +528,19 @@ impl App {
             let r = Rect::new(card.x + 1.0 + sw * i as f32, card.y + 1.0, sw, card.h - 2.0);
             let h = Hit::Tile(i as u8);
             let is_on = on == Some(i as u8);
-            if is_on {
-                self.gfx.fill_round(r, 7.0, t.hov);
-            } else {
+            let on_a = self.fade(hid(1, h), is_on);
+            if on_a > 0.0 {
+                self.gfx.fill_round(r, 7.0, t.hov.fade(on_a));
+            }
+            if !is_on {
                 self.hp(r, 7.0, h);
             }
-            if i > 0 && !is_on && on != Some(i as u8 - 1) && self.hover != h && self.hover != Hit::Tile(i as u8 - 1) {
-                self.gfx.vline(r.x, card.y + 14.0, card.b() - 14.0, t.line);
+            if i > 0 {
+                // the divider fades where a neighbour is lit
+                let lit = on_a.max(self.hov(h)).max(self.hov(Hit::Tile(i as u8 - 1))).max(self.fade(hid(1, Hit::Tile(i as u8 - 1)), on == Some(i as u8 - 1)));
+                self.gfx.vline(r.x, card.y + 14.0, card.b() - 14.0, t.line.fade(1.0 - lit));
             }
+            let pressed = self.press_begin(r, h);
             let x = r.x + 16.0;
             let c = self.res_color(*res);
             let g = &self.gfx;
@@ -481,9 +569,11 @@ impl App {
                 let max = if *res == Res::Mem { *floor } else { (peak * 1.25).max(*floor) };
                 g.spark(Rect::new(r.r() - 14.0 - 64.0, card.y + 16.0, 64.0, 30.0), &vals, max, c, 0.14, 1.5);
             }
-            if is_on {
-                g.fill_round(Rect::new(r.cx() - 12.0, r.b() - 3.0, 24.0, 3.0), 1.5, t.acc);
+            if on_a > 0.0 {
+                let bw = 24.0 * motion::decel(on_a);
+                g.fill_round(Rect::new(r.cx() - bw / 2.0, r.b() - 3.0, bw, 3.0), 1.5, t.acc);
             }
+            self.press_end(pressed);
             self.hit(r, h);
         }
     }
@@ -502,9 +592,11 @@ impl App {
             let r = Rect::new(x, y, w, CHIPS_H);
             let h = Hit::Chip(i as u8);
             let (bg, bd) = if c.hung { (t.warn_bg, t.warn_s) } else { (t.card, t.card_s) };
+            let pressed = self.press_begin(r, h);
             self.gfx.card(r, 15.0, bg, bd);
-            if self.hover == h {
-                self.gfx.fill_round(r.inset(1.0, 1.0), 14.0, if t.dark { C(1.0, 1.0, 1.0, 0.04) } else { C(0.0, 0.0, 0.0, 0.03) });
+            let hv = self.hov(h) + 0.6 * self.press_depth(h).clamp(0.0, 1.0);
+            if hv > 0.0 {
+                self.gfx.fill_round(r.inset(1.0, 1.0), 14.0, if t.dark { C(1.0, 1.0, 1.0, 0.05 * hv) } else { C(0.0, 0.0, 0.0, 0.035 * hv) });
             }
             let g = &self.gfx;
             g.glyph(c.glyph, Rect::new(x + 10.0, y, 13.0, CHIPS_H), 13.0, t.warn);
@@ -512,12 +604,14 @@ impl App {
             self.hit(r, h);
             if c.hung {
                 let er = Rect::new(x + 31.0 + tw + 4.0, y + 3.0, lw, CHIPS_H - 6.0);
-                if self.hover == Hit::ChipEnd(i as u8) {
-                    self.gfx.fill_round(er, 4.0, t.acc_soft);
+                let ehv = self.hov(Hit::ChipEnd(i as u8));
+                if ehv > 0.0 {
+                    self.gfx.fill_round(er, 4.0, t.acc_soft.fade(ehv));
                 }
                 self.gfx.text("End", er, Font::Ui, 12.5, 600, Align::Center, t.acc_t);
                 self.hit(er, Hit::ChipEnd(i as u8));
             }
+            self.press_end(pressed);
             x += w + 8.0;
         }
         if chips.len() > 3 {
@@ -570,12 +664,21 @@ impl App {
         let mut right: Vec<(Col, f32)> = vec![];
         let res: Vec<Res> = if pane { vec![Res::Cpu, Res::Mem] } else if narrow { vec![Res::Cpu, Res::Mem, Res::Disk] } else { RES_ALL.to_vec() };
         // a narrow list with the pane open drops the Type column so names stay readable
-        if !(pane && x1 - x0 < 560.0) {
+        if self.prefs.col_type && !(pane && x1 - x0 < 560.0) {
             right.push((Col::Type, 100.0));
         }
         if self.prefs.show_pid {
             right.push((Col::Pid, 70.0));
         }
+        let res: Vec<Res> = res
+            .into_iter()
+            .filter(|r| match r {
+                Res::Disk => self.prefs.col_disk,
+                Res::Net => self.prefs.col_net,
+                Res::Gpu => self.prefs.col_gpu,
+                _ => true,
+            })
+            .collect();
         for r in res {
             right.push((
                 Col::M(r),
@@ -634,8 +737,9 @@ impl App {
             let r = Rect::new(*x, hy + 1.0, *w, HEAD_H - 2.0);
             if idx != 255 {
                 let h = Hit::Header(idx);
-                if self.hover == h {
-                    self.gfx.fill(r, t.hov.fade(0.6));
+                let hv = self.hov(h);
+                if hv > 0.0 {
+                    self.gfx.fill(r, t.hov.fade(0.6 * hv));
                 }
                 self.hit(r, h);
             }
@@ -661,22 +765,32 @@ impl App {
             && let Some(i) = self.rows.iter().position(|r| self.row_sel(r.k))
         {
             // centre the selected row
-            self.scroll[0] = self.rows[i].y - view.h / 2.0;
-            self.clamp_scroll();
+            let v = self.rows[i].y - view.h / 2.0;
+            self.set_scroll(0, v);
         }
         self.gfx.clip(view);
+        // the list blocks what is under it, but its rows (added after this) take the clicks
+        self.hit(view, Hit::Block);
         let rows = std::mem::take(&mut self.rows);
         let maxes = self.col_max();
+        // selection highlight: drawn under the rows, it glides (spring) from the old row to the new one
+        if let Some(row) = rows.iter().find(|r| self.row_sel(r.k)) {
+            let id = self.row_id(row.k);
+            let (ry, _) = self.row_motion(id, row.y);
+            self.sel_highlight(Rect::new(view.x + 4.0, view.y - self.scroll[0], view.w - 8.0, row.h), id, ry, 0x6100);
+        } else {
+            self.mo.borrow_mut().sel_prev = None;
+        }
         for (i, row) in rows.iter().enumerate() {
-            let y = view.y + row.y - self.scroll[0];
-            if y + row.h < view.y {
+            let (ry, a) = self.row_motion(self.row_id(row.k), row.y);
+            let y = view.y + ry - self.scroll[0];
+            if y + row.h < view.y || y > view.b() {
                 continue;
             }
-            if y > view.b() {
-                break;
-            }
             let r = Rect::new(view.x + 4.0, y, view.w - 8.0, row.h);
+            let old = self.gfx.push_alpha(a);
             self.paint_row(i, row.k, r, &cols, &maxes);
+            self.gfx.pop_alpha(old);
         }
         self.rows = rows;
         if self.rows.is_empty() && !self.procs.is_empty() && self.searching() {
@@ -684,7 +798,6 @@ impl App {
         }
         self.gfx.unclip();
         self.scrollbar(view, 0);
-        self.hit(view, Hit::Block);
     }
 
     /// Column maxima (bars are scaled to the biggest value in their column).
@@ -723,11 +836,7 @@ impl App {
             _ => {}
         }
         let h = Hit::Row(i);
-        let selected = self.row_sel(k);
-        if selected {
-            self.gfx.fill_round(r, 4.0, t.sel);
-            self.gfx.fill_round(Rect::new(r.x, r.y + 10.0, 3.0, 16.0), 1.5, t.acc);
-        } else {
+        if !self.row_sel(k) {
             self.hp(r, 4.0, h);
         }
         self.hit(r, h);
@@ -744,6 +853,12 @@ impl App {
             }
             None => (g.cpu, g.mem, g.io, g.gpu, g.members.first().map(|m| m.pid).unwrap_or(0)),
         };
+        // numbers glide to each new sample
+        let rid = self.row_id(k);
+        let cpu = self.tv(rid, 0, cpu);
+        let mem = self.tv(rid, 1, mem as f32) as u64;
+        let io = self.tv(rid, 2, io as f32) as f64;
+        let gpu = self.tv(rid, 3, gpu);
         let flag = if child.is_none() { self.flag(gi) } else { None };
         // ---- name cell
         let (nc_x, nc_w) = (cols[0].1, cols[0].2);
@@ -857,7 +972,7 @@ impl App {
                             _ => 1048576.0,
                         };
                         let mx = maxes[RES_ALL.iter().position(|x| x == res).unwrap()].max(floor);
-                        let f = ((v / mx) as f32).clamp(0.06, 1.0);
+                        let f = self.tv(rid, 10 + RES_ALL.iter().position(|x| x == res).unwrap() as u8, ((v / mx) as f32).clamp(0.06, 1.0));
                         let br = Rect::new(vr - 36.0, r.cy() - 1.5, 36.0, 3.0);
                         self.gfx.fill_round(br, 1.5, t.track);
                         self.gfx.fill_round(Rect::new(br.x, br.y, (36.0 * f).max(3.0), 3.0), 1.5, color);
@@ -872,9 +987,7 @@ impl App {
         let t = self.t;
         let Some(e) = self.startup.get(si).cloned() else { return };
         let h = Hit::Row(i);
-        if self.row_sel(RowK::Startup(si)) {
-            self.gfx.fill_round(r, 4.0, t.sel);
-        } else {
+        if !self.row_sel(RowK::Startup(si)) {
             self.hp(r, 4.0, h);
         }
         self.hit(r, h);
@@ -903,9 +1016,7 @@ impl App {
         let t = self.t;
         let Some(s) = self.services_all.get(si).cloned() else { return };
         let h = Hit::Row(i);
-        if self.row_sel(RowK::Service(si)) {
-            self.gfx.fill_round(r, 4.0, t.sel);
-        } else {
+        if !self.row_sel(RowK::Service(si)) {
             self.hp(r, 4.0, h);
         }
         self.hit(r, h);

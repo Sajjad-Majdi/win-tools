@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
-//! wintask.exe: the Win Tools Task Manager window.
+#![allow(non_snake_case)]
+//! RustTaskManager.exe: the Rust Task Manager window.
 //! Args: `--software` (CPU renderer), `--theme light|dark`, `--no-mica`, `--test` (safe mode for automated tests).
 //! `--set-default` / `--restore-default` run the elevated helper only (the window starts it with UAC when the user
 //! clicks the button in Settings) and exit.

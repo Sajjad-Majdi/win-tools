@@ -1,4 +1,4 @@
-//! Win Tools core: process engine, performance counters, services, startup apps, process knowledge base, AI, IPC.
+//! Rust Task Manager core: process engine, performance counters, services, startup apps, process knowledge base, AI, IPC.
 pub mod ai;
 pub mod explain;
 pub mod gui;
