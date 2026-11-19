@@ -444,6 +444,220 @@ fn verb_icon(classes: &[String], verb: &str) -> Option<Icon> {
     None
 }
 
+/// The icon of an "Open with" handler: its icon location ("file,index", or an indirect string of a packaged app,
+/// whose logo is a PNG), else the program itself. Cached for the life of the process.
+pub fn handler_icon(h: &crate::shell::Handler) -> Option<Icon> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Icon>>>> = OnceLock::new();
+    let key = format!("{}|{}", h.icon, h.name);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(i) = cache.lock().unwrap().get(&key) {
+        return i.clone();
+    }
+    let _c = com();
+    let icon = icon_at(&h.icon).or_else(|| program_icon(&h.name));
+    cache.lock().unwrap().insert(key, icon.clone());
+    icon
+}
+
+/// An icon from an icon location: "file,index" (exe, dll, ico) or "@{...}" (packaged app resource, a PNG logo).
+pub fn icon_at(loc: &str) -> Option<Icon> {
+    let loc = loc.trim();
+    if loc.is_empty() {
+        return None;
+    }
+    if loc.starts_with('@') {
+        let mut buf = vec![0u16; 2048];
+        let w = wide(loc);
+        unsafe { windows::Win32::UI::Shell::SHLoadIndirectString(PCWSTR(w.as_ptr()), &mut buf, None) }.ok()?;
+        let file = from_wide(&buf);
+        let low = file.to_lowercase();
+        if low.ends_with(".png") || low.ends_with(".jpg") || low.ends_with(".jpeg") {
+            return image_icon(&file);
+        }
+        return icon_source(&file, false).and_then(|(f, i)| file_icon(&f, i));
+    }
+    icon_source(loc, false).and_then(|(f, i)| file_icon(&f, i))
+}
+
+/// A picture file (an app logo) scaled to an icon (32 px, premultiplied) with WIC.
+fn image_icon(file: &str) -> Option<Icon> {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    let w = wide(file);
+    unsafe {
+        let f: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let dec = f.CreateDecoderFromFilename(PCWSTR(w.as_ptr()), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+        let frame = dec.GetFrame(0).ok()?;
+        let (mut sw, mut sh) = (0u32, 0u32);
+        frame.GetSize(&mut sw, &mut sh).ok()?;
+        if sw == 0 || sh == 0 {
+            return None;
+        }
+        let size = 32u32;
+        let (tw, th) = if sw >= sh { (size, (size * sh / sw).max(1)) } else { ((size * sw / sh).max(1), size) };
+        let sc = f.CreateBitmapScaler().ok()?;
+        sc.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant).ok()?;
+        let cv = f.CreateFormatConverter().ok()?;
+        cv.Initialize(&sc, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+        let mut px = vec![0u8; (tw * th * 4) as usize];
+        cv.CopyPixels(std::ptr::null(), tw * 4, &mut px).ok()?;
+        // centre a non-square logo in a square
+        if tw == th {
+            return Some(Icon { width: tw, height: th, bgra: px });
+        }
+        let mut sq = vec![0u8; (size * size * 4) as usize];
+        let (ox, oy) = ((size - tw) / 2, (size - th) / 2);
+        for y in 0..th {
+            let d = (((oy + y) * size + ox) * 4) as usize;
+            sq[d..d + (tw * 4) as usize].copy_from_slice(&px[(y * tw * 4) as usize..((y + 1) * tw * 4) as usize]);
+        }
+        Some(Icon { width: size, height: size, bgra: sq })
+    }
+}
+
+/// An icon file + index at `px` pixels (exe, dll, ico; negative index = resource id), premultiplied.
+pub fn extract_icon(file: &str, idx: i32, px: u32) -> Option<Icon> {
+    use windows::Win32::UI::Shell::SHDefExtractIconW;
+    use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx, HICON};
+    let file = expand(file.trim().trim_matches('"'));
+    if file.is_empty() {
+        return None;
+    }
+    let w = wide(&file);
+    let mut big = HICON::default();
+    let hr = unsafe { SHDefExtractIconW(PCWSTR(w.as_ptr()), idx, 0, Some(&mut big), None, px & 0xFFFF) };
+    if hr.is_err() || big.is_invalid() {
+        return None;
+    }
+    let r = render_alpha(px, px, |dc| unsafe {
+        let _ = DrawIconEx(dc, 0, 0, big, px as i32, px as i32, 0, None, DI_NORMAL);
+    });
+    unsafe {
+        let _ = DestroyIcon(big);
+    }
+    r
+}
+
+/// The shell's icon of a file (IShellItemImageFactory, icon only), premultiplied.
+pub fn shell_icon(path: &Path, px: u32) -> Option<Icon> {
+    let mut i = crate::thumb::thumbnail(path, px, crate::thumb::ThumbKind::IconOnly).ok()?;
+    for p in i.bgra.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        for c in &mut p[..3] {
+            *c = ((*c as u32 * a + 127) / 255) as u8;
+        }
+    }
+    Some(Icon { width: i.width, height: i.height, bgra: i.bgra })
+}
+
+/// What SHGetFileInfo gives for a file (small icon at 16 px or less, else large), for comparisons.
+pub fn shgetfileinfo_icon(path: &Path, px: u32) -> Option<Icon> {
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON, SHGetFileInfoW};
+    use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx};
+    let _c = com();
+    let w = wide(path.as_os_str());
+    let mut sfi = SHFILEINFOW::default();
+    let flags = SHGFI_ICON | if px <= 16 { SHGFI_SMALLICON } else { SHGFI_LARGEICON };
+    let r = unsafe { SHGetFileInfoW(PCWSTR(w.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut sfi), size_of::<SHFILEINFOW>() as u32, flags) };
+    if r == 0 || sfi.hIcon.is_invalid() {
+        return None;
+    }
+    let out = render_alpha(px, px, |dc| unsafe {
+        let _ = DrawIconEx(dc, 0, 0, sfi.hIcon, px as i32, px as i32, 0, None, DI_NORMAL);
+    });
+    unsafe {
+        let _ = DestroyIcon(sfi.hIcon);
+    }
+    out
+}
+
+/// The icon a file shows in the list, at `px` pixels. For a shortcut: the icon it names (expanded), else its
+/// target's icon, else the shell's icon of the .lnk itself (Steam, Epic, packaged apps). The bool is true when the
+/// shell already drew the shortcut arrow on it (never, today: the image factory leaves the arrow out).
+pub fn file_icon_for(path: &Path, px: u32) -> Option<(Icon, bool)> {
+    let _c = com();
+    let ext = ext_of(&path.to_string_lossy());
+    if ext == "lnk" || ext == "url" {
+        let li = if ext == "lnk" { crate::info::read_shortcut(path) } else { crate::info::read_url_file(path) };
+        if let Some(li) = li {
+            if !li.icon_file.trim().is_empty()
+                && let Some(i) = extract_icon(&li.icon_file, li.icon_index, px)
+            {
+                return Some((i, false));
+            }
+            let target = Path::new(&li.target);
+            if ext == "lnk" && !li.target.is_empty() && target.exists()
+                && let Some(i) = shell_icon(target, px)
+            {
+                return Some((i, false));
+            }
+        }
+        // the shell's icon of the .lnk itself (Steam, Epic, packaged apps); IShellItemImageFactory draws no arrow
+        return shell_icon(path, px).map(|i| (i, false));
+    }
+    shell_icon(path, px).map(|i| (i, false))
+}
+
+/// The icon an item shows in the list at `px` pixels, as Explorer draws it: shortcuts with the shortcut arrow on top.
+pub fn list_icon(path: &Path, px: u32) -> Option<Icon> {
+    let ext = ext_of(&path.to_string_lossy());
+    if ext == "lnk" || ext == "url" {
+        let (mut i, arrow) = file_icon_for(path, px)?;
+        if !arrow && let Some(o) = link_overlay(i.width) {
+            over(&mut i.bgra, &o.bgra, i.width, o.width);
+        }
+        return Some(i);
+    }
+    shell_icon(path, px)
+}
+
+/// Windows' own shortcut arrow (stock icon SIID_LINK) at `px`: the arrow sits bottom-left on a full-size canvas.
+pub fn link_overlay(px: u32) -> Option<Icon> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::UI::Shell::{SHGSI_ICONLOCATION, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_LINK};
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Icon>>>> = OnceLock::new();
+    let c = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(i) = c.lock().unwrap().get(&px) {
+        return i.clone();
+    }
+    let mut info = SHSTOCKICONINFO { cbSize: size_of::<SHSTOCKICONINFO>() as u32, ..Default::default() };
+    let icon = unsafe { SHGetStockIconInfo(SIID_LINK, SHGSI_ICONLOCATION, &mut info) }.ok().and_then(|_| extract_icon(&from_wide(&info.szPath), info.iIcon, px));
+    c.lock().unwrap().insert(px, icon.clone());
+    icon
+}
+
+/// Premultiplied "source over" of `top` (width tw) onto `dst` (width dw), both square, aligned top-left.
+fn over(dst: &mut [u8], top: &[u8], dw: u32, tw: u32) {
+    let n = dw.min(tw) as usize;
+    for y in 0..n {
+        for x in 0..n {
+            let s = (y * tw as usize + x) * 4;
+            let d = (y * dw as usize + x) * 4;
+            let a = top[s + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            for k in 0..4 {
+                dst[d + k] = (top[s + k] as u32 + dst[d + k] as u32 * (255 - a) / 255).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// The icon of a program (an "Open with" handler given by its exe path); None for app ids and missing files.
+pub fn program_icon(name: &str) -> Option<Icon> {
+    let p = std::path::Path::new(name.trim_matches('"'));
+    if !p.is_absolute() || !p.is_file() {
+        return None;
+    }
+    let _c = com();
+    file_icon(&p.to_string_lossy(), 0)
+}
+
 fn file_icon(file: &str, idx: i32) -> Option<Icon> {
     use windows::Win32::UI::Shell::ExtractIconExW;
     use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx, HICON};

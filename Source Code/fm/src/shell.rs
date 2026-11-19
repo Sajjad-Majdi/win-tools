@@ -46,6 +46,106 @@ pub struct Handler {
     /// The name people see.
     pub ui_name: String,
     pub recommended: bool,
+    /// Where its icon is: "file,index", or an indirect "@{package?ms-resource://...}" string (packaged apps).
+    pub icon: String,
+    /// The app Windows uses now for this file type.
+    pub default: bool,
+}
+
+/// Our own default apps ("Always open .mp4 with PotPlayer", set in Rust File Explorer only; Windows' UserChoice is
+/// never touched). Kept in openwith.json in the data folder: extension -> (UI name, handler name).
+pub fn own_defaults() -> std::collections::BTreeMap<String, (String, String)> {
+    let v: serde_json::Value = std::fs::read_to_string(data_dir().join("openwith.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::Value::Null);
+    let mut m = std::collections::BTreeMap::new();
+    if let Some(o) = v.as_object() {
+        for (k, x) in o {
+            // {"label": what people see, "handler": the program / app id}; older files used "app" / "name"
+            let ui = x["label"].as_str().or(x["app"].as_str());
+            let name = x["handler"].as_str().or(x["name"].as_str());
+            if let (Some(ui), Some(name)) = (ui, name) {
+                m.insert(k.to_lowercase(), (ui.to_string(), name.to_string()));
+            }
+        }
+    }
+    m
+}
+
+/// ".mp4" style key for an extension or file name.
+pub fn ext_key(ext: &str) -> String {
+    let e = ext.trim().trim_start_matches('.').to_lowercase();
+    format!(".{e}")
+}
+
+/// Our own default for an extension: (UI name, handler name).
+pub fn own_default(ext: &str) -> Option<(String, String)> {
+    own_defaults().remove(&ext_key(ext))
+}
+
+/// Set (Some((ui name, handler name))) or clear (None) our own default for an extension.
+pub fn set_own_default(ext: &str, app: Option<(&str, &str)>) -> Res<()> {
+    let mut m = own_defaults();
+    match app {
+        Some((ui, name)) => {
+            m.insert(ext_key(ext), (ui.to_string(), name.to_string()));
+        }
+        None => {
+            m.remove(&ext_key(ext));
+        }
+    }
+    let o: serde_json::Map<String, serde_json::Value> = m.into_iter().map(|(k, (ui, name))| (k, serde_json::json!({"label": ui, "handler": name}))).collect();
+    let p = data_dir().join("openwith.json");
+    std::fs::create_dir_all(data_dir()).map_err(|e| format!("cannot create {}: {e}", data_dir().display()))?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&serde_json::Value::Object(o)).unwrap()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("cannot write {}: {e}", p.display()))
+}
+
+/// Open a file the way Rust File Explorer does: with our own default app for its type when one is set, else with the
+/// Windows default.
+pub fn open_file(path: &Path) -> Res<()> {
+    let ext = ext_of(&path.to_string_lossy());
+    if !ext.is_empty()
+        && path.is_file()
+        && let Some((_, name)) = own_default(&ext)
+        && open_with(path, &name).is_ok()
+    {
+        return Ok(());
+    }
+    open(path)
+}
+
+/// The current default app of a file type: (friendly name, program path); empty strings when unknown.
+pub fn default_app(ext: &str) -> (String, String) {
+    use windows::Win32::UI::Shell::{ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR, ASSOCSTR_EXECUTABLE, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW};
+    let e = if ext.starts_with('.') { ext.to_string() } else { format!(".{ext}") };
+    let w = wide(&e);
+    let q = |what: ASSOCSTR| -> String {
+        let mut buf = vec![0u16; 1024];
+        let mut n = buf.len() as u32;
+        let hr = unsafe { AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, what, PCWSTR(w.as_ptr()), PCWSTR::null(), Some(windows::core::PWSTR(buf.as_mut_ptr())), &mut n) };
+        if hr.is_ok() { from_wide(&buf) } else { String::new() }
+    };
+    (q(ASSOCSTR_FRIENDLYAPPNAME), q(ASSOCSTR_EXECUTABLE))
+}
+
+/// The Windows "Open with" dialog for a file, with "Always use this app to open .ext files": the only supported way to
+/// change a default app (UserChoice is hash-protected and never written here). `owner` = the parent window handle.
+pub fn open_with_dialog(path: &Path, owner: isize) -> Res<()> {
+    use windows::Win32::UI::Shell::{OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPENASINFO, SHOpenWithDialog};
+    let path = abs(path);
+    if !path.is_file() {
+        return Err(format!("not a file: {}", path.display()));
+    }
+    let _c = com();
+    let w = wide(path.as_os_str());
+    let info = OPENASINFO { pcszFile: PCWSTR(w.as_ptr()), pcszClass: PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC };
+    let owner = (owner != 0).then_some(windows::Win32::Foundation::HWND(owner as *mut _));
+    match unsafe { SHOpenWithDialog(owner, &info) } {
+        Ok(()) => Ok(()),
+        // the user closed the dialog
+        Err(e) if e.code().0 as u32 == 0x800704C7 => Ok(()),
+        Err(e) => Err(win_err("the Open with dialog failed", &e)),
+    }
 }
 
 fn handlers_raw(ext: &str, all: bool) -> Res<Vec<(Handler, IAssocHandler)>> {
@@ -65,7 +165,15 @@ fn handlers_raw(ext: &str, all: bool) -> Res<Vec<(Handler, IAssocHandler)>> {
             let name = h.GetName().map(take_pwstr).unwrap_or_default();
             let ui_name = h.GetUIName().map(take_pwstr).unwrap_or_default();
             let recommended = h.IsRecommended().is_ok() && h.IsRecommended().0 == 0;
-            out.push((Handler { name, ui_name, recommended }, h));
+            let mut ip = windows::core::PWSTR::null();
+            let mut idx = 0i32;
+            let icon = if h.GetIconLocation(&mut ip, &mut idx).is_ok() && !ip.is_null() {
+                let p = take_pwstr(ip);
+                if p.starts_with('@') { p } else { format!("{p},{idx}") }
+            } else {
+                String::new()
+            };
+            out.push((Handler { name, ui_name, recommended, icon, default: false }, h));
         }
     }
     Ok(out)
@@ -74,7 +182,17 @@ fn handlers_raw(ext: &str, all: bool) -> Res<Vec<(Handler, IAssocHandler)>> {
 /// Apps that can open files with this extension (recommended ones, or every registered one with `all`).
 pub fn open_with_list(ext: &str, all: bool) -> Res<Vec<Handler>> {
     let _c = com();
-    Ok(handlers_raw(ext, all)?.into_iter().map(|(h, _)| h).collect())
+    let (friendly, exe) = default_app(ext);
+    let mut v: Vec<Handler> = handlers_raw(ext, all)?.into_iter().map(|(h, _)| h).collect();
+    let mut found = false;
+    for h in v.iter_mut() {
+        let is = !found && ((!exe.is_empty() && h.name.eq_ignore_ascii_case(&exe)) || (!friendly.is_empty() && h.ui_name.eq_ignore_ascii_case(&friendly)));
+        h.default = is;
+        found |= is;
+    }
+    // the default app first
+    v.sort_by_key(|h| !h.default);
+    Ok(v)
 }
 
 /// Open a file with one app from `open_with_list` (matched by name, UI name, or a part of the UI name).

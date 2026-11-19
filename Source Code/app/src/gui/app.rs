@@ -33,6 +33,9 @@ pub const CMD_H: f32 = 48.0;
 pub const HEAD_H: f32 = 32.0;
 pub const ROW_H: f32 = 36.0;
 pub const PANE_W: f32 = 376.0;
+/// Sidebar: collapsed (icons) and expanded (icon + label) widths.
+pub const NAV_W: f32 = 48.0;
+pub const NAV_W_OPEN: f32 = 200.0;
 pub const FREE_W: f32 = 432.0;
 const WM_PANEL: u32 = WM_DATA + 1;
 const WM_IPC: u32 = WM_DATA + 2;
@@ -42,6 +45,8 @@ const WM_NCMOUSELEAVE: u32 = 0x02A2;
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
 const TIMER_TRIM: usize = 3;
+/// tooltip delay after the pointer rests
+const TIMER_TIP: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
@@ -107,6 +112,58 @@ pub enum Hit {
     /// Settings > Columns: 0 Type, 1 PID, 2 Disk, 3 Network, 4 GPU
     ColPill(u8),
     DefSort,
+    /// the sidebar's expand / collapse button
+    NavToggle,
+    /// "Restart as administrator" (shown when a process cannot be read without admin)
+    RunAdmin,
+    /// the process list as one keyboard stop (Up / Down / Enter / Menu key work in it)
+    List,
+    /// Performance page: a resource in the list (index), a top process (index)
+    PerfItem(u8),
+    PerfTop(u8),
+}
+
+/// Can the keyboard stop on this control (Tab / Shift+Tab, Enter or Space presses it)?
+pub fn focusable(h: Hit) -> bool {
+    matches!(
+        h,
+        Hit::Search
+            | Hit::List
+            | Hit::Tab(_)
+            | Hit::NavToggle
+            | Hit::Tile(_)
+            | Hit::EndTask
+            | Hit::Restart
+            | Hit::Details
+            | Hit::More
+            | Hit::Free
+            | Hit::Sort
+            | Hit::Header(_)
+            | Hit::PaneClose
+            | Hit::PaneEnd
+            | Hit::PaneRestart
+            | Hit::PaneMore
+            | Hit::PaneSec(_)
+            | Hit::RunAdmin
+            | Hit::FreeAll
+            | Hit::StToggle(_)
+            | Hit::StSort
+            | Hit::SetDefault
+            | Hit::RestoreDefault
+            | Hit::Seg(..)
+            | Hit::Toggle(_)
+            | Hit::CliCopy(_)
+            | Hit::KeyField
+            | Hit::KeySave
+            | Hit::KeyTest
+            | Hit::KeyRemove
+            | Hit::Accent(_)
+            | Hit::HexField
+            | Hit::ColPill(_)
+            | Hit::DefSort
+            | Hit::PerfItem(_)
+            | Hit::PerfTop(_)
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -114,6 +171,10 @@ pub enum RowK {
     Group(usize),
     Child(usize, usize),
     PinSep,
+    /// section header of the grouped list: 0 Apps, 1 Background processes, 2 Windows processes; count
+    Kind(u8, usize),
+    /// "Show all (N)" under a section (N = its size); 0 = "Show fewer"
+    More(u8, usize),
     Sec(u8, usize),
     Startup(usize),
     Service(usize),
@@ -209,6 +270,12 @@ pub struct Dialog {
     pub body: String,
     pub job: EndJob,
     pub at: Instant,
+    /// a process Windows needs: red warning, the button says "End anyway", Enter cancels
+    pub danger: bool,
+    /// Restart: the command line and folder started again after the end
+    pub restart: Option<(String, String)>,
+    /// the cancel button: "Wait" for a hung app, else "Cancel"
+    pub cancel: &'static str,
 }
 
 #[derive(Clone)]
@@ -265,10 +332,18 @@ pub struct App {
     pub startup_sort: u8,
     pub query: String,
     pub search_focus: bool,
+    /// caret in the search text (chars; usize::MAX = at the end) and "all selected" (Ctrl+A)
+    pub caret: usize,
+    pub q_all: bool,
     /// list, startup page, settings page, pane
     pub scroll: [f32; 4],
     drag_scroll: Option<(u8, f32, f32)>,
     pub hits: Vec<(Rect, Hit)>,
+    /// tooltips of the last frame: area and text (cut text, icon-only buttons, disabled reasons)
+    pub tips: Vec<(Rect, String)>,
+    /// pointer position and when it came to rest there (tooltips show after 500 ms)
+    pub mouse: (f32, f32),
+    pub rest_at: Instant,
     pub hover: Hit,
     pub pressed: Hit,
     pub nc_hover: Hit,
@@ -313,6 +388,26 @@ pub struct App {
     pub key_result: Option<Result<(), String>>,
     key_out: Arc<Mutex<Option<Result<(), String>>>>,
     pub shift: bool,
+    pub hi_surrogate: u16,
+    /// the focused dialog button: 0 the action, 1 cancel
+    pub dlg_focus: u8,
+    /// the sort is reversed (second click on a column header)
+    pub sort_rev: bool,
+    /// Performance page: graph history per resource, the selected resource, the keys of the top processes shown
+    pub perf_hist: HashMap<String, VecDeque<f32>>,
+    pub perf_sel: String,
+    pub perf_top_keys: Vec<String>,
+    /// narrow window: the sidebar is opened over the page (not saved)
+    pub nav_peek: bool,
+    /// the control with the keyboard after Tab (a focus ring shows it); None after a mouse click
+    pub focus: Option<Hit>,
+    /// drop the next WM_CHAR (Space pressed a focused control)
+    pub eat_char: bool,
+    /// sort value per row key, averaged over the last samples, and the sort it belongs to
+    pub smooth: HashMap<String, f64>,
+    pub smooth_sort: SortKey,
+    /// the window runs as administrator (it can read every process)
+    pub elevated: bool,
     pub is_default: bool,
     /// set while painting a screenshot: animations show their end state
     pub shooting: bool,
@@ -322,6 +417,16 @@ pub struct App {
     pub view_h: [f32; 4],
     /// bring the selected row into view on the next paint (after the layout is known)
     pub want_scroll_sel: bool,
+    /// the pointer is over the list (its order is frozen meanwhile)
+    pub pointer_in_list: bool,
+    /// last click or keyboard move (the order stays frozen for 3 s after it)
+    pub last_input: Instant,
+    /// row ids as last painted: a click maps its row index through these, so a re-sort never hits another row
+    pub painted: Vec<u64>,
+    /// current sidebar width (springs between NAV_W and NAV_W_OPEN)
+    pub nav_w: f32,
+    /// collapsed sidebar: the hovered item's name and its centre y
+    pub nav_tip: Option<(&'static str, f32)>,
     /// list row height (Settings > Density)
     pub row_h: f32,
 }
@@ -536,12 +641,11 @@ impl App {
         }
         let now = Instant::now();
         let mo = self.mo.borrow();
-        // a row that changes place dims while it passes other rows, so crossing rows do not read as a jumble
+        // a row that changes place moves there quickly and calmly
         let (dy, dim) = match mo.row_y.get(&id) {
             Some(tw) if !tw.done(now) => {
                 self.animate(30);
-                let far = ((tw.to - tw.from).abs() / self.row_h).min(3.0) / 3.0;
-                (tw.value(now, motion::standard), 1.0 - 0.65 * far.max(0.4) * (tw.progress(now) * std::f32::consts::PI).sin())
+                (tw.value(now, motion::decel), 1.0)
             }
             _ => (y, 1.0),
         };
@@ -605,6 +709,8 @@ impl App {
             RowK::Service(i) => (3 << 56) | i as u64,
             RowK::Sec(s, _) => (4 << 56) | s as u64,
             RowK::PinSep => 5 << 56,
+            RowK::Kind(k, _) => (6 << 56) | k as u64,
+            RowK::More(k, _) => (7 << 56) | k as u64,
         }
     }
 
@@ -665,8 +771,41 @@ impl App {
             (None, 2) => true,
             _ => theme::system_dark(),
         };
-        let transp = if self.backdrop_on() || self.gfx.offscreen() { self.prefs.transp } else { self.prefs.transp.min(1) };
-        theme::make(dark, self.prefs.accent, transp)
+        // Transparency needs a backdrop behind the window (Mica, Mica Alt, Acrylic); Solid is always opaque
+        let transp = if self.backdrop_on() { self.prefs.transp } else { 0 };
+        theme::make_toned(dark, self.accent_rgb(), transp, Some(self.palette_base(dark)))
+    }
+
+    /// The desktop (DWM colorization) colour, for "Follow desktop".
+    pub fn desktop_rgb(&self) -> Option<u32> {
+        let mut c = 0u32;
+        let mut opaque = windows::core::BOOL(0);
+        unsafe { DwmGetColorizationColor(&mut c, &mut opaque) }.ok().map(|_| c & 0xFFFFFF)
+    }
+
+    /// The accent in use: the chosen colour, the desktop colour ("Follow desktop"), or None = the Windows accent.
+    pub fn accent_rgb(&self) -> Option<u32> {
+        if self.prefs.desktop {
+            let mut c = 0u32;
+            let mut opaque = windows::core::BOOL(0);
+            if unsafe { DwmGetColorizationColor(&mut c, &mut opaque) }.is_ok() {
+                return Some(c & 0xFFFFFF);
+            }
+        }
+        self.prefs.accent
+    }
+
+    /// Base hue and chroma of the window palette: the accent's hue, as strong as Settings > Colour strength says,
+    /// so the whole window (title bar, sidebar, content, cards, hover, selection, borders) is one tonal family.
+    pub fn palette_base(&self, dark: bool) -> (f32, f32) {
+        // absolute chroma of the window colour: Subtle / Medium / Strong
+        let chroma = match self.prefs.strength {
+            0 => 0.018,
+            2 => 0.10,
+            _ => if dark { 0.05 } else { 0.06 },
+        };
+        let a = theme::make(dark, self.accent_rgb(), 0).acc;
+        (theme::hue_of(((a.0 * 255.0) as u32) << 16 | ((a.1 * 255.0) as u32) << 8 | (a.2 * 255.0) as u32), chroma)
     }
 
     pub fn apply_theme(&mut self) {
@@ -772,17 +911,41 @@ impl App {
         let empty = HashMap::new();
         let gpu = self.perf.gpu.as_ref().map(|g| &g.per_pid).unwrap_or(&empty);
         let mut v = model::groups(&self.procs, &self.services, &self.cmdlines, gpu, &self.hung, self.prefs.merge, self.perf.mem_total.max(1));
-        model::sort_groups(&mut v, self.sort);
-        if self.sort == SortKey::Impact {
-            // move rows at most every 2 s, and only when they changed rank by 2+ places
-            let fresh = self.last_order.map(|t| t.elapsed() >= Duration::from_secs(2)).unwrap_or(true);
-            if fresh {
-                model::stable_order(&mut v, &self.order_prev);
-                self.last_order = Some(Instant::now());
-            } else {
-                let prev = &self.order_prev;
-                v.sort_by_key(|g| prev.get(&g.key).copied().unwrap_or(usize::MAX));
+        // the sort value of each row, averaged over the last samples (about 4 s), for a calm order
+        if sample || self.smooth_sort != self.sort {
+            let reset = self.smooth_sort != self.sort;
+            self.smooth_sort = self.sort;
+            let mut next = HashMap::with_capacity(v.len());
+            for g in &v {
+                let x = model::sort_val(g, self.sort);
+                let e = if reset { x } else { self.smooth.get(&g.key).map(|o| o * 0.75 + x * 0.25).unwrap_or(x) };
+                next.insert(g.key.clone(), e);
             }
+            self.smooth = next;
+        }
+        // a calm list: the order is frozen while the pointer is over the list, a menu or flyout is open, or for
+        // 3 s after a click or key; otherwise rows move at most every 5 s, inside their own section, and only for a
+        // clear gap in value (model::calm_order). Name order is exact and never waits.
+        let fresh = self.sort == SortKey::Name || self.order_prev.is_empty() || (!self.order_frozen() && self.last_order.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(true));
+        if fresh {
+            let (sort, rev) = (self.sort, self.sort_rev);
+            if self.prefs.group && self.query.is_empty() {
+                let mut out = Vec::with_capacity(v.len());
+                for kind in [procs::Kind::App, procs::Kind::Background, procs::Kind::Windows] {
+                    let (sec, rest): (Vec<Group>, Vec<Group>) = v.into_iter().partition(|g| g.kind == kind);
+                    v = rest;
+                    out.extend(model::calm_order(sec, &self.order_prev, sort, rev, &self.smooth));
+                }
+                out.extend(v);
+                v = out;
+            } else {
+                v = model::calm_order(v, &self.order_prev, sort, rev, &self.smooth);
+            }
+            self.last_order = Some(Instant::now());
+        } else {
+            // frozen: the same order as before; new rows wait at the end of their section
+            let prev = &self.order_prev;
+            v.sort_by_key(|g| prev.get(&g.key).copied().unwrap_or(usize::MAX));
         }
         self.order_prev = v.iter().enumerate().map(|(i, g)| (g.key.clone(), i)).collect();
         if sample {
@@ -802,6 +965,7 @@ impl App {
             let disk: f64 = s.disks.iter().map(|d| d.read_rate + d.write_rate).sum();
             let net: f64 = s.nets.iter().map(|n| n.recv_rate + n.send_rate).sum();
             let vals = [s.cpu, s.mem_total.saturating_sub(s.mem_avail) as f32, disk as f32, net as f32, s.gpu.as_ref().map(|g| g.util).unwrap_or(0.0)];
+            self.push_perf_hist();
             for (q, v) in self.tot.iter_mut().zip(vals) {
                 q.push_back(v);
                 while q.len() > model::HIST_N {
@@ -810,6 +974,26 @@ impl App {
             }
         }
         self.groups = v;
+        self.build_rows();
+    }
+
+    /// Is the list order frozen right now?
+    pub fn order_frozen(&self) -> bool {
+        self.pointer_in_list || self.menu.is_some() || self.flyout.is_some() || self.dialog.is_some() || self.last_input.elapsed() < Duration::from_secs(3)
+    }
+
+    /// The row a click on painted row `i` means now (rows may have been rebuilt since the last paint).
+    pub fn row_now(&self, i: usize) -> Option<usize> {
+        let id = *self.painted.get(i)?;
+        if self.rows.get(i).map(|r| self.row_id(r.k)) == Some(id) {
+            return Some(i);
+        }
+        self.rows.iter().position(|r| self.row_id(r.k) == id)
+    }
+
+    /// Show all / show fewer rows of section `k`.
+    pub fn toggle_section(&mut self, k: u8) {
+        self.set_pref(|p| p.sec_open[k as usize % 3] = !p.sec_open[k as usize % 3]);
         self.build_rows();
     }
 
@@ -838,7 +1022,10 @@ impl App {
             let hits: Vec<(usize, Vec<usize>)> = hits.into_iter().map(|h| (h.0, h.1)).collect();
             let st: Vec<usize> = self.startup.iter().enumerate().filter(|(_, e)| model::startup_matches(e, &toks)).map(|(i, _)| i).collect();
             let sv: Vec<usize> = self.services_all.iter().enumerate().filter(|(_, s)| model::service_matches(s, &toks)).map(|(i, _)| i).collect();
-            push(&mut rows, &mut y, RowK::Sec(0, hits.len()), 32.0);
+            // an empty section is not shown (no "Processes 0" over an empty list)
+            if !hits.is_empty() {
+                push(&mut rows, &mut y, RowK::Sec(0, hits.len()), 32.0);
+            }
             for (gi, kids) in &hits {
                 push(&mut rows, &mut y, RowK::Group(*gi), self.row_h);
                 let g = &self.groups[*gi];
@@ -863,6 +1050,37 @@ impl App {
                     push(&mut rows, &mut y, RowK::Service(i), 40.0);
                 }
             }
+        } else if self.prefs.group {
+            // sections like Windows Task Manager; each keeps the current sort and shows its top 5 until opened
+            let sel_key = self.sel_group().map(|g| g.key.clone());
+            for (k, kind) in [procs::Kind::App, procs::Kind::Background, procs::Kind::Windows].iter().enumerate() {
+                let mut list: Vec<usize> = (0..self.groups.len()).filter(|&i| self.groups[i].kind == *kind).collect();
+                if list.is_empty() {
+                    continue;
+                }
+                list.sort_by_key(|&i| !self.groups[i].hung);
+                if k > 0 {
+                    y += 6.0;
+                }
+                push(&mut rows, &mut y, RowK::Kind(k as u8, list.len()), 36.0);
+                let open = self.prefs.sec_open[k];
+                let short = list.len() > 6 && !open;
+                for (n, &gi) in list.iter().enumerate() {
+                    let g = &self.groups[gi];
+                    if short && n >= 5 && sel_key.as_deref() != Some(g.key.as_str()) {
+                        continue;
+                    }
+                    push(&mut rows, &mut y, RowK::Group(gi), self.row_h);
+                    if g.members.len() > 1 && self.expanded.contains(&g.key) {
+                        for mi in 0..g.members.len() {
+                            push(&mut rows, &mut y, RowK::Child(gi, mi), self.row_h);
+                        }
+                    }
+                }
+                if list.len() > 6 {
+                    push(&mut rows, &mut y, RowK::More(k as u8, if open { 0 } else { list.len() }), 32.0);
+                }
+            }
         } else {
             let pinned: Vec<usize> = (0..self.groups.len()).filter(|&i| self.groups[i].hung).collect();
             let rest: Vec<usize> = (0..self.groups.len()).filter(|&i| !self.groups[i].hung).collect();
@@ -883,6 +1101,27 @@ impl App {
         }
         self.content_h[0] = y + 4.0;
         self.rows = rows;
+        // the selection never points at a row that is not shown (a search that hides it, a collapsed group):
+        // End task, Delete and Details act only on what the user can see
+        let shown = |k: &RowK| -> Option<(&str, Option<u32>)> {
+            match *k {
+                RowK::Group(gi) => self.groups.get(gi).map(|g| (g.key.as_str(), None)),
+                RowK::Child(gi, mi) => self.groups.get(gi).and_then(|g| g.members.get(mi).map(|m| (g.key.as_str(), Some(m.pid)))),
+                _ => None,
+            }
+        };
+        let fix = match &self.sel {
+            Some(Sel::Group(key)) if !self.rows.iter().any(|r| shown(&r.k).map(|(k, c)| k == key && c.is_none()).unwrap_or(false)) => Some(None),
+            Some(Sel::Child(pid)) if !self.rows.iter().any(|r| shown(&r.k).map(|(_, c)| c == Some(*pid)).unwrap_or(false)) => {
+                // its group row may still be there (the group was collapsed): select that instead
+                let key = self.group_of(*pid).map(|g| g.key.clone());
+                Some(key.filter(|k| self.rows.iter().any(|r| shown(&r.k).map(|(rk, c)| rk == k && c.is_none()).unwrap_or(false))).map(Sel::Group))
+            }
+            _ => None,
+        };
+        if let Some(new) = fix {
+            self.sel = new;
+        }
         self.clamp_scroll();
         self.note_rows();
     }
@@ -948,26 +1187,41 @@ impl App {
         self.w = pw as f32 / self.gfx.scale();
         self.h = ph as f32 / self.gfx.scale();
         self.hits.clear();
+        self.tips.clear();
         self.tick_scroll();
         self.track_ghosts();
         let t = self.t;
         self.gfx.begin();
         // Mica shows through transparent pixels of the window target; screenshots use the solid fallback
-        if self.backdrop_on() && !self.gfx.offscreen() {
-            self.gfx.clear(super::gfx::C(0.0, 0.0, 0.0, 0.0));
-        } else {
+        // the window colour at the panel alpha (Settings > Transparency): Mica / Acrylic shows through it evenly;
+        // screenshots and Solid use the opaque colour
+        if self.backdrop_on() && !self.gfx.preview() {
             self.gfx.clear(t.mica);
+        } else {
+            self.gfx.clear(t.mica.a(1.0));
         }
         self.paint_title();
+        // the sidebar opened over a narrow window is drawn after the page
+        let nav_over = self.nav_auto() && (self.nav_peek || self.nav_w > NAV_W + 1.0);
+        if !nav_over {
+            self.paint_nav();
+        }
         if first {
             trace(&format!("  paint title: {:.1} ms", self.started.elapsed().as_secs_f64() * 1000.0));
         }
         match self.page {
             0 => self.paint_processes(),
             1 => self.paint_startup(),
+            3 => self.paint_performance(),
             _ => self.paint_settings(),
         }
+        if nav_over {
+            self.paint_nav();
+        }
         self.paint_overlays();
+        self.paint_nav_tip();
+        self.paint_focus();
+        self.paint_tip();
         if first {
             trace(&format!("  paint page: {:.1} ms", self.started.elapsed().as_secs_f64() * 1000.0));
         }
@@ -979,6 +1233,11 @@ impl App {
 
     pub fn hit(&mut self, r: Rect, h: Hit) {
         self.hits.push((r, h));
+    }
+
+    /// A tooltip for an area of this frame.
+    pub fn tip(&mut self, r: Rect, text: impl Into<String>) {
+        self.tips.push((r, text.into()));
     }
 
     /// Hover / press fill for a clickable rect (call before drawing its content).
@@ -994,7 +1253,8 @@ impl App {
     }
 
     /// Render one frame offscreen and save it as a 32-bit BMP (lets agents see the GUI without a screen).
-    fn shot(&mut self, path: &str) -> Result<(), String> {
+    /// `alpha`: keep the window's per-pixel alpha (what DWM gets) and also write `<path>.alpha.bmp` (alpha as grey).
+    fn shot(&mut self, path: &str, alpha: bool) -> Result<(), String> {
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
@@ -1005,7 +1265,7 @@ impl App {
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
             let bmp = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| e.message())?;
             let old = SelectObject(dc, bmp.into());
-            if !self.gfx.begin_offscreen(dc, w as u32, h as u32) {
+            if !self.gfx.begin_offscreen(dc, w as u32, h as u32, alpha) {
                 return Err("offscreen target failed".into());
             }
             self.shooting = true;
@@ -1017,6 +1277,10 @@ impl App {
             let _ = GdiFlush();
             let n = (w * h * 4) as usize;
             let mut px = std::slice::from_raw_parts(bits as *const u8, n).to_vec();
+            if alpha {
+                let a: Vec<u8> = px.chunks_exact(4).flat_map(|p| [p[3], p[3], p[3], 255]).collect();
+                write_bmp(&format!("{path}.alpha.bmp"), w, h, &a)?;
+            }
             for p in px.chunks_exact_mut(4) {
                 p[3] = 255;
             }
@@ -1126,12 +1390,81 @@ impl App {
             if i < 0 || i >= n {
                 return;
             }
-            if !matches!(self.rows[i as usize].k, RowK::PinSep | RowK::Sec(..)) {
+            if !matches!(self.rows[i as usize].k, RowK::PinSep | RowK::Sec(..) | RowK::Kind(..) | RowK::More(..)) {
                 break;
             }
         }
         self.select_row(i as usize);
         self.scroll_to(i as usize);
+    }
+
+    /// Open the row menu for the selected row (keyboard), at its left part.
+    fn menu_for_sel(&mut self) {
+        let Some(i) = self.sel_index() else { return };
+        self.scroll_to(i);
+        let r = self.rows[i];
+        let y = (self.list_rect.y + r.y - self.scroll[0] + r.h / 2.0).clamp(self.list_rect.y, self.list_rect.b());
+        self.menu = Some(Menu { kind: MenuKind::Row, x: self.list_rect.x + 80.0, y, at: Instant::now() });
+        self.animate(180);
+    }
+
+    /// Move the keyboard to the next (or previous) control of this frame.
+    fn tab_focus(&mut self, back: bool) {
+        let mut stops: Vec<Hit> = vec![];
+        for (_, h) in &self.hits {
+            if focusable(*h) && !stops.contains(h) {
+                stops.push(*h);
+            }
+        }
+        if stops.is_empty() {
+            return;
+        }
+        let cur = self.focus.or(if self.search_focus { Some(Hit::Search) } else { None }).and_then(|f| stops.iter().position(|h| *h == f));
+        let n = stops.len();
+        let i = match (cur, back) {
+            (None, false) => 0,
+            (None, true) => n - 1,
+            (Some(c), false) => (c + 1) % n,
+            (Some(c), true) => (c + n - 1) % n,
+        };
+        let f = stops[i];
+        self.focus = Some(f);
+        self.search_focus = f == Hit::Search;
+        self.key_focus = f == Hit::KeyField;
+        self.hex_focus = f == Hit::HexField;
+        if f == Hit::List && self.sel_index().is_none() {
+            self.sel_edge(true);
+        }
+    }
+
+    /// Up / Down on the Startup apps page (in its shown order).
+    fn move_startup(&mut self, d: i32) {
+        let order = self.startup_order();
+        if order.is_empty() {
+            return;
+        }
+        let cur = order.iter().position(|&i| self.sel == Some(Sel::Startup(i)));
+        let n = match cur {
+            Some(c) => (c as i32 + d).clamp(0, order.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        self.sel = Some(Sel::Startup(order[n]));
+        let (y, view) = (n as f32 * 48.0, self.view_h[1]);
+        if y < self.scroll[1] {
+            self.scroll_smooth(1, y);
+        } else if y + 56.0 > self.scroll[1] + view {
+            self.scroll_smooth(1, y + 56.0 - view);
+        }
+    }
+
+    /// Home / End: select the first / last row.
+    fn sel_edge(&mut self, first: bool) {
+        let ok = |k: RowK| !matches!(k, RowK::PinSep | RowK::Sec(..) | RowK::Kind(..) | RowK::More(..));
+        let i = if first { self.rows.iter().position(|r| ok(r.k)) } else { self.rows.iter().rposition(|r| ok(r.k)) };
+        if let Some(i) = i {
+            self.select_row(i);
+            self.scroll_to(i);
+        }
     }
 
     pub fn scroll_to(&mut self, i: usize) {
@@ -1196,28 +1529,65 @@ impl App {
         let Some(job) = self.end_job(process_only) else { return };
         let g = self.sel_group().cloned();
         let risky = g.as_ref().map(|g| g.hung || g.kind == procs::Kind::App).unwrap_or(false);
-        if risky && self.prefs.ask_end {
-            let hung = g.as_ref().map(|g| g.hung).unwrap_or(false);
-            let body = if hung { format!("{} is not responding. Text you have not sent or saved may be lost.", job.label) } else { format!("{} may have work you have not saved. It will be lost.", job.label) };
-            self.dialog = Some(Dialog { title: format!("End {}?", job.label), body, job, at: Instant::now() });
-            self.animate(220);
-        } else {
-            self.run_end(job);
-        }
+        let hung = g.as_ref().map(|g| g.hung).unwrap_or(false);
+        let body = if hung { format!("{} is not responding. Text you have not sent or saved may be lost.", job.label) } else { format!("{} may have work you have not saved. It will be lost.", job.label) };
+        self.ask_end(job, if risky { Some(body) } else { None });
     }
 
-    pub fn run_end(&mut self, job: EndJob) {
+    /// End a job, after a confirm when it needs one: always for a process Windows needs (red warning) and for more
+    /// than one process; for an app or a hung app (`risky`) when "Ask before ending" is on.
+    pub fn ask_end(&mut self, mut job: EndJob, risky: Option<String>) {
+        // the window itself and Windows' kernel (System, PID 4 and below) are never ended: take them out first
+        let me = std::process::id();
+        job.pids.retain(|p| *p != me && *p > 4);
+        if job.pids.is_empty() {
+            let mine = self.sel_group().map(|g| g.pids().contains(&me)).unwrap_or(false);
+            self.toast_msg(if mine { "This is Rust Task Manager itself: close it with the × button" } else { "Windows' kernel (System) cannot be ended" }, false);
+            return;
+        }
+        job.count = job.pids.len();
+        let risky_hung = self.sel_group().map(|g| g.hung).unwrap_or(false);
+        let mut crit: Vec<String> = job.pids.iter().filter_map(|p| self.proc(*p)).filter(|p| procs::is_critical_name(&p.name)).map(|p| p.name.clone()).collect();
+        crit.sort();
+        crit.dedup();
+        let (title, body, danger) = if !crit.is_empty() {
+            let names = crit.join(", ");
+            (format!("End {}?", job.label), format!("Windows needs {names}. Ending it can crash Windows, sign you out or restart the PC, and unsaved work in every app can be lost."), true)
+        } else if let Some(b) = risky.filter(|_| self.prefs.ask_end) {
+            (format!("End {}?", job.label), if job.count > 1 { format!("{b} All {} of its processes end.", job.count) } else { b }, false)
+        } else if job.count > 1 {
+            {
+                // the row shows its own processes; the end also takes the helpers they started (console hosts...)
+                let own = self.sel_group().filter(|g| g.label == job.label).map(|g| g.members.len()).unwrap_or(job.count).min(job.count);
+                let helpers = job.count - own;
+                let body = if helpers > 0 { format!("{} runs as {own} processes, plus {helpers} helper processes they started. All of them end together.", job.label) } else { format!("{} runs as {} processes. All of them end together.", job.label, job.count) };
+                (format!("End {} processes?", job.count), body, false)
+            }
+        } else {
+            self.run_end(job);
+            return;
+        };
+        self.dialog = Some(Dialog { title, body, job, at: Instant::now(), danger, restart: None, cancel: if risky_hung { "Wait" } else { "Cancel" } });
+        // Enter confirms a normal dialog; the red one starts on Cancel
+        self.dlg_focus = if danger { 1 } else { 0 };
+        self.animate(220);
+    }
+
+    /// End the job's processes. Returns how many really ended; the toast says what happened, honestly.
+    pub fn run_end(&mut self, job: EndJob) -> usize {
         let me = std::process::id();
         let mut fails = 0;
+        let mut blocked = 0;
         for p in &job.pids {
             if *p == me || *p <= 4 {
-                // the window never ends itself or the kernel
+                // the window never ends itself or the kernel (ask_end already took them out)
                 fails += 1;
                 continue;
             }
             if self.test && !test_owned(&self.procs, *p) {
                 // test mode: only processes started by the tester's own scripts may be ended
                 fails += 1;
+                blocked += 1;
                 continue;
             }
             if procs::terminate(*p).is_err() {
@@ -1230,27 +1600,42 @@ impl App {
             }
             self.ctl.reload_startup.store(true, Relaxed);
         }
+        let n = job.pids.len();
+        let ended = n - fails;
         self.last_action = format!("end {:?} fails={fails}", job.pids);
-        if fails == job.pids.len() && fails > 0 {
-            self.toast_msg(&format!("Could not end {} (needs admin?)", job.label), false);
+        let why = if blocked == fails && blocked > 0 {
+            "test mode: not ended"
+        } else if self.elevated {
+            "access denied"
+        } else {
+            "needs administrator"
+        };
+        if ended == 0 && n > 0 {
+            self.toast_msg(&format!("Could not end {} ({why})", job.label), false);
+        } else if fails > 0 {
+            let rest = if why == "needs administrator" { "need administrator" } else { why };
+            self.toast_msg(&format!("Ended {ended} of {n} processes of {}; the rest {rest}", job.label), false);
         } else {
             let text = if job.mem >= 1 << 20 { format!("{} ended · freed {}", job.label, model::fmt_mem(job.mem)) } else { format!("{} ended", job.label) };
             self.toast = Some(Toast { text, code: String::new(), link: job.relaunch.clone().map(|(c, d)| ("Restart".to_string(), ToastAct::Relaunch(c, d))), ok: true, at: Instant::now(), secs: 8 });
             self.animate(220);
         }
-        if matches!(self.sel, Some(Sel::Child(_))) || job.count > 0 {
+        if ended > 0 && (matches!(self.sel, Some(Sel::Child(_))) || job.count > 0) {
             self.sel = None;
         }
-        if let Some(p) = &self.pane
+        if ended > 0
+            && let Some(p) = &self.pane
             && p.kind == PaneKind::Details
         {
             self.pane = None;
         }
         self.ctl.now.store(true, Relaxed);
         self.invalidate();
+        ended
     }
 
-    /// Restart: end the selection's tree and start its root again with the same command line and folder.
+    /// Restart: end the selection's tree and start its root again with the same command line and folder. It asks
+    /// first like End task does (an app with unsaved work, or more than one process).
     pub fn restart_selected(&mut self) {
         let Some(g) = self.sel_group().cloned() else { return };
         let pid = self.sel_pid().unwrap_or(g.root());
@@ -1258,17 +1643,51 @@ impl App {
             self.toast_msg("Windows processes are not restarted here", false);
             return;
         }
+        let Some(mut job) = self.end_job(matches!(self.sel, Some(Sel::Child(_)))) else { return };
+        if job.pids.iter().filter_map(|p| self.proc(*p)).any(|p| procs::is_critical_name(&p.name)) {
+            self.toast_msg("Windows needs this process; it is not restarted here", false);
+            return;
+        }
+        if job.pids.contains(&std::process::id()) {
+            self.toast_msg("Rust Task Manager does not restart itself", false);
+            return;
+        }
         let Some((cmd, dir)) = relaunch_info(pid) else {
             self.toast_msg("Cannot read its command line (run as administrator?)", false);
             return;
         };
-        let Some(mut job) = self.end_job(matches!(self.sel, Some(Sel::Child(_)))) else { return };
         job.relaunch = None;
+        let risky = (g.kind == procs::Kind::App || g.hung) && self.prefs.ask_end;
+        if risky || job.count > 1 {
+            let many = if job.count > 1 { format!("All {} of its processes end; only the main one starts again.", job.count) } else { String::new() };
+            let body = if risky { format!("{} may have work you have not saved. It will be lost. {many}", job.label).trim_end().to_string() } else { format!("{} runs as {} processes. {many}", job.label, job.count) };
+            self.dialog = Some(Dialog { title: format!("Restart {}?", job.label), body, job, at: Instant::now(), danger: false, restart: Some((cmd, dir)), cancel: if g.hung { "Wait" } else { "Cancel" } });
+            self.dlg_focus = 0;
+            self.animate(220);
+        } else {
+            self.finish_restart(job, cmd, dir);
+        }
+    }
+
+    fn finish_restart(&mut self, job: EndJob, cmd: String, dir: String) {
         let label = job.label.clone();
-        self.run_end(job);
+        if self.run_end(job) == 0 {
+            return;
+        }
         let ok = self.test_or_spawn(&cmd, &dir, 300);
         self.toast = Some(Toast { text: if ok { format!("{label} restarted") } else { format!("Could not start {label} again") }, code: String::new(), link: None, ok, at: Instant::now(), secs: 4 });
         self.animate(220);
+    }
+
+    /// The dialog's action button (End / End anyway / Restart).
+    pub fn dialog_confirm(&mut self) {
+        let Some(d) = self.dialog.take() else { return };
+        match d.restart {
+            Some((cmd, dir)) => self.finish_restart(d.job, cmd, dir),
+            None => {
+                self.run_end(d.job);
+            }
+        }
     }
 
     /// Start a command again (after a short wait so the old process is gone).
@@ -1314,10 +1733,29 @@ impl App {
         self.copy(&s);
     }
 
+    /// Start an elevated copy of the window (Windows asks with UAC) and close this one when it starts.
+    pub fn run_as_admin(&mut self) {
+        if self.test {
+            self.last_action = "run as administrator (test mode, not started)".into();
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let exe = wide(&exe.display().to_string());
+        let r = unsafe { ShellExecuteW(Some(self.hwnd), w!("runas"), PCWSTR(exe.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+        if r.0 as isize > 32 {
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        } else {
+            self.toast_msg("Not started (the administrator prompt was declined)", false);
+        }
+    }
+
     pub fn open_location(&mut self) {
         let Some(g) = self.sel_group() else { return };
         let path = self.sel_pid().and_then(|p| self.proc(p)).map(|p| p.meta.path.clone()).filter(|p| !p.is_empty()).unwrap_or(g.path.clone());
         if path.is_empty() {
+            self.toast_msg("Its file location can be read only as administrator", false);
             return;
         }
         if self.test {
@@ -1334,6 +1772,7 @@ impl App {
         let Some(g) = self.sel_group() else { return };
         let path = g.path.clone();
         if path.is_empty() {
+            self.toast_msg("Its file can be read only as administrator", false);
             return;
         }
         if self.test {
@@ -1434,7 +1873,8 @@ impl App {
         let Some(it) = go.get(i) else { return };
         let path = it.pids.first().and_then(|p| self.proc(*p)).map(|p| p.meta.path.clone()).unwrap_or_default();
         let job = EndJob { pids: it.pids.clone(), label: it.label.clone(), mem: it.mem, icon: path, count: it.pids.len(), relaunch: it.pids.first().and_then(|p| relaunch_info(*p)), disable: if disable { it.startup_entry.clone() } else { None } };
-        self.run_end(job);
+        // more than one process asks first, like End task
+        self.ask_end(job, None);
         self.pane = Some(Pane { kind: PaneKind::Free, key: String::new(), pid: 0, open: [false; 3], info: PaneInfo::default(), loading: false, ai_loading: false, keep_open: false, at: Instant::now() - Duration::from_secs(1) });
     }
 
@@ -1447,7 +1887,8 @@ impl App {
         let pids: Vec<u32> = go.iter().flat_map(|i| i.pids.clone()).collect();
         let n = go.len();
         let job = EndJob { pids, label: format!("{n} apps"), mem, icon: String::new(), count: n, relaunch: None, disable: None };
-        self.run_end(job);
+        // ends several apps at once: always asks (ask_end confirms more than one process)
+        self.ask_end(job, None);
         self.pane = Some(Pane { kind: PaneKind::Free, key: String::new(), pid: 0, open: [false; 3], info: PaneInfo::default(), loading: false, ai_loading: false, keep_open: false, at: Instant::now() - Duration::from_secs(1) });
     }
 
@@ -1458,7 +1899,7 @@ impl App {
             self.toast_msg(&format!("{} {} at startup (test mode: not changed)", e.name, if e.enabled { "off" } else { "on" }), true);
             return;
         }
-        match crate::startup::set_enabled(&e.name, !e.enabled) {
+        match crate::startup::set_enabled_in(&e.name, Some(e.source), !e.enabled) {
             Ok(_) => {
                 let mut v = (*self.startup).clone();
                 v[i].enabled = !e.enabled;
@@ -1586,6 +2027,7 @@ impl App {
     }
 
     pub fn set_page(&mut self, p: u8) {
+        self.nav_peek = false;
         if self.page != p {
             self.page = p;
             self.menu = None;
@@ -1626,7 +2068,7 @@ impl App {
         let p = &self.prefs;
         if (old.backdrop, old.corners, old.font, old.density) != (p.backdrop, p.corners, p.font, p.density) {
             self.apply_look();
-        } else if (old.accent, old.transp) != (p.accent, p.transp) {
+        } else if (old.accent, old.transp, old.desktop, old.strength) != (p.accent, p.transp, p.desktop, p.strength) {
             self.apply_theme();
         }
         if old.sort != self.prefs.sort
@@ -1663,7 +2105,28 @@ impl App {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32, double: bool) {
-        let h = self.hit_at(x, y);
+        let mut h = self.hit_at(x, y);
+        // a row index from the last paint -> the same row now
+        if let Hit::Row(i) | Hit::Chevron(i) = h {
+            h = match self.row_now(i) {
+                Some(j) if matches!(h, Hit::Row(_)) => Hit::Row(j),
+                Some(j) => Hit::Chevron(j),
+                None => Hit::None,
+            };
+        }
+        self.last_input = Instant::now();
+        // light dismiss: a click outside an open flyout or the sidebar opened over the page only closes it
+        let in_nav = matches!(h, Hit::Tab(_) | Hit::NavToggle | Hit::Block) && x < self.nav_w + 1.0;
+        if self.nav_peek && !in_nav {
+            self.nav_peek = false;
+            self.invalidate();
+            return;
+        }
+        if self.flyout.is_some() && !matches!(h, Hit::Tile(_) | Hit::Block | Hit::FlyFree) {
+            self.flyout = None;
+            self.invalidate();
+            return;
+        }
         self.pressed = h;
         self.animate(motion::FAST as u64);
         self.key_focus = h == Hit::KeyField || (self.key_focus && matches!(h, Hit::KeySave | Hit::KeyTest));
@@ -1674,8 +2137,16 @@ impl App {
         if h == Hit::Hue {
             self.hue_at(x);
         }
-        self.search_focus = h == Hit::Search || h == Hit::SearchClear || (self.search_focus && self.searching() && !matches!(h, Hit::Tab(_) | Hit::Settings));
+        // a click on a row (or anything in the list) moves the keyboard to the list
+        self.search_focus = h == Hit::Search || h == Hit::SearchClear || (self.search_focus && self.searching() && !matches!(h, Hit::Tab(_) | Hit::Settings | Hit::Row(_) | Hit::Chevron(_) | Hit::StRow(_) | Hit::Header(_)));
+        self.focus = None;
         match h {
+            Hit::Row(i) if matches!(self.rows.get(i).map(|r| r.k), Some(RowK::More(..))) => {
+                if let Some(RowK::More(k, _)) = self.rows.get(i).map(|r| r.k) {
+                    self.toggle_section(k);
+                }
+            }
+            Hit::Row(i) if matches!(self.rows.get(i).map(|r| r.k), Some(RowK::Kind(..))) => {}
             Hit::Row(i) | Hit::Chevron(i) => {
                 if h == Hit::Chevron(i) {
                     self.toggle_row(i);
@@ -1747,10 +2218,7 @@ impl App {
         }
         if self.dialog.is_some() {
             match h {
-                Hit::DlgEnd => {
-                    let d = self.dialog.take().unwrap();
-                    self.run_end(d.job);
-                }
+                Hit::DlgEnd => self.dialog_confirm(),
                 Hit::DlgWait => self.dialog = None,
                 _ => {}
             }
@@ -1808,13 +2276,40 @@ impl App {
                 self.animate(180);
             }
             Hit::Header(c) => {
+                // first click sorts by the column, the second reverses it, the third goes back to Impact
                 let s = [SortKey::Name, SortKey::Cpu, SortKey::Mem, SortKey::Disk, SortKey::Net, SortKey::Gpu][c as usize];
-                self.set_sort(if self.sort == s { SortKey::Impact } else { s });
+                if self.sort == s && !self.sort_rev {
+                    self.sort_rev = true;
+                    self.set_sort(s);
+                } else if self.sort == s {
+                    self.sort_rev = false;
+                    self.set_sort(SortKey::Impact);
+                } else {
+                    self.sort_rev = false;
+                    self.set_sort(s);
+                }
             }
             Hit::SrStartupToggle(i) | Hit::StToggle(i) => self.toggle_startup(i),
             Hit::SrServiceBtn(i) => self.service_action(i),
             Hit::PaneClose => self.pane = None,
             Hit::PaneEnd => self.end_selected(false),
+            Hit::PerfItem(i) => {
+                if let Some(it) = self.perf_items().get(i as usize) {
+                    self.perf_sel = it.key.clone();
+                    self.set_scroll(2, 0.0);
+                }
+            }
+            Hit::PerfTop(i) => {
+                // show that process in the list
+                if let Some(key) = self.perf_top_keys.get(i as usize).cloned() {
+                    self.query.clear();
+                    self.sel = Some(Sel::Group(key));
+                    self.set_page(0);
+                    self.build_rows();
+                    self.want_scroll_sel = true;
+                }
+            }
+            Hit::RunAdmin => self.run_as_admin(),
             Hit::PaneRestart => self.restart_selected(),
             Hit::PaneSec(i) => {
                 if let Some(p) = self.pane.as_mut() {
@@ -1860,6 +2355,7 @@ impl App {
                 6 => self.set_pref(|p| p.font = i),
                 7 => self.set_pref(|p| p.corners = i),
                 8 => self.set_pref(|p| p.pane = i),
+                9 => self.set_pref(|p| p.strength = i.min(2)),
                 _ => {
                     let l = if i == 1 { "fa" } else { "en" };
                     if !self.test {
@@ -1874,6 +2370,10 @@ impl App {
                 2 => self.set_pref(|p| p.show_pid = !p.show_pid),
                 4 => self.set_pref(|p| p.tiles = !p.tiles),
                 5 => self.set_pref(|p| p.chips = !p.chips),
+                6 => {
+                    self.set_pref(|p| p.group = !p.group);
+                    self.build_rows();
+                }
                 _ => {
                     let on = !self.ai_on;
                     self.set_ai(on)
@@ -1891,12 +2391,23 @@ impl App {
             Hit::Accent(i) => {
                 if i == 0 {
                     self.custom_open = false;
-                    self.set_pref(|p| p.accent = None);
+                    self.set_pref(|p| {
+                        p.accent = None;
+                        p.desktop = false
+                    });
+                } else if i == 10 {
+                    // Follow desktop: the wallpaper / DWM colour, refreshed when Windows changes it
+                    self.custom_open = false;
+                    self.set_pref(|p| p.desktop = true);
                 } else if let Some((_, rgb)) = theme::PRESETS.get(i as usize - 1) {
                     self.custom_open = false;
                     let rgb = *rgb;
-                    self.set_pref(|p| p.accent = Some(rgb));
+                    self.set_pref(|p| {
+                        p.accent = Some(rgb);
+                        p.desktop = false
+                    });
                 } else {
+                    self.set_pref(|p| p.desktop = false);
                     self.custom_open = !self.custom_open;
                     if self.custom_open {
                         let cur = self.prefs.accent.unwrap_or(0x0078D4);
@@ -1919,6 +2430,15 @@ impl App {
                 3 => p.col_net = !p.col_net,
                 _ => p.col_gpu = !p.col_gpu,
             }),
+            Hit::NavToggle => {
+                if self.nav_auto() {
+                    // small window: open / close the sidebar over the page (the saved choice is for wider windows)
+                    self.nav_peek = !self.nav_peek;
+                } else {
+                    let open = !self.prefs.nav_open;
+                    self.set_pref(|p| p.nav_open = open);
+                }
+            }
             Hit::DefSort => {
                 self.menu = Some(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now() });
             }
@@ -1939,6 +2459,7 @@ impl App {
         match m.kind {
             MenuKind::Sort => {
                 if let Some(s) = SortKey::MENU.get(i as usize) {
+                    self.sort_rev = false;
                     self.set_sort(*s);
                 }
             }
@@ -1979,14 +2500,14 @@ impl App {
         let pids: Vec<u32> = self.procs.iter().filter(|p| p.name.to_lowercase() == exe).map(|p| p.pid).collect();
         let mem = self.procs.iter().filter(|p| p.name.to_lowercase() == exe).map(|p| p.mem).sum();
         let job = EndJob { count: pids.len(), pids, label: g.exe.clone(), mem, icon: g.path.clone(), relaunch: None, disable: None };
-        self.run_end(job);
+        self.ask_end(job, None);
     }
 
     fn wheel(&mut self, x: f32, y: f32, d: f32) {
         self.menu = None;
         let k = if self.page == 1 {
             1
-        } else if self.page == 2 {
+        } else if self.page == 2 || self.page == 3 {
             2
         } else if self.pane.is_some() && self.pane_rect.has(x, y) {
             3
@@ -1997,7 +2518,65 @@ impl App {
         self.invalidate();
     }
 
+    /// The caret position in the search text (chars).
+    pub fn qcaret(&self) -> usize {
+        self.caret.min(self.query.chars().count())
+    }
+
+    fn q_byte(&self, c: usize) -> usize {
+        self.query.char_indices().nth(c).map(|(i, _)| i).unwrap_or(self.query.len())
+    }
+
+    /// Insert text at the caret (replaces everything after Ctrl+A).
+    fn q_insert(&mut self, txt: &str) {
+        if self.q_all {
+            self.query.clear();
+            self.q_all = false;
+        }
+        let c = self.qcaret();
+        let b = self.q_byte(c);
+        self.query.insert_str(b, txt);
+        self.caret = c + txt.chars().count();
+    }
+
+    /// Delete in the search text: `back` = Backspace (before the caret) else Delete; `word` = Ctrl (a whole word).
+    fn q_delete(&mut self, back: bool, word: bool) {
+        if self.q_all {
+            self.query.clear();
+            self.q_all = false;
+            self.caret = 0;
+            return;
+        }
+        let chars: Vec<char> = self.query.chars().collect();
+        let c = self.qcaret();
+        let (a, b) = if back {
+            let mut a = c.saturating_sub(1);
+            if word {
+                while a > 0 && chars[a - 1] == ' ' {
+                    a -= 1;
+                }
+                while a > 0 && chars[a - 1] != ' ' {
+                    a -= 1;
+                }
+            }
+            (a, c)
+        } else {
+            let mut b = (c + 1).min(chars.len());
+            if word {
+                while b < chars.len() && chars[b] != ' ' {
+                    b += 1;
+                }
+            }
+            (c, b)
+        };
+        if a < b {
+            self.query = chars[..a].iter().chain(chars[b..].iter()).collect();
+            self.caret = a;
+        }
+    }
+
     fn key(&mut self, vk: u16) -> bool {
+        self.last_input = Instant::now();
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
@@ -2040,11 +2619,65 @@ impl App {
                     self.sel = None;
                 }
             }
-            VK_RETURN if self.dialog.is_some() => self.dialog = None,
+            // dialog keys: Tab moves between its two buttons, Enter presses the focused one
+            VK_TAB if self.dialog.is_some() => self.dlg_focus ^= 1,
+            // Tab / Shift+Tab: the next / previous control, in the order they are drawn (with a focus ring)
+            VK_TAB => self.tab_focus(shift),
+            // Enter or Space presses the focused control (the list and the search box keep their own keys)
+            VK_RETURN | VK_SPACE if self.focus.map(|f| !matches!(f, Hit::List | Hit::Search | Hit::KeyField | Hit::HexField)).unwrap_or(false) => {
+                let f = self.focus.unwrap();
+                if VIRTUAL_KEY(vk) == VK_SPACE {
+                    self.eat_char = true;
+                }
+                if let Some(r) = self.hits.iter().rev().find(|(_, h)| *h == f).map(|(r, _)| *r) {
+                    self.click(f, r.cx(), r.cy());
+                }
+            }
+            VK_RETURN if self.dialog.is_some() => {
+                if self.dlg_focus == 0 {
+                    self.dialog_confirm();
+                } else {
+                    self.dialog = None;
+                }
+            }
+            // each page moves its own selection: Startup apps its entries, Settings scrolls, Processes its rows
+            VK_DOWN | VK_UP if self.page == 1 => self.move_startup(if VIRTUAL_KEY(vk) == VK_DOWN { 1 } else { -1 }),
+            VK_DOWN | VK_UP if self.page == 2 => self.scroll_by(2, if VIRTUAL_KEY(vk) == VK_DOWN { 48.0 } else { -48.0 }),
+            VK_DOWN | VK_UP if self.page == 3 => self.perf_move(if VIRTUAL_KEY(vk) == VK_DOWN { 1 } else { -1 }),
+            VK_RETURN | VK_F1 if self.page != 0 && !alt => {}
             VK_DOWN => self.move_sel(1),
             VK_UP => self.move_sel(-1),
             VK_PRIOR => self.scroll_by(0, -(self.list_rect.h - self.row_h)),
             VK_NEXT => self.scroll_by(0, self.list_rect.h - self.row_h),
+            // the search box has focus: editing keys go to its text, never to the list
+            VK_LEFT if self.search_focus => {
+                self.caret = self.qcaret().saturating_sub(1);
+                self.q_all = false;
+            }
+            VK_RIGHT if self.search_focus => {
+                self.caret = (self.qcaret() + 1).min(self.query.chars().count());
+                self.q_all = false;
+            }
+            VK_HOME if self.search_focus => {
+                self.caret = 0;
+                self.q_all = false;
+            }
+            VK_END if self.search_focus => {
+                self.caret = usize::MAX;
+                self.q_all = false;
+            }
+            VK_A if ctrl && self.search_focus => self.q_all = !self.query.is_empty(),
+            VK_DELETE if self.search_focus => {
+                self.q_delete(false, ctrl);
+                self.set_scroll(0, 0.0);
+                self.build_rows();
+            }
+            VK_DELETE if self.key_focus || self.hex_focus => {}
+            // Menu key / Shift+F10: the row menu for the selection, next to its row
+            VK_APPS if self.page == 0 => self.menu_for_sel(),
+            VK_F10 if shift && self.page == 0 => self.menu_for_sel(),
+            VK_HOME if self.page == 0 => self.sel_edge(true),
+            VK_END if self.page == 0 => self.sel_edge(false),
             VK_RIGHT if !self.search_focus => {
                 if let Some(Sel::Group(k)) = self.sel.clone() {
                     self.expanded.insert(k);
@@ -2063,14 +2696,13 @@ impl App {
             VK_F5 => self.ctl.now.store(true, Relaxed),
             VK_F if ctrl => self.search_focus = true,
             VK_OEM_COMMA if ctrl => self.set_page(2),
+            VK_1 if ctrl => self.set_page(0),
+            VK_2 if ctrl => self.set_page(3),
+            VK_3 if ctrl => self.set_page(1),
+            VK_4 if ctrl => self.set_page(2),
             VK_C if ctrl && shift => self.copy_command(),
             VK_BACK => {
-                if ctrl {
-                    let t = self.query.trim_end().rfind(' ').map(|i| i + 1).unwrap_or(0);
-                    self.query.truncate(t);
-                } else {
-                    self.query.pop();
-                }
+                self.q_delete(true, ctrl);
                 self.set_scroll(0, 0.0);
                 self.build_rows();
             }
@@ -2091,7 +2723,8 @@ impl App {
             } else if ch == '\u{16}'
                 && let Some(s) = get_clipboard(self.hwnd)
             {
-                self.query.push_str(s.lines().next().unwrap_or("").trim());
+                self.q_insert(s.lines().next().unwrap_or("").trim());
+                self.search_focus = true;
                 self.build_rows();
                 self.invalidate();
             }
@@ -2119,10 +2752,16 @@ impl App {
             return;
         }
         // typing anywhere searches
-        self.query.push(ch);
+        if !self.search_focus {
+            self.caret = usize::MAX;
+        }
+        self.q_insert(&ch.to_string());
         self.search_focus = true;
         self.set_scroll(0, 0.0);
-        self.page = 0;
+        // the Startup apps page filters its own list; other pages search processes
+        if self.page != 1 {
+            self.page = 0;
+        }
         self.flyout = None;
         self.build_rows();
         self.invalidate();
@@ -2147,6 +2786,8 @@ impl App {
                     json!({"row": "child", "pid": m.pid, "name": m.name, "sub": m.sub})
                 }
                 RowK::PinSep => json!({"row": "pinned-separator"}),
+                RowK::Kind(k, n) => json!({"row": "section", "name": SECTION_NAMES[k as usize % 3], "count": n}),
+                RowK::More(k, n) => json!({"row": if n > 0 { "show-all" } else { "show-fewer" }, "section": k, "count": n}),
                 RowK::Sec(i, n) => {
                     let name = ["Processes", "Startup apps", "Services"][i as usize];
                     json!({"row": "section", "name": name, "count": n})
@@ -2185,6 +2826,7 @@ impl App {
             "full_data_ms": self.full_data_ms,
             "test_mode": self.test,
             "offscreen": self.offscreen,
+            "focus": self.focus.map(|f| format!("{f:?}")),
             "active": self.is_active(),
             "caption": {"hover": format!("{:?}", self.nc_hover), "down": format!("{:?}", self.nc_down)},
             "sysmenu": SYSMENU_STATE.lock().unwrap().clone(),
@@ -2247,6 +2889,43 @@ impl App {
                         _ => return err("nc hover|down|leave min|max|close"),
                     }
                 }
+                "hit" => {
+                    // what a click at client DIP x y would hit (from the last frame)
+                    let x: f32 = a1.parse().unwrap_or(0.0);
+                    let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    return json!({"ok": true, "hit": format!("{:?}", self.hit_at(x, y))}).to_string();
+                }
+                "perf" => {
+                    // perf cpu|mem|disk|net|gpu [n]: show that resource on the Performance page (n-th of its kind)
+                    let items = self.perf_items();
+                    let n: usize = parts.get(2).and_then(|x| x.parse().ok()).unwrap_or(0);
+                    let Some(it) = items.iter().filter(|i| i.key.starts_with(a1)).nth(n) else { return err("perf cpu|mem|disk|net|gpu [n]") };
+                    self.perf_sel = it.key.clone();
+                    self.set_page(3);
+                    self.set_scroll(2, 0.0);
+                }
+                "order" => {
+                    // the keys of all list rows, in order (to check that the list stays calm)
+                    let keys: Vec<String> = self.rows.iter().filter_map(|r| match r.k {
+                        RowK::Group(gi) => self.groups.get(gi).map(|g| g.key.clone()),
+                        RowK::Child(gi, mi) => self.groups.get(gi).and_then(|g| g.members.get(mi)).map(|m| format!("  {}", m.pid)),
+                        _ => None,
+                    }).collect();
+                    let all: Vec<String> = self.groups.iter().map(|g| g.key.clone()).collect();
+                    let vals: serde_json::Map<String, serde_json::Value> = self.smooth.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                    return json!({"ok": true, "rows": keys, "groups": all, "smooth": vals}).to_string();
+                }
+                "hits" => {
+                    // the clickable areas of the last frame whose name contains <filter>, with their centres
+                    let list: Vec<_> = self
+                        .hits
+                        .iter()
+                        .map(|(r, h)| (format!("{h:?}"), r))
+                        .filter(|(n, _)| n.contains(a1))
+                        .map(|(n, r)| json!({"hit": n, "x": r.x + r.w / 2.0, "y": r.y + r.h / 2.0, "w": r.w, "h": r.h}))
+                        .collect();
+                    return json!({"ok": true, "hits": list}).to_string();
+                }
                 "nchit" => {
                     // what WM_NCHITTEST answers at client DIP x y
                     let x: f32 = a1.parse().unwrap_or(0.0);
@@ -2292,6 +2971,31 @@ impl App {
                     };
                     let _ = PostMessageW(Some(self.hwnd), WM_SYSCOMMAND, WPARAM(sc as usize), LPARAM(0));
                 }
+                "section" => {
+                    // section apps|background|windows open|close (Show all / Show fewer)
+                    let Some(k) = ["apps", "background", "windows"].iter().position(|x| *x == a1) else { return err("section apps|background|windows open|close") };
+                    let want = parts.get(2) == Some(&"open");
+                    if self.prefs.sec_open[k] != want {
+                        self.toggle_section(k as u8);
+                    }
+                }
+                "mouse" => {
+                    // real mouse messages to this window only: mouse <x> <y> [left|right|move|down|up] (DIPs)
+                    let x: f32 = a1.parse().unwrap_or(0.0);
+                    let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    let sc = self.gfx.scale();
+                    let lp = LPARAM((((y * sc) as i32 as u32 as isize) << 16) | ((x * sc) as i32 as u16 as isize));
+                    let msgs: &[(u32, usize)] = match parts.get(3).copied().unwrap_or("left") {
+                        "right" => &[(WM_MOUSEMOVE, 0), (WM_RBUTTONDOWN, 2), (WM_RBUTTONUP, 0)],
+                        "move" => &[(WM_MOUSEMOVE, 0)],
+                        "down" => &[(WM_MOUSEMOVE, 0), (WM_LBUTTONDOWN, 1)],
+                        "up" => &[(WM_LBUTTONUP, 0)],
+                        _ => &[(WM_MOUSEMOVE, 0), (WM_LBUTTONDOWN, 1), (WM_LBUTTONUP, 0)],
+                    };
+                    for (m, w) in msgs {
+                        let _ = PostMessageW(Some(self.hwnd), *m, WPARAM(*w), lp);
+                    }
+                }
                 "glyphs" => {
                     let (font, missing) = self.gfx.icon_check(&GLYPHS_USED);
                     return json!({"ok": true, "icon_font": font, "checked": GLYPHS_USED.len(), "missing": missing.iter().map(|c| format!("{c:X}")).collect::<Vec<_>>()}).to_string();
@@ -2300,18 +3004,19 @@ impl App {
                     let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
                 "state" => return self.state_json().to_string(),
-                "shot" => {
+                "shot" | "shot-alpha" => {
                     if arg.is_empty() {
                         return err("shot needs a .bmp path");
                     }
                     self.take_data();
-                    return match self.shot(&arg) {
+                    return match self.shot(&arg, cmd == "shot-alpha") {
                         Ok(()) => json!({"ok": true, "file": arg}).to_string(),
                         Err(e) => err(&e),
                     };
                 }
                 "search" => {
                     self.query = arg.clone();
+                    self.caret = usize::MAX;
                     self.search_focus = !arg.is_empty();
                     self.page = 0;
                     self.set_scroll(0, 0.0);
@@ -2340,6 +3045,7 @@ impl App {
                 "tab" => match a1 {
                     "processes" => self.set_page(0),
                     "startup" => self.set_page(1),
+                    "performance" => self.set_page(3),
                     "settings" => self.set_page(2),
                     _ => return err("tab processes|startup|settings"),
                 },
@@ -2382,6 +3088,9 @@ impl App {
                     let x: f32 = a1.parse().unwrap_or(0.0);
                     let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
                     self.hover = self.hit_at(x, y);
+                    // a resting pointer there (shows its tooltip at once)
+                    self.mouse = (x, y);
+                    self.rest_at = Instant::now() - Duration::from_secs(1);
                 }
                 "click" => {
                     let x: f32 = a1.parse().unwrap_or(-1.0);
@@ -2390,7 +3099,10 @@ impl App {
                     self.mouse_up(x, y);
                 }
                 "sort" => match SortKey::parse(a1) {
-                    Some(s) => self.set_sort(s),
+                    Some(s) => {
+                        self.sort_rev = false;
+                        self.set_sort(s)
+                    }
                     None => return err("sort impact|cpu|memory|disk|network|gpu|name"),
                 },
                 "theme" => {
@@ -2427,9 +3139,13 @@ impl App {
                     self.end_selected(a1 == "process");
                 }
                 "confirm" => {
-                    let Some(d) = self.dialog.take() else { return err("no dialog is open") };
+                    if self.dialog.is_none() {
+                        return err("no dialog is open");
+                    }
                     if a1 == "end" {
-                        self.run_end(d.job);
+                        self.dialog_confirm();
+                    } else {
+                        self.dialog = None;
                     }
                 }
                 "restart" => {
@@ -2497,6 +3213,7 @@ impl App {
                             let Some(i) = ["off", "low", "medium", "high"].iter().position(|x| *x == v) else { return err("set transparency off|low|medium|high") };
                             self.set_pref(|p| p.transp = i as u8)
                         }
+                        "accent" if v == "desktop" => self.set_pref(|p| p.desktop = true),
                         "accent" => {
                             let acc = if v == "system" {
                                 None
@@ -2511,7 +3228,10 @@ impl App {
                             if let Some(a) = acc {
                                 self.hex_buf = format!("#{a:06X}");
                             }
-                            self.set_pref(|p| p.accent = acc)
+                            self.set_pref(|p| {
+                                p.accent = acc;
+                                p.desktop = false
+                            })
                         }
                         "density" => self.set_pref(|p| p.density = (v != "compact") as u8),
                         "text" => {
@@ -2525,6 +3245,15 @@ impl App {
                         }
                         "summary" => self.set_pref(|p| p.tiles = b),
                         "chips" => self.set_pref(|p| p.chips = b),
+                        "nav" => self.set_pref(|p| p.nav_open = b),
+                        "strength" => {
+                            let Some(i) = ["subtle", "medium", "strong"].iter().position(|x| *x == v) else { return err("set strength subtle|medium|strong") };
+                            self.set_pref(|p| p.strength = i as u8)
+                        }
+                        "group" => {
+                            self.set_pref(|p| p.group = b);
+                            self.build_rows();
+                        }
                         "col" => {
                             let on = parts.get(3).map(|x| *x == "on").unwrap_or(true);
                             match v {
@@ -2578,7 +3307,17 @@ impl App {
                         "del" | "delete" => VK_DELETE,
                         "right" => VK_RIGHT,
                         "left" => VK_LEFT,
-                        _ => return err("key esc|down|up|enter|f1|del|right|left"),
+                        "home" => VK_HOME,
+                        "end" => VK_END,
+                        "back" | "backspace" => VK_BACK,
+                        "apps" | "menu" => VK_APPS,
+                        "tab" => VK_TAB,
+                        "space" => VK_SPACE,
+                        "ctrl+a" => {
+                            self.q_all = self.search_focus && !self.query.is_empty();
+                            return json!({"ok": true}).to_string();
+                        }
+                        _ => return err("key esc|down|up|enter|f1|del|right|left|home|end|back|apps|ctrl+a"),
                     };
                     self.key(vk.0);
                 }
@@ -2737,13 +3476,17 @@ fn lparam_xy(lp: LPARAM) -> (i32, i32) {
     ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32)
 }
 
+/// Section names of the grouped list.
+pub const SECTION_NAMES: [&str; 3] = ["Apps", "Background processes", "Windows processes"];
+
 /// Caption buttons: Windows 11 size (46 x 32 DIPs) at the top right.
 pub const CAP_W: f32 = 46.0;
 pub const CAP_H: f32 = 32.0;
 
 /// Glyphs the window draws from the icon font (checked by `wtm gui glyphs`).
-pub const GLYPHS_USED: [u32; 24] = [
-    0xE921, 0xE922, 0xE923, 0xE8BB, 0xE713, 0xE721, 0xE711, 0xE72C, 0xE946, 0xE712, 0xEA99, 0xE8CB, 0xE70D, 0xE76C, 0xE790, 0xE771, 0xE81E, 0xE8D2, 0xE8A9, 0xE739, 0xE89F, 0xE895, 0xE9D2, 0xE70F,
+pub const GLYPHS_USED: [u32; 27] = [
+    0xE8A0, 0xE7E8,
+    0xE921, 0xE922, 0xE923, 0xE8BB, 0xE713, 0xE721, 0xE711, 0xE72C, 0xE946, 0xE712, 0xEA99, 0xE8CB, 0xE70D, 0xE76C, 0xE790, 0xE771, 0xE81E, 0xE8D2, 0xE8A9, 0xE739, 0xE89F, 0xE895, 0xE9D2, 0xE70F, 0xE8FD,
 ];
 
 /// Last window menu shown: its items and whether it is open (for `wtm gui state`).
@@ -3014,6 +3757,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_MOUSEMOVE => {
                 let (x, y) = lparam_xy(lp);
                 let (x, y) = (x as f32 / s, y as f32 / s);
+                // tooltips: a move hides the tip, a rest of 500 ms shows it
+                if (x - app.mouse.0).abs() + (y - app.mouse.1).abs() > 2.0 {
+                    let was = app.rest_at.elapsed() >= Duration::from_millis(500) && app.tips.iter().any(|(r, _)| r.has(app.mouse.0, app.mouse.1));
+                    app.mouse = (x, y);
+                    app.rest_at = Instant::now();
+                    SetTimer(Some(hwnd), TIMER_TIP, 520, None);
+                    if was {
+                        app.invalidate();
+                    }
+                }
                 if let Some((k, y0, s0)) = app.drag_scroll {
                     let (view, ch) = (app.view_h[k as usize], app.content_h[k as usize]);
                     let th = (view * view / ch.max(1.0)).max(30.0);
@@ -3028,6 +3781,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     app.invalidate();
                     return LRESULT(0);
                 }
+                app.pointer_in_list = app.page == 0 && app.list_rect.has(x, y);
                 let h = app.hit_at(x, y);
                 if h != app.hover {
                     app.hover = h;
@@ -3037,8 +3791,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+                // I-beam over text fields, a hand over links, the arrow elsewhere
+                let h = app.hit_at(app.mouse.0, app.mouse.1);
+                let more = matches!(h, Hit::Row(i) if matches!(app.rows.get(i).map(|r| r.k), Some(RowK::More(..))));
+                let id = match h {
+                    Hit::Search | Hit::KeyField | Hit::HexField => IDC_IBEAM,
+                    Hit::KeyLink | Hit::ToastLink => IDC_HAND,
+                    _ if more => IDC_HAND,
+                    _ => IDC_ARROW,
+                };
+                SetCursor(LoadCursorW(None, id).ok());
+                LRESULT(1)
+            }
             WM_MOUSELEAVE => {
+                app.mouse = (-1.0, -1.0);
                 app.hover = Hit::None;
+                app.pointer_in_list = false;
                 app.invalidate();
                 LRESULT(0)
             }
@@ -3057,7 +3826,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let (x, y) = lparam_xy(lp);
                 let (x, y) = (x as f32 / s, y as f32 / s);
                 app.menu = None;
+                app.last_input = Instant::now();
                 if let Hit::Row(i) | Hit::Chevron(i) = app.hit_at(x, y)
+                    && let Some(i) = app.row_now(i)
                     && matches!(app.rows.get(i).map(|r| r.k), Some(RowK::Group(_)) | Some(RowK::Child(..)))
                 {
                     app.select_row(i);
@@ -3089,7 +3860,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_CHAR => {
-                if let Some(c) = char::from_u32(wp.0 as u32) {
+                // UTF-16 surrogate pairs come as two messages: keep the high half until the low one arrives
+                let u = wp.0 as u32;
+                if std::mem::take(&mut app.eat_char) && u == 0x20 {
+                    return LRESULT(0);
+                }
+                if (0xD800..0xDC00).contains(&u) {
+                    app.hi_surrogate = u as u16;
+                } else if (0xDC00..0xE000).contains(&u) {
+                    if let Some(Ok(c)) = char::decode_utf16([app.hi_surrogate, u as u16]).next() {
+                        app.char_in(c);
+                    }
+                    app.hi_surrogate = 0;
+                } else if let Some(c) = char::from_u32(u) {
                     app.char_in(c);
                 }
                 LRESULT(0)
@@ -3123,6 +3906,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         SetTimer(Some(hwnd), TIMER_ANIM, 250, None);
                     }
                     app.invalidate();
+                } else if wp.0 == TIMER_TIP {
+                    let _ = KillTimer(Some(hwnd), TIMER_TIP);
+                    if app.tips.iter().any(|(r, _)| r.has(app.mouse.0, app.mouse.1)) {
+                        app.invalidate();
+                    }
                 } else if wp.0 == TIMER_TRIM {
                     let _ = KillTimer(Some(hwnd), TIMER_TRIM);
                     trim_ws();
@@ -3136,7 +3924,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_GETMINMAXINFO => {
                 let mi = &mut *(lp.0 as *mut MINMAXINFO);
                 let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                mi.ptMinTrackSize = POINT { x: (900.0 * dpi) as i32, y: (620.0 * dpi) as i32 };
+                mi.ptMinTrackSize = POINT { x: (MIN_W * dpi) as i32, y: (MIN_H * dpi) as i32 };
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -3187,12 +3975,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                if !app.test {
+                    save_placement(hwnd);
+                }
                 PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
+}
+
+/// Smallest window (DIPs).
+const MIN_W: f32 = 600.0;
+const MIN_H: f32 = 480.0;
+
+fn placement_path() -> std::path::PathBuf {
+    crate::ai::config_dir().join("taskman-window.json")
+}
+
+/// Remember the normal (restored) rectangle and whether the window is maximized.
+fn save_placement(hwnd: HWND) {
+    let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    if unsafe { GetWindowPlacement(hwnd, &mut wp) }.is_err() {
+        return;
+    }
+    let r = wp.rcNormalPosition;
+    let v = serde_json::json!({"left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom, "max": wp.showCmd == SW_SHOWMAXIMIZED.0 as u32});
+    let _ = std::fs::create_dir_all(crate::ai::config_dir());
+    let _ = std::fs::write(placement_path(), v.to_string());
+}
+
+/// The saved rectangle, if it is still on a monitor and not smaller than the minimum.
+fn load_placement() -> Option<(RECT, bool)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(placement_path()).ok()?).ok()?;
+    let g = |k: &str| v[k].as_i64().map(|x| x as i32);
+    let r = RECT { left: g("left")?, top: g("top")?, right: g("right")?, bottom: g("bottom")? };
+    if r.right - r.left < 300 || r.bottom - r.top < 240 {
+        return None;
+    }
+    // a monitor must show a good part of its title bar
+    let title = RECT { left: r.left + 40, top: r.top, right: r.right - 40, bottom: r.top + 30 };
+    if unsafe { MonitorFromRect(&title, MONITOR_DEFAULTTONULL) }.is_invalid() {
+        return None;
+    }
+    Some((r, v["max"].as_bool().unwrap_or(false)))
 }
 
 /// Return pages that are not in use to Windows (start-up only pages, or everything while minimized).
@@ -3237,7 +4064,9 @@ pub fn run(software: bool) -> i32 {
         _ => None,
     };
     let want_mica = !args.iter().any(|a| a == "--no-mica") && std::env::var("WT_NOMICA").is_err();
-    let prefs = Prefs::load();
+    // test windows start from the defaults (reproducible tests; the user's saved settings are never read or written)
+    let prefs = if test { Prefs::default() } else { Prefs::load() };
+    let prefs_nav_open = prefs.nav_open;
     let (shared, ctl) = data::start();
     ctl.interval_ms.store(prefs.interval_ms, Relaxed);
     unsafe {
@@ -3258,6 +4087,8 @@ pub fn run(software: bool) -> i32 {
             hInstance: inst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hIcon: LoadIconW(Some(inst.into()), PCWSTR(1 as _)).unwrap_or_default(),
+            // the exe's icon resource at small size too (title bar, Alt+Tab small, taskbar on small icons)
+            hIconSm: LoadImageW(Some(inst.into()), PCWSTR(1 as _), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR).map(|h| HICON(h.0)).unwrap_or_default(),
             lpszClassName: cls,
             hbrBackground: CreateSolidBrush(COLORREF(((t.mica.2 * 255.0) as u32) << 16 | ((t.mica.1 * 255.0) as u32) << 8 | (t.mica.0 * 255.0) as u32)),
             ..Default::default()
@@ -3265,12 +4096,21 @@ pub fn run(software: bool) -> i32 {
         RegisterClassExW(&wc);
         // 1180x760 DIPs on the primary monitor, centred. No WS_SYSMENU: DWM must not draw its own caption
         // buttons over the Mica frame (the window draws Fluent ones and answers HTMINBUTTON/HTMAXBUTTON/HTCLOSE).
+        // the last size and place (not for test windows), else 1180x760 fitted into the work area and centred
         let dpi = GetDpiForSystem() as f32 / 96.0;
-        let (w, h) = ((1180.0 * dpi) as i32, (760.0 * dpi) as i32);
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let mut work = RECT::default();
+        if SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut RECT as *mut _), Default::default()).is_err() {
+            work = RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) };
+        }
+        let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+        let (w, h) = (((1180.0 * dpi) as i32).min(ww - 16), ((760.0 * dpi) as i32).min(wh - 16));
+        let saved = if test { None } else { load_placement() };
+        let (sx, sy, w, h) = match saved {
+            Some((r, _)) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => (work.left + (ww - w) / 2, work.top + (wh - h) / 2, w, h),
+        };
         let style = if want_mica { WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN } else { WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN };
-        let (ex, x0, y0) = if offscreen { (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000) } else { (WINDOW_EX_STYLE(0), (sw - w) / 2, (sh - h) / 2) };
+        let (ex, x0, y0) = if offscreen { (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000) } else { (WINDOW_EX_STYLE(0), sx, sy) };
         let Ok(hwnd) = CreateWindowExW(ex, cls, w!("Rust Task Manager"), style, x0, y0, w, h, None, None, Some(inst.into()), None) else { return 1 };
         set_dark_frame(hwnd, t.dark);
         let mica = want_mica && set_mica(hwnd);
@@ -3318,9 +4158,26 @@ pub fn run(software: bool) -> i32 {
             startup_sort: 0,
             query: String::new(),
             search_focus: false,
+            caret: usize::MAX,
+            hi_surrogate: 0,
+            dlg_focus: 0,
+            sort_rev: false,
+            perf_hist: HashMap::new(),
+            perf_sel: "cpu".into(),
+            perf_top_keys: vec![],
+            nav_peek: false,
+            focus: None,
+            eat_char: false,
+            smooth: HashMap::new(),
+            smooth_sort: SortKey::Impact,
+            elevated: crate::sys::is_elevated(),
+            q_all: false,
             scroll: [0.0; 4],
             drag_scroll: None,
             hits: vec![],
+            tips: vec![],
+            mouse: (-1.0, -1.0),
+            rest_at: Instant::now(),
             hover: Hit::None,
             pressed: Hit::None,
             nc_hover: Hit::None,
@@ -3365,6 +4222,11 @@ pub fn run(software: bool) -> i32 {
             content_h: [0.0; 4],
             view_h: [600.0; 4],
             want_scroll_sel: false,
+            pointer_in_list: false,
+            last_input: Instant::now(),
+            painted: vec![],
+            nav_tip: None,
+            nav_w: if prefs_nav_open { NAV_W_OPEN } else { NAV_W },
             row_h: ROW_H,
         });
         ctl.icon_px.store((16.0 * GetDpiForWindow(hwnd) as f32 / 96.0).round() as u32, Relaxed);
@@ -3391,7 +4253,8 @@ pub fn run(software: bool) -> i32 {
         // data may already be there (the first sample takes a few ms)
         (*ptr).take_data();
         trace(&format!("{:.1} ms: data taken ({} procs)", started.elapsed().as_secs_f64() * 1000.0, (*ptr).procs.len()));
-        let _ = ShowWindow(hwnd, if offscreen { SW_SHOWNOACTIVATE } else { SW_SHOW });
+        let maxed = saved.map(|p| p.1).unwrap_or(false);
+        let _ = ShowWindow(hwnd, if offscreen { SW_SHOWNOACTIVATE } else if maxed { SW_SHOWMAXIMIZED } else { SW_SHOW });
         trace(&format!("{:.1} ms: shown", started.elapsed().as_secs_f64() * 1000.0));
         let _ = UpdateWindow(hwnd);
         trace(&format!("{:.1} ms: first paint done", started.elapsed().as_secs_f64() * 1000.0));

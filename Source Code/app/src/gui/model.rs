@@ -17,13 +17,14 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    pub const MENU: [SortKey; 6] = [SortKey::Impact, SortKey::Cpu, SortKey::Mem, SortKey::Disk, SortKey::Net, SortKey::Name];
+    pub const MENU: [SortKey; 6] = [SortKey::Impact, SortKey::Cpu, SortKey::Mem, SortKey::Disk, SortKey::Gpu, SortKey::Name];
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Impact => "Impact",
             SortKey::Cpu => "CPU",
             SortKey::Mem => "Memory",
-            SortKey::Disk => "Disk",
+            // read + write of files, pipes and devices (Windows has no per-app disk-only counter without ETW)
+            SortKey::Disk => "I/O",
             SortKey::Net => "Network",
             SortKey::Gpu => "GPU",
             SortKey::Name => "Name",
@@ -34,7 +35,7 @@ impl SortKey {
             "impact" => SortKey::Impact,
             "cpu" => SortKey::Cpu,
             "memory" | "mem" => SortKey::Mem,
-            "disk" => SortKey::Disk,
+            "disk" | "io" | "i/o" => SortKey::Disk,
             "network" | "net" => SortKey::Net,
             "gpu" => SortKey::Gpu,
             "name" => SortKey::Name,
@@ -137,8 +138,23 @@ fn label_for(p: &Proc, services: &HashMap<u32, Vec<String>>) -> String {
 pub fn groups(procs: &[Proc], services: &HashMap<u32, Vec<String>>, cmdlines: &HashMap<u32, String>, gpu: &HashMap<u32, f32>, hung: &[u32], merge: bool, ram_total: u64) -> Vec<Group> {
     let mut map: HashMap<String, Group> = HashMap::new();
     let mut order: Vec<String> = vec![];
+    // an exe without a description joins the one product of the same name (bash.exe -> "Git for Windows"), so
+    // one program is one row; names with several products (claude.exe: Claude, Claude Code) stay apart
+    let mut products: HashMap<String, Vec<String>> = HashMap::new();
+    for p in procs.iter().filter(|p| p.pid != 0 && !p.meta.description.is_empty()) {
+        let v = products.entry(p.name.to_lowercase()).or_default();
+        let l = label_for(p, services);
+        if !v.contains(&l) {
+            v.push(l);
+        }
+    }
     for p in procs.iter().filter(|p| p.pid != 0) {
-        let label = label_for(p, services);
+        let mut label = label_for(p, services);
+        if p.meta.description.is_empty()
+            && let Some([only]) = products.get(&p.name.to_lowercase()).map(|v| v.as_slice())
+        {
+            label = only.clone();
+        }
         let svc_host = p.name.eq_ignore_ascii_case("svchost.exe");
         let key = if !merge || svc_host { format!("{}#{}", p.name.to_lowercase(), p.pid) } else { format!("{}|{}", p.name.to_lowercase(), label.to_lowercase()) };
         let m = Member {
@@ -193,12 +209,80 @@ pub fn groups(procs: &[Proc], services: &HashMap<u32, Vec<String>>, cmdlines: &H
     }
     let mut v: Vec<Group> = order.into_iter().filter_map(|k| map.remove(&k)).collect();
     for g in &mut v {
-        g.members.sort_by(|a, b| b.mem.cmp(&a.mem).then(a.pid.cmp(&b.pid)));
+        // children keep a fixed order (by PID), so expanded groups never shuffle
+        g.members.sort_by_key(|m| m.pid);
         let i = crate::insight::impact(g.cpu, g.mem, g.io, g.gpu, ram_total);
         g.score = i.score;
         g.driver = i.driver;
     }
     v
+}
+
+/// The value a sort ranks by (bigger first); Name has none.
+pub fn sort_val(g: &Group, key: SortKey) -> f64 {
+    match key {
+        SortKey::Impact | SortKey::Net => g.score as f64,
+        SortKey::Cpu => g.cpu as f64,
+        SortKey::Mem => g.mem as f64,
+        SortKey::Disk => g.io,
+        SortKey::Gpu => g.gpu as f64,
+        SortKey::Name => 0.0,
+    }
+}
+
+/// The smallest gap that may move a row past its neighbour: (relative, absolute). Smaller changes are noise.
+fn min_gap(key: SortKey) -> (f64, f64) {
+    match key {
+        SortKey::Impact | SortKey::Net => (0.35, 1.0),
+        SortKey::Cpu => (0.35, 1.5),
+        SortKey::Mem => (0.15, 32.0 * 1048576.0),
+        SortKey::Disk => (0.50, 512.0 * 1024.0),
+        SortKey::Gpu => (0.35, 2.0),
+        SortKey::Name => (0.0, 0.0),
+    }
+}
+
+/// A calm order for one list (one section, or the flat list): keep the previous order and let a row pass its
+/// neighbour only when it is clearly bigger (both gaps of `min_gap`); ties and small changes never move a row.
+/// New rows go where their value puts them. `rev` = smallest first. Name is an exact A-Z (or Z-A) order.
+/// `smooth`: the sort value averaged over the last samples (so a one-second burst does not move a row).
+pub fn calm_order(mut v: Vec<Group>, prev: &HashMap<String, usize>, key: SortKey, rev: bool, smooth: &HashMap<String, f64>) -> Vec<Group> {
+    if key == SortKey::Name {
+        v.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()).then(a.key.cmp(&b.key)));
+        if rev {
+            v.reverse();
+        }
+        return v;
+    }
+    let sign = if rev { -1.0 } else { 1.0 };
+    let val = |g: &Group| smooth.get(&g.key).copied().unwrap_or_else(|| sort_val(g, key)) * sign;
+    // the plain order by value (ties by key, so it is the same every time)
+    v.sort_by(|a, b| val(b).total_cmp(&val(a)).then(a.key.cmp(&b.key)));
+    if prev.is_empty() {
+        return v;
+    }
+    let (old, new): (Vec<Group>, Vec<Group>) = v.into_iter().partition(|g| prev.contains_key(&g.key));
+    let mut list = old;
+    list.sort_by_key(|g| prev[&g.key]);
+    for g in new {
+        let at = list.iter().position(|x| val(&g) > val(x)).unwrap_or(list.len());
+        list.insert(at, g);
+    }
+    let (rel, abs) = min_gap(key);
+    let clearly = |a: f64, b: f64| a - b > abs.max(a.abs().max(b.abs()) * rel);
+    for _ in 0..list.len() {
+        let mut moved = false;
+        for i in 0..list.len().saturating_sub(1) {
+            if clearly(val(&list[i + 1]), val(&list[i])) {
+                list.swap(i, i + 1);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    list
 }
 
 pub fn sort_groups(v: &mut [Group], key: SortKey) {
@@ -223,7 +307,7 @@ pub fn stable_order(v: &mut Vec<Group>, prev: &HashMap<String, usize>) {
         .enumerate()
         .map(|(new, g)| {
             let k = match prev.get(&g.key) {
-                Some(&old) if (old as i64 - new as i64).abs() < 2 => old as f32,
+                Some(&old) if (old as i64 - new as i64).abs() <= 3 => old as f32,
                 _ => new as f32 - 0.5,
             };
             (k, new, g)
@@ -350,7 +434,7 @@ pub fn fmt_mem(b: u64) -> String {
 pub fn fmt_rate(b: f64) -> String {
     let kb = b / 1024.0;
     if b < 1.0 {
-        "0".into()
+        "0 KB/s".into()
     } else if kb >= 1000.0 {
         format!("{:.1} MB/s", kb / 1024.0)
     } else if kb < 10.0 {

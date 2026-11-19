@@ -29,6 +29,9 @@ pub struct LinkInfo {
     pub arguments: String,
     pub work_dir: String,
     pub description: String,
+    /// The icon the shortcut names ("" = none) and its index.
+    pub icon_file: String,
+    pub icon_index: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -208,6 +211,12 @@ pub fn read_shortcut(lnk: &Path) -> Option<LinkInfo> {
         if sl.GetDescription(&mut buf).is_ok() {
             li.description = from_wide(&buf);
         }
+        buf.fill(0);
+        let mut idx = 0i32;
+        if sl.GetIconLocation(&mut buf, &mut idx).is_ok() {
+            li.icon_file = from_wide(&buf);
+            li.icon_index = idx;
+        }
         Some(li)
     }
 }
@@ -232,10 +241,13 @@ pub fn create_shortcut(lnk: &Path, target: &Path, arguments: &str) -> Res<()> {
     }
 }
 
-fn read_url_file(p: &Path) -> Option<LinkInfo> {
+/// Read a .url Internet shortcut: its URL and the icon it names.
+pub fn read_url_file(p: &Path) -> Option<LinkInfo> {
     let s = std::fs::read_to_string(p).ok()?;
     let url = s.lines().find_map(|l| l.trim().strip_prefix("URL=").map(String::from))?;
-    Some(LinkInfo { target: url, ..Default::default() })
+    let icon_file = s.lines().find_map(|l| l.trim().strip_prefix("IconFile=").map(String::from)).unwrap_or_default();
+    let icon_index = s.lines().find_map(|l| l.trim().strip_prefix("IconIndex=").and_then(|x| x.trim().parse().ok())).unwrap_or(0);
+    Some(LinkInfo { target: url, icon_file, icon_index, ..Default::default() })
 }
 
 /// Folder size: Everything's index when allowed and available (instant), else a walk that stops after `limit`.

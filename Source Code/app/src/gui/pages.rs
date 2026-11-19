@@ -1,6 +1,6 @@
 //! Startup apps page and Settings page.
 use super::app::*;
-use super::gfx::{Align, Font, Rect};
+use super::gfx::{Align, C, Font, Rect};
 use super::model;
 use super::paint::{Btn, exe_of, keep_from};
 use std::cell::RefCell;
@@ -93,7 +93,9 @@ impl App {
     }
 
     pub fn startup_order(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = (0..self.startup.len()).collect();
+        // the search box filters this page too (name and command)
+        let toks = model::tokens(&self.query);
+        let mut v: Vec<usize> = (0..self.startup.len()).filter(|&i| toks.is_empty() || model::startup_matches(&self.startup[i], &toks)).collect();
         let s = &self.startup;
         match self.startup_sort {
             1 => v.sort_by_key(|&i| s[i].name.to_lowercase()),
@@ -105,7 +107,7 @@ impl App {
 
     pub fn paint_startup(&mut self) {
         let t = self.t;
-        let layer = Rect::new(12.0, TITLE_H, self.w - 24.0, self.h - TITLE_H - 12.0);
+        let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
         let on = self.startup.iter().filter(|e| e.enabled).count();
@@ -125,10 +127,14 @@ impl App {
         self.gfx.hline(layer.x, layer.r(), hy + 31.0, t.line);
         let (x0, x1) = (layer.x + 4.0 + 8.0, layer.r() - 4.0 - 12.0);
         let tog_x = x1 - 96.0;
-        let now_x = tog_x - 220.0;
-        let src_x = now_x - 196.0;
-        for (s, x) in [("Name", x0 + 36.0), ("Starts from", src_x), ("Now", now_x)] {
-            self.gfx.text_at(s, x, hy, 32.0, 200.0, Font::Ui, 12.0, 400, t.t2);
+        // a narrow window drops "Now", then "Starts from", so the name keeps its room
+        let (show_now, show_src) = (layer.w >= 860.0, layer.w >= 640.0);
+        let now_x = if show_now { tog_x - 220.0 } else { tog_x };
+        let src_x = if show_src { now_x - 196.0 } else { now_x };
+        for (s, x, on) in [("Name", x0 + 36.0, true), ("Starts from", src_x, show_src), ("Now", now_x, show_now)] {
+            if on {
+                self.gfx.text_at(s, x, hy, 32.0, 200.0, Font::Ui, 12.0, 400, t.t2);
+            }
         }
         self.gfx.text("At startup", Rect::new(tog_x, hy, 96.0, 32.0), Font::Ui, 12.0, 400, Align::Right, t.t2);
         // rows
@@ -162,10 +168,17 @@ impl App {
             self.gfx.text(&shown, Rect::new(tx, r.y + 6.0, tw, 18.0), Font::Ui, 13.0, 400, Align::Left, if e.enabled { t.t1 } else { t.t2 });
             let keep = keep_from(&e.command);
             let cmd = self.gfx.elide_mid(&e.command, keep, tw, Font::Ui, 12.0, 400);
+            if cmd != e.command || self.gfx.measure(&shown, Font::Ui, 13.0, 400) > tw {
+                self.tip(Rect::new(tx, r.y, tw, r.h), format!("{}
+{}", e.name, e.command));
+            }
             self.gfx.text(&cmd, Rect::new(tx, r.y + 25.0, tw, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t3);
-            self.gfx.text(source_label(e.source), Rect::new(src_x, r.y, 196.0 - 12.0, 48.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
+            if show_src {
+                self.gfx.text(source_label(e.source), Rect::new(src_x, r.y, 196.0 - 12.0, 48.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
+            }
             let (running, now) = self.startup_now(&e);
-            if running {
+            if !show_now {
+            } else if running {
                 let rw = self.gfx.text_at("Running", now_x, r.y, 48.0, 200.0, Font::Ui, 12.5, 400, t.t1);
                 self.gfx.text_at(&now["Running".len()..], now_x + rw, r.y, 48.0, 220.0 - 12.0 - rw, Font::Ui, 12.5, 400, t.t2);
             } else {
@@ -179,6 +192,8 @@ impl App {
         }
         if self.startup.is_empty() {
             self.gfx.text("Reading startup entries…", Rect::new(view.x, view.y + 30.0, view.w, 24.0), Font::Ui, 13.0, 400, Align::Center, t.t2);
+        } else if order.is_empty() {
+            self.gfx.text(&format!("No startup apps match \"{}\"", self.query.trim()), Rect::new(view.x, view.y + 30.0, view.w, 24.0), Font::Ui, 13.0, 400, Align::Center, t.t2);
         }
         self.gfx.unclip();
         self.scrollbar(view, 1);
@@ -188,10 +203,10 @@ impl App {
     // ------------------------------------------------------------------ Settings
     pub fn paint_settings(&mut self) {
         let t = self.t;
-        let layer = Rect::new(12.0, TITLE_H, self.w - 24.0, self.h - TITLE_H - 12.0);
+        let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
-        let one_col = self.w < 1000.0;
+        let one_col = layer.w < 900.0;
         let pad_x = 24.0;
         let lx = layer.x + pad_x;
         let lw = if one_col { layer.w - pad_x * 2.0 } else { 500.0 };
@@ -217,7 +232,7 @@ impl App {
         y += 18.0;
         self.gfx.text_at("Personalize", lx, y, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
         y += 28.0;
-        let n = 8 + self.custom_open as usize;
+        let n = 9 + self.custom_open as usize;
         let card = Rect::new(lx, y, lw, 56.0 * n as f32);
         self.gfx.card(card, 8.0, t.card, t.card_s);
         let right = lx + lw - 16.0;
@@ -228,10 +243,24 @@ impl App {
         self.set_row(lx, lw, ry, true, 0xE771, "Background", "");
         self.segmented(right, ry + 28.0, &["Mica", "Mica Alt", "Acrylic", "Solid"], self.prefs.backdrop as usize, 3);
         ry += 56.0;
-        self.set_row(lx, lw, ry, true, 0xE81E, "Transparency", "");
-        self.segmented(right, ry + 28.0, &["Off", "Low", "Medium", "High"], self.prefs.transp as usize, 4);
+        // the accent colours the whole window; this says how much
+        self.set_row(lx, lw, ry, true, 0xE790, "Colour strength", "");
+        self.segmented(right, ry + 28.0, &["Subtle", "Medium", "Strong"], self.prefs.strength.min(2) as usize, 9);
+        ry += 56.0;
+        if self.backdrop_on() {
+            self.set_row(lx, lw, ry, true, 0xE81E, "Transparency", "");
+            self.segmented(right, ry + 28.0, &["Off", "Low", "Medium", "High"], self.prefs.transp as usize, 4);
+        } else {
+            // Solid has no backdrop to show: the control is disabled (drawn faded, no hits)
+            self.set_row(lx, lw, ry, true, 0xE81E, "Transparency", "Needs Mica or Acrylic");
+            let (n0, old) = (self.hits.len(), self.gfx.push_alpha(0.45));
+            self.segmented(right, ry + 28.0, &["Off", "Low", "Medium", "High"], self.prefs.transp as usize, 4);
+            self.gfx.pop_alpha(old);
+            self.hits.truncate(n0);
+        }
         ry += 56.0;
         let acc_name = match self.prefs.accent {
+            _ if self.prefs.desktop => "Follows the desktop".to_string(),
             None => "Windows".to_string(),
             Some(rgb) => super::theme::PRESETS.iter().find(|p| p.1 == rgb).map(|p| p.0.to_string()).unwrap_or_else(|| format!("Custom · #{rgb:06X}")),
         };
@@ -251,7 +280,7 @@ impl App {
         self.set_row(lx, lw, ry, true, 0xE739, "Corners", "");
         self.segmented(right, ry + 28.0, &["Rounded", "Square"], self.prefs.corners as usize, 7);
         ry += 56.0;
-        self.set_row(lx, lw, ry, true, 0xE89F, "Side pane width", "");
+        self.set_row(lx, lw, ry, true, 0xE89F, "Details pane width", "");
         self.segmented(right, ry + 28.0, &["Narrow", "Medium", "Wide"], self.prefs.pane as usize, 8);
         y = card.b();
         // Processes
@@ -274,12 +303,13 @@ impl App {
         self.gfx.glyph(0xE70D, Rect::new(br.r() - 12.0 - 9.0, br.y + 1.0, 9.0, 32.0), 9.0, t.t2);
         ry += 56.0;
         self.set_row(lx, lw, ry, true, 0xE71D, "Columns", "");
-        let cols = [("Type", self.prefs.col_type), ("PID", self.prefs.show_pid), ("Disk", self.prefs.col_disk), ("Network", self.prefs.col_net), ("GPU", self.prefs.col_gpu)];
-        let ws: Vec<f32> = cols.iter().map(|c| (self.gfx.measure(c.0, Font::Ui, 12.5, 400) + 22.0).ceil()).collect();
+        // Network per app has no counter yet, so it is not offered (ColPill 3 stays reserved for it)
+        let cols = [(0u8, "Type", self.prefs.col_type), (1, "PID", self.prefs.show_pid), (2, "I/O", self.prefs.col_disk), (4, "GPU", self.prefs.col_gpu)];
+        let ws: Vec<f32> = cols.iter().map(|c| (self.gfx.measure(c.1, Font::Ui, 12.5, 400) + 22.0).ceil()).collect();
         let mut cx = right - ws.iter().sum::<f32>() - 6.0 * (cols.len() as f32 - 1.0);
-        for (i, (name, on)) in cols.iter().enumerate() {
+        for (i, (id, name, on)) in cols.iter().enumerate() {
             let r = Rect::new(cx, ry + 15.0, ws[i], 26.0);
-            let h = Hit::ColPill(i as u8);
+            let h = Hit::ColPill(*id);
             let k = self.fade(hid(1, h), *on);
             let pressed = self.press_begin(r, h);
             self.gfx.fill_round(r, 13.0, t.inp);
@@ -292,7 +322,7 @@ impl App {
             cx += ws[i] + 6.0;
         }
         ry += 56.0;
-        let toggles = [(0xE9D2u32, "Show resource summary", self.prefs.tiles, 4u8), (0xE8EC, "Show attention chips", self.prefs.chips, 5), (0xE8FD, "Merge processes with the same name", self.prefs.merge, 0), (0xE7BA, "Ask before ending an app that may lose work", self.prefs.ask_end, 1)];
+        let toggles = [(0xE8FDu32, "Group processes", self.prefs.group, 6u8), (0xE8EC, "Show attention chips", self.prefs.chips, 5), (0xE8FD, "Merge processes with the same name", self.prefs.merge, 0), (0xE7BA, "Ask before ending an app that may lose work", self.prefs.ask_end, 1)];
         for (g, label, on, id) in toggles {
             self.set_row(lx, lw, ry, true, g, label, "");
             self.toggle(right, ry + 28.0, on, Hit::Toggle(id), true);
@@ -319,6 +349,9 @@ impl App {
                 self.gfx.fill(Rect::new(r.x, r.y + if i > 0 { 1.0 } else { 0.0 }, r.w, r.h - if i > 0 { 1.0 } else { 0.0 }), t.hov.fade(hv));
             }
             self.hit(r, h);
+            self.tip(r, format!("{cmd}
+{desc}
+Click to copy"));
             let cw = self.gfx.text_at(cmd, r.x + 15.0, r.y, 34.0, cmd_w, Font::Mono, 12.0, 400, t.t1);
             if *new {
                 self.gfx.text_at("new", r.x + 15.0 + cw + 6.0, r.y, 34.0, 40.0, Font::Ui, 10.5, 600, t.acc_t);
@@ -367,12 +400,7 @@ impl App {
         let fr = Rect::new(fx, ky + 12.0, fw, 32.0);
         let focus = self.key_focus;
         self.gfx.fill_round(fr, 4.0, t.inp.mix(t.ctl_h, if focus { 0.0 } else { self.hov(Hit::KeyField) }));
-        self.gfx.stroke_round(fr, 4.0, t.inp_s, 1.0);
-        if focus {
-            self.gfx.fill_round(Rect::new(fr.x + 1.0, fr.b() - 2.0, fr.w - 2.0, 2.0), 1.0, t.acc);
-        } else {
-            self.gfx.fill(Rect::new(fr.x + 3.0, fr.b() - 1.0, fr.w - 6.0, 1.0), t.inp_b);
-        }
+        self.input_ring(fr, Hit::KeyField, focus);
         let (shown, color) = if !self.key_buf.is_empty() {
             ("•".repeat(self.key_buf.chars().count().min(48)), t.t1)
         } else if self.key_saved {
@@ -453,20 +481,25 @@ impl App {
         let t = self.t;
         let dark = t.dark;
         let custom = self.prefs.accent.filter(|a| !super::theme::PRESETS.iter().any(|p| p.1 == *a));
-        for i in 0..10u8 {
-            let cx = right - 12.0 - (9 - i) as f32 * 30.0;
+        let desk = self.prefs.desktop;
+        // Windows accent, 8 presets, Custom, Follow desktop (the last one is a choice, never the default)
+        for i in 0..11u8 {
+            let cx = right - 12.0 - (10 - i) as f32 * 30.0;
             let col = match i {
                 0 => super::theme::system_accent(dark),
                 1..=8 => {
                     let (l, d) = super::theme::accent_pair(super::theme::PRESETS[i as usize - 1].1);
                     if dark { d } else { l }
                 }
+                9 => custom.map(|c| { let (l, d) = super::theme::accent_pair(c); if dark { d } else { l } }).unwrap_or(t.acc),
                 _ => t.acc,
             };
             let sel = match i {
+                _ if desk => i == 10,
                 0 => self.prefs.accent.is_none(),
                 1..=8 => self.prefs.accent == Some(super::theme::PRESETS[i as usize - 1].1),
-                _ => custom.is_some() || self.custom_open,
+                9 => custom.is_some() || self.custom_open,
+                _ => false,
             };
             let h = Hit::Accent(i);
             let r = Rect::new(cx - 14.0, cy - 14.0, 28.0, 28.0);
@@ -477,14 +510,29 @@ impl App {
                 self.gfx.ellipse(cx, cy, 13.0, t.t1.fade(k), false, 2.0);
             }
             let rad = 10.0 - 1.5 * k + 1.0 * hv * (1.0 - k);
-            if i == 9 && custom.is_none() {
+            if i == 10 {
+                // Follow desktop: a clean circle in the desktop colour with a tiny white monitor drawn with shapes
+                let dc = self.desktop_rgb().map(|c| {
+                    let (l, d) = super::theme::accent_pair(c);
+                    if dark { d } else { l }
+                });
+                self.gfx.ellipse(cx, cy, rad, dc.unwrap_or(t.track), true, 0.0);
+                let ink = if dc.is_some() { C(1.0, 1.0, 1.0, 0.92) } else { t.t2 };
+                self.gfx.stroke_round(Rect::new(cx - 4.5, cy - 4.0, 9.0, 6.5), 0.0, ink, 1.2);
+                self.gfx.fill(Rect::new(cx - 2.5, cy + 3.5, 5.0, 1.2), ink);
+                self.tip(r, "Follow desktop (the wallpaper colour)");
+            } else if i == 9 && custom.is_none() {
                 self.gfx.ellipse(cx, cy, rad, t.track, true, 0.0);
                 self.gfx.glyph(0xE710, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 10.0, t.t2);
             } else {
                 self.gfx.ellipse(cx, cy, rad, col, true, 0.0);
                 if i == 0 {
-                    // the Windows accent: a small window mark
-                    self.gfx.glyph(0xE782, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 9.0, t.on_acc.fade(0.9));
+                    // the Windows accent: a thin four-pane Windows mark (8 px) in white
+                    let ink = C(1.0, 1.0, 1.0, 0.92);
+                    for (dx, dy) in [(-4.0f32, -4.0f32), (0.5, -4.0), (-4.0, 0.5), (0.5, 0.5)] {
+                        self.gfx.fill(Rect::new(cx + dx, cy + dy, 3.5, 3.5), ink);
+                    }
+                    self.tip(r, "Windows accent (follows Windows)");
                 } else if i == 9 {
                     self.gfx.glyph(0xE70F, Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0), 9.0, t.on_acc);
                 }
@@ -518,12 +566,7 @@ impl App {
         let fr = Rect::new(right - fw, ry + 12.0, fw, 32.0);
         let focus = self.hex_focus;
         self.gfx.fill_round(fr, 4.0, t.inp.mix(t.ctl_h, if focus { 0.0 } else { self.hov(Hit::HexField) }));
-        self.gfx.stroke_round(fr, 4.0, t.inp_s, 1.0);
-        if focus {
-            self.gfx.fill_round(Rect::new(fr.x + 1.0, fr.b() - 2.0, fr.w - 2.0, 2.0), 1.0, t.acc);
-        } else {
-            self.gfx.fill(Rect::new(fr.x + 3.0, fr.b() - 1.0, fr.w - 6.0, 1.0), t.inp_b);
-        }
+        self.input_ring(fr, Hit::HexField, focus);
         let shown = if self.hex_buf.is_empty() { self.prefs.accent.map(|a| format!("#{a:06X}")).unwrap_or_default() } else { self.hex_buf.clone() };
         let tw = self.gfx.text_at(&shown, fr.x + 10.0, fr.y, 32.0, fw - 20.0, Font::Mono, 12.5, 400, t.t1);
         if focus {

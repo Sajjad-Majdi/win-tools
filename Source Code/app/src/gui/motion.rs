@@ -9,9 +9,9 @@ pub const FAST: f32 = 83.0;
 /// Fades of menus, flyouts and toasts; leaving things.
 pub const NORMAL: f32 = 167.0;
 /// Number and bar transitions after a new sample.
-pub const VALUE: f32 = 260.0;
+pub const VALUE: f32 = 150.0;
 /// Rows that change place.
-pub const MOVE: f32 = 250.0;
+pub const MOVE: f32 = 150.0;
 /// Press depth -> scale (1.0 at rest, 0.97 fully pressed).
 pub const PRESS_SCALE: f32 = 0.03;
 

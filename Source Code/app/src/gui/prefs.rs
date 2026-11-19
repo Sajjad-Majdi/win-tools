@@ -41,6 +41,16 @@ pub struct Prefs {
     pub sort: String,
     /// side pane width: 0 narrow, 1 medium, 2 wide
     pub pane: u8,
+    /// list in sections (Apps, Background processes, Windows processes)
+    pub group: bool,
+    /// sections showing all rows (else the top 5 + "Show all")
+    pub sec_open: [bool; 3],
+    /// sidebar expanded (icon + label) or collapsed (icons)
+    pub nav_open: bool,
+    /// the accent follows the desktop (wallpaper / DWM colour) instead of `accent`; one choice, never the default
+    pub desktop: bool,
+    /// how strongly the whole window takes the accent hue: 0 subtle, 1 medium, 2 strong
+    pub strength: u8,
 }
 
 impl Default for Prefs {
@@ -52,7 +62,7 @@ impl Default for Prefs {
             ask_end: true,
             show_pid: false,
             backdrop: 0,
-            transp: 0,
+            transp: 1,
             accent: None,
             density: 1,
             font: 1,
@@ -65,6 +75,11 @@ impl Default for Prefs {
             chips: true,
             sort: "impact".into(),
             pane: 1,
+            group: true,
+            sec_open: [false; 3],
+            nav_open: true,
+            desktop: false,
+            strength: 1,
         }
     }
 }
@@ -92,7 +107,14 @@ impl Prefs {
             show_pid: flag("show_pid", d.show_pid),
             backdrop: small("backdrop", 3, d.backdrop),
             transp: small("transparency", 3, d.transp),
-            accent: v["accent"].as_str().and_then(parse_hex),
+            // 0.2.x had a separate "Window colour" with a custom hue: an old custom hue becomes the accent
+            accent: v["accent"].as_str().and_then(parse_hex).or_else(|| {
+                (v["window_color"].as_u64() == Some(3)).then(|| {
+                    let h = v["window_hue"].as_u64().unwrap_or(210) as f32;
+                    let c = super::theme::from_hsl(h, 0.78, 0.45);
+                    ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32
+                })
+            }),
             density: small("density", 1, d.density),
             font: small("text_size", 2, d.font),
             corners: small("corners", 1, d.corners),
@@ -104,6 +126,20 @@ impl Prefs {
             chips: flag("chips", d.chips),
             sort: v["sort"].as_str().filter(|s| super::model::SortKey::parse(s).is_some()).map(|s| s.to_lowercase()).unwrap_or(d.sort),
             pane: small("pane_width", 2, d.pane),
+            group: flag("group", d.group),
+            nav_open: flag("nav_open", d.nav_open),
+            desktop: flag("accent_desktop", d.desktop),
+            // the old "Neutral" window colour becomes Subtle
+            strength: v["colour_strength"].as_u64().filter(|x| *x <= 2).map(|x| x as u8).unwrap_or(if v["window_color"].as_u64() == Some(2) { 0 } else { d.strength }),
+            sec_open: {
+                let mut o = d.sec_open;
+                if let Some(a) = v["sections_open"].as_array() {
+                    for (i, x) in a.iter().take(3).enumerate() {
+                        o[i] = x.as_bool().unwrap_or(false);
+                    }
+                }
+                o
+            },
         }
     }
 
@@ -114,6 +150,8 @@ impl Prefs {
             "accent": self.accent.map(|a| format!("#{a:06X}")), "density": self.density, "text_size": self.font,
             "corners": self.corners, "col_type": self.col_type, "col_disk": self.col_disk, "col_network": self.col_net,
             "col_gpu": self.col_gpu, "summary": self.tiles, "chips": self.chips, "sort": self.sort, "pane_width": self.pane,
+            "group": self.group, "sections_open": self.sec_open, "nav_open": self.nav_open,
+            "accent_desktop": self.desktop, "colour_strength": self.strength,
         })
     }
 
@@ -151,11 +189,21 @@ mod tests {
         p.tiles = false;
         p.sort = "memory".into();
         p.pane = 2;
+        p.group = false;
+        p.nav_open = false;
+        p.desktop = true;
+        p.strength = 2;
+        p.sec_open = [true, false, true];
         assert_eq!(Prefs::from_json(&p.to_json()), p);
         // bad values fall back one by one
         let bad = Prefs::from_json(&json!({"backdrop": 9, "accent": "zz", "sort": "colour", "density": 0}));
         assert_eq!((bad.backdrop, bad.accent, bad.sort.as_str(), bad.density), (0, None, "impact", 0));
         assert_eq!(parse_hex("#0078d4"), Some(0x0078D4));
+        // 0.2.x values migrate: a custom window hue becomes the accent, Neutral becomes Subtle
+        let old = Prefs::from_json(&json!({"window_color": 3, "window_hue": 120}));
+        assert!(old.accent.is_some() && !old.desktop && old.strength == 1);
+        assert_eq!(Prefs::from_json(&json!({"window_color": 2})).strength, 0);
+        assert_eq!(Prefs::from_json(&json!({"window_color": 0})).desktop, false);
     }
 }
 

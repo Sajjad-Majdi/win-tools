@@ -18,9 +18,11 @@ mod known;
 mod look;
 mod model;
 mod motion;
+mod outproc;
 mod models;
 mod paint;
 mod preview;
+mod sicons;
 mod theme;
 
 /// Plain HTTP GET to a local server (semsearch on 127.0.0.1), short timeout.
@@ -69,7 +71,11 @@ fn main() {
     }
     // one window: a second start opens its folder as a tab in the running window
     if !flag("--new-window") && std::env::var("WFILES_TEST").is_err() && fmcore::pipe::exists() {
-        let p = path.clone().map(|p| fmcore::util::abs(p.trim_matches('"').trim_start_matches("/select,")).display().to_string());
+        let p = path.clone().map(|p| {
+            let p = p.trim_matches('"').trim_start_matches("/select,");
+            // "::{CLSID}" / "shell:..." names of This PC and the Recycle Bin pass through as they are
+            if model::special_loc(p).is_some() { p.to_string() } else { fmcore::util::abs(p).display().to_string() }
+        });
         let cmd = match p {
             Some(p) => format!("tab new {p}"),
             None => "tab new".into(),

@@ -192,8 +192,17 @@ fn set_task_enabled(path: &str, on: bool) -> Result<(), String> {
 /// Enable or disable an entry the way Explorer / Task Manager do (writes only the StartupApproved flag).
 /// Scheduled tasks are enabled/disabled in Task Scheduler. Services are not changed here (that needs admin).
 pub fn set_enabled(name: &str, on: bool) -> Result<Entry, String> {
+    set_enabled_in(name, None, on)
+}
+
+/// Like `set_enabled`, for the entry in one place (`source`, e.g. "Registry (user)") when a name is in several.
+pub fn set_enabled_in(name: &str, source: Option<&str>, on: bool) -> Result<Entry, String> {
     let all = list_all();
-    let matches: Vec<&Entry> = all.iter().filter(|e| e.name.eq_ignore_ascii_case(name) || (e.source == "Scheduled task" && e.name.rsplit('\\').next().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false))).collect();
+    let matches: Vec<&Entry> = all
+        .iter()
+        .filter(|e| source.map(|s| e.source == s).unwrap_or(true))
+        .filter(|e| e.name.eq_ignore_ascii_case(name) || (e.source == "Scheduled task" && e.name.rsplit('\\').next().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)))
+        .collect();
     let e = match matches.as_slice() {
         [] => return Err(format!("no startup entry named '{name}'")),
         [e] => *e,

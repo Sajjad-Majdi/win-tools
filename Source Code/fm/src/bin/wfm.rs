@@ -19,6 +19,7 @@ Browse
   ls <dir> [--all] [--sort name|size|date|created|type] [--desc] [--dirs-first] [--top N]
   info <path> [--no-index] [--limit MS]   size, dates, attributes, version (exe/dll), shortcut target,
                                           folder size (Everything index, else a walk of at most MS, default 3000)
+  search <words...>                       same as find (Everything first)
   find <words...> [--in DIR] [--ext pdf,docx] [--size >10mb] [--modified 7d] [--folders|--files]
        [--top N] [--sort date-modified-descending] [--regex] [--match-path]
        [--engine auto|everything|walk] [--limit MS]
@@ -50,7 +51,9 @@ Change (every change can be undone with `wfm undo`)
 Open
   open <path> [--verb VERB]               default app (VERB: edit, print, runas, ...)
   open --select <path>                    like `explorer /select,`: prints the folder and the item to select
-  open-with <path> [--app NAME] [--all]   without --app: list the apps that can open it
+  openwith <path> [--all]                 the apps that can open it (Windows default, our own default)
+  openwith <path> <app>                   open it with one of them (also: --app NAME; old name: open-with)
+  openwith default <.ext> [<app>|--clear] Rust File Explorer's own default app for a type (Windows' is untouched)
   reveal <path>                           show it selected in a folder window
   menu <path...> [--extended]             the right-click menu, with app extensions (7-Zip, Terminal, ...)
   menu <path...> --invoke VERB            run one entry (by verb or by its text)
@@ -71,14 +74,18 @@ Window (RustFileExplorer.exe must be running; every command answers with one lin
   gui tab new [path] | tab close [N] | tab N        gui view details|list|grid     gui split on|off
   gui pane 0|1 | gui preview | gui menu | gui whatis | gui rename | gui settings | gui palette [text]
   gui transfers | gui copy | gui cut | gui paste | gui delete | gui undo | gui newfolder <name>
-  gui key <keys e.g. ctrl+shift+n> | gui type <text> | gui click X Y | gui rclick X Y | gui dblclick X Y
+  gui key <keys e.g. ctrl+shift+n> | gui keys <text> | gui type <text> | gui look [key value]
+  gui click X Y | gui rclick X Y | gui dblclick X Y | gui hover X Y | gui wheel X Y N
   gui theme light|dark|system | gui size W H | gui shot <file.png> | gui quit
   gui shot-real <file.png>                capture the real window as Windows composes it (PrintWindow);
                                           start it with --offscreen so nothing shows on the screen
+  gui capture <file.png>                  the window as DWM composes it WITH its backdrop and alpha
+                                          (Windows.Graphics.Capture); prints the alpha of sample pixels
   gui drag X0 Y0 X1 Y1 [ctrl|shift]       a mouse drag sent to the window only (no real cursor)
   gui look [key value]                    show or change a Settings > Personalize value
-  default status                          is wfiles the default file manager? (set/restore only from
-                                          Settings, or: default set --yes / default restore --yes)
+  default status                          which parts open in Rust File Explorer: folders, drives, Win+E,
+                                          This PC (set/restore only from Settings, or:
+                                          default set --yes / default restore --yes; --root TESTKEY for tests)
   ev <words...> [--top N]                 Everything IPC query (no es.exe), with timing
 
 Notes
@@ -205,7 +212,7 @@ fn run(a: &Args) -> R {
         "unzip" => cmd_unzip(a),
         "undo" => cmd_undo(a),
         "open" => cmd_open(a),
-        "open-with" => cmd_open_with(a),
+        "open-with" | "openwith" => cmd_open_with(a),
         "reveal" => cmd_reveal(a),
         "watch" => cmd_watch(a),
         "thumb" => cmd_thumb(a),
@@ -215,6 +222,8 @@ fn run(a: &Args) -> R {
         "shell-ls" => cmd_shell_ls(a),
         "shell-copy" => cmd_shell_copy(a),
         "menu" => cmd_menu(a),
+        "menu-data" => cmd_menu_data(a),
+        "icon" => cmd_icon(a),
         "eject" => cmd_eject(a),
         other => Err(usage(&format!("unknown command '{other}'"))),
     }
@@ -456,6 +465,61 @@ fn cmd_menu(a: &Args) -> R {
     Ok(Out { v: json!({"ok": true, "items": l.iter().map(|i| json!({"verb": i.verb, "text": i.text, "parent": i.parent, "enabled": i.enabled, "icon": i.icon.as_ref().map(|c| format!("{}x{}", c.width, c.height))})).collect::<Vec<_>>()}), text: t })
 }
 
+/// Icon pixels as "W,H,hex" (premultiplied BGRA) for the window's out-of-process menu.
+fn icon_hex(i: &menu::Icon) -> String {
+    let mut s = String::with_capacity(i.bgra.len() * 2 + 16);
+    s += &format!("{},{},", i.width, i.height);
+    for b in &i.bgra {
+        s += &format!("{b:02x}");
+    }
+    s
+}
+
+/// Internal, for RustFileExplorer: the right-click menu's shell entries and (with --apps EXT) the apps that open
+/// the type, icons included, as JSON. It runs in this short-lived process so the shell extensions it loads
+/// (7-Zip, Git, VS Code, Defender ...) never stay in the window's memory.
+fn cmd_menu_data(a: &Args) -> R {
+    // the value of --apps is not a path
+    let apps_ext = a.opt("--apps").unwrap_or("").to_string();
+    let paths: Vec<PathBuf> = a.pos[1..].iter().filter(|p| **p != apps_ext).map(PathBuf::from).collect();
+    let items = if paths.is_empty() { vec![] } else { menu::list(&paths, false).unwrap_or_default() };
+    let apps = match a.opt("--apps") {
+        Some(ext) if !ext.is_empty() => shell::open_with_list(ext, false).unwrap_or_default().into_iter().take(12).collect::<Vec<_>>(),
+        _ => vec![],
+    };
+    let v = json!({
+        "ok": true,
+        "items": items.iter().map(|i| json!({"verb": i.verb, "text": i.text, "parent": i.parent, "enabled": i.enabled, "icon": i.icon.as_ref().map(icon_hex)})).collect::<Vec<_>>(),
+        "apps": apps.iter().map(|h| json!({"name": h.name, "ui_name": h.ui_name, "recommended": h.recommended, "icon_loc": h.icon, "default": h.default, "icon": menu::handler_icon(h).as_ref().map(icon_hex)})).collect::<Vec<_>>(),
+    });
+    Ok(Out { text: v.to_string(), v })
+}
+
+/// icon <path> --out <file.png> [--size N] [--shell]: the icon the file manager shows (or SHGetFileInfo's with --shell)
+fn cmd_icon(a: &Args) -> R {
+    let p = a.arg(1, "icon needs a path")?;
+    let out = a.opt("--out").ok_or_else(|| usage("icon needs --out <file.png>"))?;
+    let px = a.num("--size")?.unwrap_or(32).clamp(8, 256) as u32;
+    let (icon, arrow) = if a.flag("--shell") {
+        (menu::shgetfileinfo_icon(Path::new(p), px).ok_or_else(|| fail("no icon".into()))?, true)
+    } else {
+        (menu::list_icon(Path::new(p), px).ok_or_else(|| fail("no icon".into()))?, false)
+    };
+    // premultiplied -> straight alpha for the PNG
+    let mut px_ = icon.bgra.clone();
+    for q in px_.chunks_exact_mut(4) {
+        let al = q[3] as u32;
+        if al > 0 && al < 255 {
+            for c in &mut q[..3] {
+                *c = ((*c as u32 * 255 + al / 2) / al).min(255) as u8;
+            }
+        }
+    }
+    thumb::save_png(&thumb::Image { width: icon.width, height: icon.height, bgra: px_ }, Path::new(out)).map_err(fail)?;
+    Ok(Out { v: json!({"ok": true, "file": out, "size": [icon.width, icon.height], "arrow_drawn_by_shell": arrow}), text: format!("saved {out} ({}x{})
+", icon.width, icon.height) })
+}
+
 fn cmd_eject(a: &Args) -> R {
     let d = a.arg(1, "eject needs a drive letter")?;
     shell::eject(d).map_err(fail)?;
@@ -651,19 +715,52 @@ fn cmd_open(a: &Args) -> R {
     Ok(Out { v: json!({"ok": true, "path": abs(p).to_string_lossy(), "verb": verb}), text: format!("opened {}\n", abs(p).display()) })
 }
 
+/// openwith <file> [--all]            the apps that open it (Windows default, our own default, icon location)
+/// openwith <file> <app> | --app <app>  open it with one of them
+/// openwith default <.ext> [<app>|--clear]   show / set / clear Rust File Explorer's own default for a type
 fn cmd_open_with(a: &Args) -> R {
-    let p = a.arg(1, "open-with needs a path")?;
-    if let Some(app) = a.opt("--app") {
+    let p = a.arg(1, "openwith needs a path (or: openwith default <.ext> [<app>|--clear])")?;
+    if p == "default" {
+        let ext = a.arg(2, "openwith default needs an extension, e.g. .mp4")?;
+        let key = shell::ext_key(ext);
+        if a.flag("--clear") {
+            shell::set_own_default(&key, None).map_err(fail)?;
+            return Ok(Out { v: json!({"ok": true, "ext": key, "default": null}), text: format!("{key}: Windows decides again\n") });
+        }
+        if let Some(app) = a.pos.get(3) {
+            let list = shell::open_with_list(&key, true).map_err(fail)?;
+            let l = app.to_lowercase();
+            let h = list
+                .iter()
+                .find(|h| h.ui_name.to_lowercase() == l || h.name.to_lowercase() == l)
+                .or_else(|| list.iter().find(|h| h.ui_name.to_lowercase().contains(&l)))
+                .ok_or_else(|| fail(format!("no app named '{app}' can open {key} files")))?;
+            shell::set_own_default(&key, Some((&h.ui_name, &h.name))).map_err(fail)?;
+            return Ok(Out { v: json!({"ok": true, "ext": key, "default": h.ui_name, "name": h.name}), text: format!("{key} now always opens with {}\n", h.ui_name) });
+        }
+        let own = shell::own_default(&key);
+        let (win, _) = shell::default_app(&key);
+        return Ok(Out {
+            v: json!({"ok": true, "ext": key, "default": own.as_ref().map(|o| o.0.clone()), "windows_default": win}),
+            text: format!("{key}: {} (Windows default: {})\n", own.map(|o| o.0).unwrap_or_else(|| "not set, Windows decides".into()), if win.is_empty() { "none".to_string() } else { win }),
+        });
+    }
+    if let Some(app) = a.opt("--app").or_else(|| a.pos.get(2).map(|s| s.as_str())) {
         let h = shell::open_with(Path::new(p), app).map_err(fail)?;
         return Ok(Out { v: json!({"ok": true, "app": h.ui_name, "name": h.name}), text: format!("opened with {}\n", h.ui_name) });
     }
     let ext = ext_of(p);
     let list = shell::open_with_list(&ext, a.flag("--all")).map_err(fail)?;
+    let own = shell::own_default(&ext);
     let mut t = String::new();
     for h in &list {
-        t += &format!("{:<36} {}\n", trunc(&h.ui_name, 36), h.name);
+        let ours = own.as_ref().map(|o| o.1 == h.name).unwrap_or(false);
+        t += &format!("{:<36} {:<9} {}\n", trunc(&h.ui_name, 36), if ours { "ours" } else if h.default { "windows" } else { "" }, h.name);
     }
-    Ok(Out { v: json!({"ok": true, "ext": ext, "apps": list.iter().map(|h| json!({"ui_name": h.ui_name, "name": h.name, "recommended": h.recommended})).collect::<Vec<_>>()}), text: t })
+    Ok(Out {
+        v: json!({"ok": true, "ext": ext, "own_default": own.as_ref().map(|o| o.0.clone()), "apps": list.iter().map(|h| json!({"ui_name": h.ui_name, "name": h.name, "recommended": h.recommended, "windows_default": h.default, "own_default": own.as_ref().map(|o| o.1 == h.name).unwrap_or(false), "icon": h.icon})).collect::<Vec<_>>()}),
+        text: t,
+    })
 }
 
 fn cmd_reveal(a: &Args) -> R {
@@ -769,6 +866,9 @@ fn cmd_gui(a: &Args) -> R {
     if line.is_empty() {
         return Err(usage("gui needs a command"));
     }
+    if line[0] == "capture" {
+        return gui_capture(line.get(1..).map(|r| r.join(" ")).unwrap_or_default().trim());
+    }
     if line[0] == "shot-real" {
         return gui_shot_real(line.get(1..).map(|r| r.join(" ")).unwrap_or_default().trim());
     }
@@ -780,6 +880,97 @@ fn cmd_gui(a: &Args) -> R {
     let text = format!("{}
 ", serde_json::to_string_pretty(&v).unwrap());
     Ok(Out { v, text })
+}
+
+/// The window exactly as DWM composes it, backdrop (Mica / Acrylic) and per-pixel alpha included, through
+/// Windows.Graphics.Capture (PrintWindow cannot show the backdrop). Saves a PNG with the captured alpha and prints
+/// the colour and alpha at sample points of each panel, so transparency can be proven without a screen.
+fn gui_capture(file: &str) -> R {
+    use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
+    use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+    use windows::Graphics::DirectX::DirectXPixelFormat;
+    use windows::Win32::Foundation::{HMODULE, HWND};
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
+    use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+    use windows::core::Interface;
+    if file.is_empty() {
+        return Err(usage("gui capture <file.png>"));
+    }
+    let _ = fmcore::pipe::send("paint");
+    let reply = fmcore::pipe::send("state").map_err(fail)?;
+    let st: Value = serde_json::from_str(&reply).map_err(|_| fail("bad state reply".into()))?;
+    let hw = st["hwnd"].as_i64().ok_or_else(|| fail("the window gave no hwnd".into()))?;
+    let hwnd = HWND(hw as isize as *mut _);
+    let e = |m: &str, x: windows::core::Error| fail(format!("{m}: {}", x.message()));
+    unsafe {
+        let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
+        let mut dev: Option<ID3D11Device> = None;
+        let mut ctx: Option<ID3D11DeviceContext> = None;
+        D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut dev), None, Some(&mut ctx)).map_err(|x| e("D3D11CreateDevice", x))?;
+        let (dev, ctx) = (dev.unwrap(), ctx.unwrap());
+        let dxgi: IDXGIDevice = dev.cast().map_err(|x| e("IDXGIDevice", x))?;
+        let d3d: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi).and_then(|i| i.cast()).map_err(|x| e("WinRT device", x))?;
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|x| e("capture interop", x))?;
+        let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd).map_err(|x| e("CreateForWindow", x))?;
+        let size = item.Size().map_err(|x| e("item size", x))?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size).map_err(|x| e("frame pool", x))?;
+        let session = pool.CreateCaptureSession(&item).map_err(|x| e("session", x))?;
+        let _ = session.SetIsBorderRequired(false);
+        let _ = session.SetIsCursorCaptureEnabled(false);
+        session.StartCapture().map_err(|x| e("StartCapture", x))?;
+        let t0 = std::time::Instant::now();
+        let frame = loop {
+            if let Ok(f) = pool.TryGetNextFrame() {
+                break f;
+            }
+            if t0.elapsed() > std::time::Duration::from_secs(3) {
+                let _ = session.Close();
+                return Err(fail("no frame from Windows.Graphics.Capture in 3 s".into()));
+            }
+            let _ = fmcore::pipe::send("paint");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        };
+        let surf = frame.Surface().map_err(|x| e("surface", x))?;
+        let access: IDirect3DDxgiInterfaceAccess = surf.cast().map_err(|x| e("dxgi access", x))?;
+        let tex: ID3D11Texture2D = access.GetInterface().map_err(|x| e("texture", x))?;
+        let mut d = D3D11_TEXTURE2D_DESC::default();
+        tex.GetDesc(&mut d);
+        let sd = D3D11_TEXTURE2D_DESC { Usage: D3D11_USAGE_STAGING, BindFlags: 0, CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32, MiscFlags: 0, ..d };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        dev.CreateTexture2D(&sd, None, Some(&mut staging)).map_err(|x| e("staging", x))?;
+        let staging = staging.unwrap();
+        ctx.CopyResource(&staging, &tex);
+        let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+        ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).map_err(|x| e("map", x))?;
+        let (w, h) = (d.Width as usize, d.Height as usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let src = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), w * 4);
+            px[y * w * 4..(y + 1) * w * 4].copy_from_slice(src);
+        }
+        ctx.Unmap(&staging, 0);
+        let _ = frame.Close();
+        let _ = session.Close();
+        let _ = pool.Close();
+        // the window's client area starts at the frame's top-left (custom frame, no caption); sample each panel
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        let at = |x: f32, y: f32| {
+            let (xi, yi) = (((x * dpi) as usize).min(w - 1), ((y * dpi) as usize).min(h - 1));
+            let i = (yi * w + xi) * 4;
+            json!({"x": x, "y": y, "rgba": format!("#{:02X}{:02X}{:02X}", px[i + 2], px[i + 1], px[i]), "alpha": px[i + 3]})
+        };
+        let wl = w as f32 / dpi;
+        let samples = json!({
+            "titlebar": at(wl - 200.0, 4.0), "toolbar": at(wl - 260.0, 44.0), "sidebar": at(8.0, h as f32 / dpi - 60.0),
+            "content": at(wl - 40.0, h as f32 / dpi - 80.0),
+        });
+        thumb::save_png(&thumb::Image { width: w as u32, height: h as u32, bgra: px }, Path::new(file)).map_err(fail)?;
+        let text = format!("saved {file} ({w}x{h})\n{}\n", serde_json::to_string_pretty(&samples).unwrap());
+        Ok(Out { v: json!({"ok": true, "file": file, "size": [w, h], "samples": samples}), text })
+    }
 }
 
 /// The window as Windows composes it (DWM), not our own offscreen paint: PrintWindow with PW_RENDERFULLCONTENT.
@@ -827,26 +1018,44 @@ fn gui_shot_real(file: &str) -> R {
 
 fn cmd_default(a: &Args) -> R {
     let what = a.pos.get(1).map(|s| s.as_str()).unwrap_or("status");
+    // --root KEY (tests only): write under HKCU\KEY instead of HKCU\Software\Classes; it must name a test key
+    let root = match a.opt("--root") {
+        Some(r) if r.to_lowercase().contains("test") => r.trim_start_matches(r"HKCU\").to_string(),
+        Some(_) => return Err(usage("--root is for tests only: its key name must contain \"Test\"")),
+        None => fmcore::defaultfm::CLASSES.to_string(),
+    };
+    let st = |root: &str| {
+        let s = fmcore::defaultfm::status_in(root);
+        let mut t = String::new();
+        for (k, on) in s.parts() {
+            t += &format!("{:<12} {}\n", k, if on { "Rust File Explorer" } else { "Explorer" });
+        }
+        (json!({"default": s.folders, "all": s.all(), "parts": s.parts().iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>(), "root": root}), t)
+    };
     match what {
         "status" => {
-            let on = fmcore::defaultfm::is_default();
-            Ok(Out { v: json!({"ok": true, "default": on}), text: format!("{}
-", if on { "wfiles is the default file manager" } else { "Explorer is the default file manager" }) })
+            let (mut v, t) = st(&root);
+            v["ok"] = json!(true);
+            Ok(Out { v, text: t })
         }
         "set" | "restore" => {
             if !a.flag("--yes") {
                 return Err(usage(&format!("default {what} changes how Windows opens folders; add --yes")));
             }
             if what == "set" {
-                let exe = std::env::current_exe().map_err(|e| fail(e.to_string()))?.with_file_name("RustFileExplorer.exe");
-                fmcore::defaultfm::set(&exe).map_err(fail)?;
+                let exe = match a.opt("--exe") {
+                    Some(e) => std::path::PathBuf::from(e),
+                    None => std::env::current_exe().map_err(|e| fail(e.to_string()))?.with_file_name("RustFileExplorer.exe"),
+                };
+                fmcore::defaultfm::set_in(&root, &exe).map_err(fail)?;
             } else {
-                fmcore::defaultfm::restore().map_err(fail)?;
+                fmcore::defaultfm::restore_in(&root).map_err(fail)?;
             }
-            Ok(Out { v: json!({"ok": true, "default": fmcore::defaultfm::is_default()}), text: "done
-".into() })
+            let (mut v, t) = st(&root);
+            v["ok"] = json!(true);
+            Ok(Out { v, text: format!("done\n{t}") })
         }
-        _ => Err(usage("default status|set|restore")),
+        _ => Err(usage("default status|set|restore [--yes] [--root TESTKEY] [--exe PATH]")),
     }
 }
 

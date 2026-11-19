@@ -1,7 +1,9 @@
 # Measures start time (launch -> first visible top-level window) and memory of a GUI exe, on a never-shown desktop,
 # so nothing appears on the owner's screen. Runs N times, prints one line per run and the median.
-# Usage: powershell -File tools/measure.ps1 -Exe <full path> [-ArgLine "..."] [-Runs 5] [-Settle 3]
-param([string]$Exe, [string]$ArgLine = "", [int]$Runs = 5, [int]$Settle = 3)
+# Usage: powershell -File tools/measure.ps1 -Exe <full path> [-ArgLine "..."] [-Runs 5] [-Settle 3] [-Desktop Default]
+# -Desktop Default: the real desktop (give --offscreen in -ArgLine so the window stays off every monitor). Needed for
+# the true memory: on a never-shown desktop DirectComposition falls back to WARP (about 8 MB more).
+param([string]$Exe, [string]$ArgLine = "", [int]$Runs = 5, [int]$Settle = 3, [string]$Desktop = "wfiles_measure")
 Add-Type -TypeDefinition @"
 using System;
 using System.Diagnostics;
@@ -34,10 +36,12 @@ public static class Meas {
         EnumDesktopWindows(desk, (h, l) => { int p; GetWindowThreadProcessId(h, out p); if (p == target && IsWindowVisible(h)) { found = true; return false; } return true; }, IntPtr.Zero);
         return found;
     }
-    public static string Run(string exe, string args, int settleSec) {
-        IntPtr desk = CreateDesktop("wfiles_measure", IntPtr.Zero, IntPtr.Zero, 0, 0x10000000u, IntPtr.Zero);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr OpenDesktop(string name, int flags, bool inherit, uint access);
+    public static string Run(string exe, string args, int settleSec, string deskName) {
+        IntPtr desk = deskName == "Default" ? OpenDesktop("Default", 0, false, 0x0041u) : CreateDesktop(deskName, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000u, IntPtr.Zero);
         if (desk == IntPtr.Zero) return "error=CreateDesktop " + Marshal.GetLastWin32Error();
-        var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.lpDesktop = "WinSta0\\wfiles_measure";
+        var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.lpDesktop = "WinSta0\\" + deskName;
         si.dwFlags = 1; si.wShowWindow = 4;
         PROCESS_INFORMATION pi;
         var cmd = new StringBuilder("\"" + exe + "\" " + args);
@@ -58,7 +62,7 @@ public static class Meas {
 "@
 $res = @()
 for ($i = 1; $i -le $Runs; $i++) {
-    $r = [Meas]::Run($Exe, $ArgLine, $Settle); "run $i : $r"
+    $r = [Meas]::Run($Exe, $ArgLine, $Settle, $Desktop); "run $i : $r"
     if ($r -match "window_ms=(\S+) ws_mb=(\S+) private_mb=(\S+)") { $res += ,@([double]$matches[1], [double]$matches[2], [double]$matches[3]) }
     Start-Sleep -Milliseconds 500
 }

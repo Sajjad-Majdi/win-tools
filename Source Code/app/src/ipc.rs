@@ -48,9 +48,17 @@ pub fn send_to(name: &str, line: &str) -> Result<String, String> {
     }
 }
 
+/// The window's channel: "taskman", or "taskman-<WT_PIPE>" so a test window never shares the user's channel.
+pub fn window_channel() -> String {
+    match std::env::var("WT_PIPE") {
+        Ok(v) if !v.is_empty() => format!("taskman-{v}"),
+        _ => "taskman".into(),
+    }
+}
+
 /// The open Task Manager window.
 pub fn send(line: &str) -> Result<String, String> {
-    send_to("taskman", line).map_err(|_| "the Rust Task Manager window is not running (start RustTaskManager.exe)".to_string())
+    send_to(&window_channel(), line).map_err(|_| "the Rust Task Manager window is not running (start RustTaskManager.exe)".to_string())
 }
 
 fn create(p: &str) -> HANDLE {
@@ -97,5 +105,5 @@ pub fn serve_on(name: &str, handle: impl Fn(String) -> String) {
 }
 
 pub fn serve(handle: impl Fn(String) -> String) {
-    serve_on("taskman", handle)
+    serve_on(&window_channel(), handle)
 }

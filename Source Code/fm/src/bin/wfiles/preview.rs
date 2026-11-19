@@ -299,7 +299,11 @@ pub fn load(path: &Path, is_dir: bool) -> Data {
                 let l = l.replace('\t', "    ");
                 d.lines.push(if d.code { tokenize(&l, &ext, &mut block) } else { vec![(l, Tok::Plain)] });
             }
-            let lines = if total_lines > 0 { format!(" · {total_lines} lines") } else { String::new() };
+            let lines = match total_lines {
+                0 => String::new(),
+                1 => " · 1 line".to_string(),
+                n => format!(" · {n} lines"),
+            };
             d.meta = format!("{label} · {}{lines} · {when}", crate::fmt::size(size));
         }
         _ => {

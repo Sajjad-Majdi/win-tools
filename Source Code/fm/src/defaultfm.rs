@@ -1,18 +1,29 @@
 //! "Set as default file manager" / "Restore Explorer", per user (HKCU only, no admin rights).
 //!
-//! `set` makes folders, drives and Win+E open in RustFileExplorer.exe:
+//! `set` makes folders, drives, Win+E and the This PC / Recycle Bin desktop icons open in RustFileExplorer.exe:
 //! - `HKCU\Software\Classes\Directory\shell` and `...\Drive\shell`: default verb `openinwfiles` with
 //!   `"<RustFileExplorer.exe>" "%1"`;
-//! - `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command` (Win+E).
+//! - `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command` (Win+E);
+//! - `HKCU\Software\Classes\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\shell\open\command` (This PC) and
+//!   `...\CLSID\{645FF040-5081-101B-9F08-08002B27103E}\shell\open\command` (Recycle Bin): `"<exe>" "::{CLSID}"`, with
+//!   an empty `DelegateExecute` value so the per-user command wins over Explorer's delegate (as Files / Explorer++ do).
 //! `restore` deletes exactly those keys again, so Explorer is the handler once more.
-//! Only the GUI's Settings buttons (a click by the user) and `wfm default set|restore` run them.
+//! Only the GUI's Settings buttons (a click by the user) and `wfm default set|restore --yes` run them. Every function has
+//! an `_in(root, ...)` form: `root` replaces `Software\Classes` (tests use `Software\RustFileExplorerTest\Classes`).
 use crate::util::{Res, wide};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::*;
 use windows::core::PCWSTR;
 
+/// The real per-user classes root.
+pub const CLASSES: &str = r"Software\Classes";
+/// This PC and Recycle Bin (desktop icons, "shell:" names).
+pub const THIS_PC: &str = "{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+pub const RECYCLE_BIN: &str = "{645FF040-5081-101B-9F08-08002B27103E}";
+const MARK: &str = "WinToolsFiles";
+
 const VERB: &str = "openinwfiles";
-const WIN_E: &str = r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+const WIN_E: &str = r"CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
 
 fn set_value(path: &str, name: &str, value: &str) -> Res<()> {
     let p = wide(path);
@@ -35,12 +46,17 @@ fn set_value(path: &str, name: &str, value: &str) -> Res<()> {
 }
 
 fn get_value(path: &str, name: &str) -> Option<String> {
+    get_value_in(HKEY_CURRENT_USER, path, name)
+}
+
+/// A string value under any root (HKEY_CLASSES_ROOT = the merged HKCU + HKLM view Windows really uses).
+fn get_value_in(root: HKEY, path: &str, name: &str) -> Option<String> {
     let p = wide(path);
     let n = wide(name);
     let mut buf = vec![0u16; 1024];
     let mut size = (buf.len() * 2) as u32;
     unsafe {
-        let r = RegGetValueW(HKEY_CURRENT_USER, PCWSTR(p.as_ptr()), if name.is_empty() { PCWSTR::null() } else { PCWSTR(n.as_ptr()) }, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size));
+        let r = RegGetValueW(root, PCWSTR(p.as_ptr()), if name.is_empty() { PCWSTR::null() } else { PCWSTR(n.as_ptr()) }, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size));
         if r != ERROR_SUCCESS {
             return None;
         }
@@ -57,33 +73,131 @@ fn delete_tree(path: &str) {
     }
 }
 
-/// Is wfiles the per-user default for folders right now? (read only)
-pub fn is_default() -> bool {
-    get_value(r"Software\Classes\Directory\shell", "").as_deref() == Some(VERB)
+/// Delete a key only when nothing is left in it (no subkeys, no values): keys the user had stay.
+fn delete_if_empty(path: &str) {
+    let p = wide(path);
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(p.as_ptr()), None, KEY_READ, &mut key) != ERROR_SUCCESS {
+            return;
+        }
+        let (mut subkeys, mut values) = (0u32, 0u32);
+        let r = RegQueryInfoKeyW(key, None, None, None, Some(&mut subkeys), None, None, Some(&mut values), None, None, None, None);
+        let _ = RegCloseKey(key);
+        if r == ERROR_SUCCESS && subkeys == 0 && values == 0 {
+            let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(p.as_ptr()));
+        }
+    }
 }
 
-/// Make `exe` (full path of RustFileExplorer.exe) the default for folders, drives and Win+E.
+/// What `set` has made ours, part by part (read only).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Status {
+    pub folders: bool,
+    pub drives: bool,
+    pub win_e: bool,
+    pub this_pc: bool,
+}
+
+impl Status {
+    pub fn all(&self) -> bool {
+        self.folders && self.drives && self.win_e && self.this_pc
+    }
+    pub fn parts(&self) -> [(&'static str, bool); 4] {
+        [("folders", self.folders), ("drives", self.drives), ("win_e", self.win_e), ("this_pc", self.this_pc)]
+    }
+}
+
+pub fn status() -> Status {
+    status_in(CLASSES)
+}
+
+/// The Recycle Bin's own shell folder adds a built-in "open" that wins over a registry verb of the same name, so
+/// its verb has its own name; This PC keeps "open" (it works there).
+const RB_VERB: &str = "openinrfe";
+
+fn clsid_verb(id: &str) -> &'static str {
+    if id == RECYCLE_BIN { RB_VERB } else { "open" }
+}
+
+pub fn status_in(root: &str) -> Status {
+    let verb = |class: &str| get_value(&format!(r"{root}\{class}\shell"), "").as_deref() == Some(VERB) && get_value(&format!(r"{root}\{class}\shell\{VERB}\command"), "").is_some();
+    // ours AND effective: our open verb is there and it is the default verb Windows sees. On the real root the
+    // merged HKEY_CLASSES_ROOT is read (HKLM sets This PC's default verb to "none", which beats a lone HKCU verb).
+    let clsid = |id: &str| {
+        let v = clsid_verb(id);
+        let ours = get_value(&format!(r"{root}\CLSID\{id}\shell\{v}"), MARK).is_some() && get_value(&format!(r"{root}\CLSID\{id}\shell\{v}\command"), "").is_some();
+        let default_verb = if root == CLASSES { get_value_in(HKEY_CLASSES_ROOT, &format!(r"CLSID\{id}\shell"), "") } else { get_value(&format!(r"{root}\CLSID\{id}\shell"), "") };
+        let cmd = if root == CLASSES { get_value_in(HKEY_CLASSES_ROOT, &format!(r"CLSID\{id}\shell\{v}\command"), "") } else { get_value(&format!(r"{root}\CLSID\{id}\shell\{v}\command"), "") };
+        ours && default_verb.as_deref().map(|d| d.eq_ignore_ascii_case(v)).unwrap_or(false) && cmd.map(|c| c.contains(&format!("::{id}"))).unwrap_or(false)
+    };
+    Status {
+        folders: verb("Directory"),
+        drives: verb("Drive"),
+        win_e: get_value(&format!(r"{root}\{WIN_E}"), MARK).is_some(),
+        this_pc: clsid(THIS_PC),
+    }
+}
+
+/// Is Rust File Explorer the per-user default for folders right now? (read only)
+pub fn is_default() -> bool {
+    status().folders
+}
+
+/// Make `exe` (full path of RustFileExplorer.exe) the default for folders, drives, Win+E and This PC.
 pub fn set(exe: &std::path::Path) -> Res<()> {
+    set_in(CLASSES, exe)
+}
+
+pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
     let exe = exe.to_string_lossy();
     if !exe.to_lowercase().ends_with(".exe") {
         return Err("needs the full path of RustFileExplorer.exe".into());
     }
     for class in ["Directory", "Drive"] {
-        let base = format!(r"Software\Classes\{class}\shell");
+        let base = format!(r"{root}\{class}\shell");
         set_value(&format!(r"{base}\{VERB}"), "", "Open in Rust File Explorer")?;
         set_value(&format!(r"{base}\{VERB}\command"), "", &format!("\"{exe}\" \"%1\""))?;
         set_value(&base, "", VERB)?;
     }
-    set_value(&format!(r"{WIN_E}\shell\opennewwindow\command"), "", &format!("\"{exe}\""))?;
-    set_value(&format!(r"{WIN_E}\shell\opennewwindow\command"), "DelegateExecute", "")?;
-    set_value(WIN_E, "WinToolsFiles", "1")?;
+    let we = format!(r"{root}\{WIN_E}");
+    set_value(&format!(r"{we}\shell\opennewwindow\command"), "", &format!("\"{exe}\""))?;
+    set_value(&format!(r"{we}\shell\opennewwindow\command"), "DelegateExecute", "")?;
+    set_value(&we, MARK, "1")?;
+    // Recycle Bin: Windows 11 opens the desktop icon by itself and ignores registry verbs, so it is not set any more
+    // (Sajjad, 2026-11-19); keys an earlier 0.2.1 build wrote are removed here.
+    let rb = format!(r"{root}\CLSID\{RECYCLE_BIN}\shell");
+    if get_value(&rb, MARK).is_some() || get_value(&format!(r"{rb}\open"), MARK).is_some() || get_value(&format!(r"{rb}\{RB_VERB}"), MARK).is_some() {
+        delete_tree(&rb);
+        delete_if_empty(&format!(r"{root}\CLSID\{RECYCLE_BIN}"));
+    }
+    for id in [THIS_PC] {
+        let shell = format!(r"{root}\CLSID\{id}\shell");
+        // a verb from an earlier version (Recycle Bin used "open" before 0.2.1) goes first
+        if get_value(&shell, MARK).is_some() {
+            delete_tree(&shell);
+        }
+        let v = clsid_verb(id);
+        let open = format!(r"{shell}\{v}");
+        set_value(&open, "", "Open in Rust File Explorer")?;
+        set_value(&format!(r"{open}\command"), "", &format!("\"{exe}\" \"::{id}\""))?;
+        set_value(&format!(r"{open}\command"), "DelegateExecute", "")?;
+        set_value(&open, MARK, "1")?;
+        // the default verb: HKLM gives This PC "none" (its own navigation), so ours must be named here
+        set_value(&shell, "", v)?;
+        set_value(&shell, MARK, "1")?;
+    }
     Ok(())
 }
 
-/// Undo `set`: Explorer opens folders and Win+E again.
+/// Undo `set`: Explorer opens folders, Win+E, This PC and the Recycle Bin again.
 pub fn restore() -> Res<()> {
+    restore_in(CLASSES)
+}
+
+pub fn restore_in(root: &str) -> Res<()> {
     for class in ["Directory", "Drive"] {
-        let base = format!(r"Software\Classes\{class}\shell");
+        let base = format!(r"{root}\{class}\shell");
         delete_tree(&format!(r"{base}\{VERB}"));
         if get_value(&base, "").as_deref() == Some(VERB) {
             // remove only our default verb value
@@ -97,8 +211,19 @@ pub fn restore() -> Res<()> {
             }
         }
     }
-    if get_value(WIN_E, "WinToolsFiles").is_some() {
-        delete_tree(WIN_E);
+    let we = format!(r"{root}\{WIN_E}");
+    if get_value(&we, MARK).is_some() {
+        delete_tree(&we);
+    }
+    for id in [THIS_PC, RECYCLE_BIN] {
+        // our whole shell subtree goes (a default verb "open" left without its verb would break the icon), but only
+        // when it carries our marker
+        let shell = format!(r"{root}\CLSID\{id}\shell");
+        let marked = |v: &str| get_value(&format!(r"{shell}\{v}"), MARK).is_some();
+        if get_value(&shell, MARK).is_some() || marked("open") || marked(RB_VERB) {
+            delete_tree(&shell);
+            delete_if_empty(&format!(r"{root}\CLSID\{id}"));
+        }
     }
     Ok(())
 }

@@ -123,14 +123,14 @@ impl Sampler {
             let meta = if let Some(m) = self.meta.get(&key) {
                 m.clone()
             } else if with_meta {
-                let m = Arc::new(self.lookup_meta(pid));
+                let m = Arc::new(self.lookup_meta(pid, &name));
                 self.meta.insert(key, m.clone());
                 m
             } else {
                 Arc::new(Meta::default())
             };
             let title = titles.get(&pid).cloned().unwrap_or_default();
-            let kind = classify(pid, &name, &meta.path, !title.is_empty(), e.session);
+            let kind = classify(pid, &name, &meta, !title.is_empty(), e.session);
             out.push(Proc {
                 pid,
                 ppid: e.ppid as u32,
@@ -168,6 +168,31 @@ impl Sampler {
         self.procs = out;
     }
 
+    /// Processes we may not open (no admin) but that run a service: take the exe path from the service's own
+    /// config (readable without admin), so they get a name, icon and the right section (a third-party service
+    /// is Background, not Windows). `svc` = (pid, service name) of running services. Returns how many were filled.
+    pub fn fill_service_paths(&mut self, svc: &[(u32, String)], cache: &mut HashMap<String, String>) -> usize {
+        let mut done = 0;
+        for i in 0..self.procs.len() {
+            let (pid, ct) = (self.procs[i].pid, self.procs[i].create_time);
+            if pid <= 4 || !self.procs[i].meta.path.is_empty() {
+                continue;
+            }
+            let Some((_, name)) = svc.iter().find(|(p, _)| *p == pid) else { continue };
+            let path = cache.entry(name.clone()).or_insert_with(|| crate::services::details(name).map(|d| service_exe(&d.1)).unwrap_or_default()).clone();
+            if path.is_empty() {
+                continue;
+            }
+            let m = Arc::new(Meta { path: path.clone(), ..Default::default() });
+            self.meta.insert((pid, ct), m.clone());
+            let p = &mut self.procs[i];
+            p.meta = m;
+            p.kind = classify(pid, &p.name, &Meta { path: path.clone(), ..Default::default() }, !p.title.is_empty(), p.session);
+            done += 1;
+        }
+        done
+    }
+
     /// Add description/company (version resource, slow on a cold disk) to up to `budget` processes.
     /// Returns how many were filled; 0 = all done.
     pub fn fill_desc(&mut self, budget: usize) -> usize {
@@ -191,14 +216,27 @@ impl Sampler {
             };
             let nm = Arc::new(Meta { path: m.path.clone(), description, company, desc_done: true });
             self.meta.insert(key, nm.clone());
-            self.procs[i].meta = nm;
+            let p = &mut self.procs[i];
+            p.kind = classify(p.pid, &p.name, &nm, !p.title.is_empty(), p.session);
+            p.meta = nm;
             done += 1;
         }
         done
     }
 
-    fn lookup_meta(&mut self, pid: u32) -> Meta {
-        let path = image_path(pid).unwrap_or_default();
+    fn lookup_meta(&mut self, pid: u32, name: &str) -> Meta {
+        let mut path = image_path(pid).unwrap_or_default();
+        if path.is_empty() && pid > 4 {
+            // Windows' own protected processes (no access without admin) always run from System32
+            let n = name.to_string();
+            if SYSTEM32_PROTECTED.contains(&n.to_lowercase().as_str()) {
+                let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+                let p = format!(r"{root}\System32\{n}");
+                if std::path::Path::new(&p).exists() {
+                    path = p;
+                }
+            }
+        }
         match self.ver.get(&path) {
             Some((d, c)) => Meta { path, description: d.clone(), company: c.clone(), desc_done: true },
             None => Meta { path, ..Default::default() },
@@ -206,7 +244,43 @@ impl Sampler {
     }
 }
 
-fn classify(pid: u32, name: &str, path: &str, has_window: bool, session: u32) -> Kind {
+/// The exe of a service command line: `"C:\Program Files\X\x.exe" -k` or `C:\WINDOWS\system32\svchost.exe -k ...`.
+pub fn service_exe(cmd: &str) -> String {
+    let c = cmd.trim();
+    let raw = if let Some(rest) = c.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("").to_string()
+    } else {
+        let l = c.to_lowercase();
+        match l.find(".exe") {
+            Some(i) => c[..i + 4].to_string(),
+            None => c.split(' ').next().unwrap_or("").to_string(),
+        }
+    };
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let l = raw.to_lowercase();
+    if l.starts_with("%systemroot%") {
+        format!("{root}{}", &raw[12..])
+    } else if l.starts_with(r"\systemroot\") {
+        format!("{root}{}", &raw[11..])
+    } else {
+        raw
+    }
+}
+
+/// Protected Windows processes whose file is always System32\<name> (read for their name, icon and publisher).
+const SYSTEM32_PROTECTED: &[&str] = &["csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "smss.exe", "dwm.exe", "fontdrvhost.exe", "lsaiso.exe", "svchost.exe", "sihost.exe", "logonui.exe", "audiodg.exe", "spoolsv.exe", "wudfhost.exe", "dllhost.exe", "conhost.exe", "taskhostw.exe", "runtimebroker.exe", "searchindexer.exe", "wlanext.exe", "dashost.exe", "unsecapp.exe", "wmiprvse.exe"];
+
+/// Windows programs a person starts by hand: in the user's session they are their work, not a part of Windows.
+const USER_TOOLS: &[&str] = &["cmd.exe", "powershell.exe", "pwsh.exe", "ping.exe", "wsl.exe", "curl.exe", "tar.exe", "robocopy.exe", "xcopy.exe", "where.exe", "findstr.exe", "timeout.exe", "tasklist.exe", "ssh.exe", "certutil.exe", "netsh.exe", "ipconfig.exe", "tracert.exe", "nslookup.exe", "mspaint.exe", "calc.exe", "write.exe"];
+
+fn classify(pid: u32, name: &str, meta: &Meta, has_window: bool, session: u32) -> Kind {
+    let path = meta.path.as_str();
+    let company = meta.company.to_lowercase();
+    // a file in a Windows folder made by someone else (drivers' helper services) is not a part of Windows
+    let other_maker = !company.is_empty() && !company.contains("microsoft");
+    if !path.is_empty() && session != 0 && USER_TOOLS.contains(&name.to_lowercase().as_str()) {
+        return Kind::Background;
+    }
     if has_window && session != 0 && !path.is_empty() {
         let lp = path.to_ascii_lowercase();
         // explorer and shell hosts own windows but are Windows parts; still shown as apps like Task Manager does
@@ -218,7 +292,9 @@ fn classify(pid: u32, name: &str, path: &str, has_window: bool, session: u32) ->
     if pid <= 4 || path.is_empty() {
         return Kind::Windows;
     }
-    if path.to_ascii_lowercase().starts_with(r"c:\windows\") {
+    let lp = path.to_ascii_lowercase();
+    // Microsoft Defender lives outside C:\Windows but is a part of Windows
+    if (lp.starts_with(r"c:\windows\") && !other_maker) || lp.contains(r"\windows defender\") {
         Kind::Windows
     } else {
         Kind::Background
@@ -361,6 +437,20 @@ pub fn descendants(procs: &[Proc], pid: u32) -> Vec<u32> {
     out
 }
 
+/// Processes Windows cannot run without: ending one crashes Windows (blue screen), signs the user out or restarts
+/// the PC. The window asks with a clear warning first; `wtm kill` refuses them without --force.
+pub const CRITICAL: &[&str] = &[
+    "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+    "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "logonui.exe", "sihost.exe",
+    "userinit.exe", "wudfhost.exe", "audiodg.exe", "spoolsv.exe", "msmpeng.exe", "searchindexer.exe", "ctfmon.exe",
+];
+
+/// Is this a process Windows needs (see CRITICAL)?
+pub fn is_critical_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    CRITICAL.contains(&n.as_str())
+}
+
 pub fn terminate(pid: u32) -> Result<(), String> {
     if pid <= 4 {
         return Err("system process".into());
@@ -456,4 +546,19 @@ pub fn fmt_bytes(b: f64) -> String {
         i += 1;
     }
     if i == 0 { format!("{v:.0} {}", U[i]) } else if v < 10.0 { format!("{v:.1} {}", U[i]) } else { format!("{v:.0} {}", U[i]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn critical_names_and_service_exe() {
+        assert!(is_critical_name("CSRSS.EXE") && is_critical_name("svchost.exe") && is_critical_name("Memory Compression"));
+        assert!(!is_critical_name("ping.exe") && !is_critical_name("explorer.exe"));
+        assert_eq!(service_exe(r#""C:\Program Files\Windscribe\WindscribeService.exe" -x"#), r"C:\Program Files\Windscribe\WindscribeService.exe");
+        assert_eq!(service_exe(r"C:\WINDOWS\system32\svchost.exe -k netsvcs -p"), r"C:\WINDOWS\system32\svchost.exe");
+        assert!(service_exe(r"%SystemRoot%\System32\spoolsv.exe").to_lowercase().ends_with(r"\system32\spoolsv.exe"));
+        assert!(!service_exe(r"%SystemRoot%\System32\spoolsv.exe").contains('%'));
+    }
 }

@@ -198,7 +198,11 @@ fn same_file(a: &Path, b: &Path) -> Option<(bool, u64, u64, u64, u64)> {
     let mb = std::fs::metadata(b).ok()?;
     let ft = |m: &std::fs::Metadata| m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
     let (ta, tb) = (ft(&ma), ft(&mb));
-    let identical = ma.is_file() && mb.is_file() && ma.len() == mb.len() && ta.abs_diff(tb) <= 2;
+    // same size and the exact same time (a copy keeps it) = the same file; within 2 s (FAT keeps 2 s steps) only
+    // when the bytes match too, so two different files saved in the same second are never skipped silently
+    let exact = ma.modified().ok() == mb.modified().ok();
+    let same_bytes = || ma.len() <= 64 << 20 && std::fs::read(a).ok().zip(std::fs::read(b).ok()).map(|(x, y)| x == y).unwrap_or(false);
+    let identical = ma.is_file() && mb.is_file() && ma.len() == mb.len() && (exact || (ta.abs_diff(tb) <= 2 && same_bytes()));
     let to_ft = |s: u64| fmcore::util::unix_ft(s as i64);
     Some((identical, ma.len(), to_ft(ta), mb.len(), to_ft(tb)))
 }

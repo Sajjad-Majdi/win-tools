@@ -118,6 +118,9 @@ fn run(shared: Arc<Mutex<Shared>>, ctl: Arc<Ctl>) {
     let mut services: HashMap<u32, Vec<String>> = HashMap::new();
     let mut services_all: Arc<Vec<crate::services::Service>> = Arc::new(vec![]);
     let mut hist: Vec<HistAnomaly> = vec![];
+    // service name -> exe path (from the service config), for processes we may not open without admin
+    let mut svc_paths: HashMap<String, String> = HashMap::new();
+    let mut svc_pids: Vec<(u32, String)> = vec![];
     loop {
         let t0 = Instant::now();
         s.refresh(true);
@@ -155,6 +158,7 @@ fn run(shared: Arc<Mutex<Shared>>, ctl: Arc<Ctl>) {
                 more = true;
             }
         }
+        more |= s.fill_service_paths(&svc_pids, &mut svc_paths) > 0;
         more |= s.fill_desc(usize::MAX) > 0;
         if tick == 0 {
             // names and command lines are in: publish before the slower services, icons and startup entries
@@ -171,7 +175,10 @@ fn run(shared: Arc<Mutex<Shared>>, ctl: Arc<Ctl>) {
                     services.entry(x.pid).or_default().push(x.display.clone());
                 }
             }
+            svc_pids = all.iter().filter(|x| x.pid != 0 && x.state == "running").map(|x| (x.pid, x.name.clone())).collect();
             services_all = Arc::new(all);
+            s.fill_service_paths(&svc_pids, &mut svc_paths);
+            s.fill_desc(usize::MAX);
             more = true;
         }
         let px = ctl.icon_px.load(Relaxed);

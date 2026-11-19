@@ -93,6 +93,13 @@ fn cmd_why(target: Option<&String>) -> R {
 
 fn cmd_restart(target: Option<&String>) -> R {
     let pid: u32 = target.and_then(|p| p.parse().ok()).ok_or_else(|| usage("restart needs a PID"))?;
+    // a process Windows needs is never restarted (ending it can crash Windows), wherever its file is
+    let mut smp = wt::procs::Sampler::new();
+    smp.refresh(false);
+    let name = smp.procs.iter().find(|p| p.pid == pid).map(|p| p.name.clone()).unwrap_or_default();
+    if wt::procs::is_critical_name(&name) || pid <= 4 {
+        return Err((1, format!("refused: Windows needs {name} ({pid}); it is not restarted")));
+    }
     let new = wt::insight::restart(pid).map_err(|e| (1, e))?;
     Ok(Out { v: json!({"ok": true, "old_pid": pid, "new_pid": new}), text: format!("restarted: PID {pid} -> {new}\n") })
 }

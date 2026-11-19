@@ -90,7 +90,7 @@ impl App {
             }
         }
         if self.page != 0 {
-            let layer = Rect::new(12.0, TITLE_H, self.w - 24.0, self.h - TITLE_H - 12.0);
+            let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
             self.paint_toast(layer);
         }
         if self.menu.is_some() {
@@ -163,17 +163,23 @@ impl App {
     fn paint_flyout_body(&mut self, i: u8) {
         let t = self.t;
         let top = TITLE_H + if self.prefs.tiles { TILES_H } else { 0.0 } + 6.0;
-        let r = Rect::new(12.0, top, self.w - 24.0, 332.0);
+        let r = Rect::new(self.cx0(), top, self.w - self.cx0() - 12.0, 332.0);
         self.hit(r, Hit::Block);
         self.fly_card(r);
         let inner = r.inset(20.0, 18.0);
+        // a narrow window stacks the flyout: graph on top, the numbers below in two columns, no "Top now" column
+        let narrow = r.w < 760.0;
         let right_w = 232.0;
         let mid_w = 218.0;
-        let left = Rect::new(inner.x, inner.y, inner.w - right_w - mid_w - 56.0, inner.h);
-        let mid = Rect::new(left.r() + 28.0, inner.y, mid_w, inner.h);
-        let right = Rect::new(mid.r() + 28.0, inner.y, right_w, inner.h);
-        self.gfx.vline(right.x, inner.y, inner.b(), t.line);
-        let right = Rect::new(right.x + 24.0, right.y, right.w - 24.0, right.h);
+        let (left, mid, right) = if narrow {
+            (inner, Rect::new(inner.x, inner.y + 66.0 + 110.0 + 28.0, inner.w, inner.h - 204.0), Rect::default())
+        } else {
+            let left = Rect::new(inner.x, inner.y, inner.w - right_w - mid_w - 56.0, inner.h);
+            let mid = Rect::new(left.r() + 28.0, inner.y, mid_w, inner.h);
+            let right = Rect::new(mid.r() + 28.0, inner.y, right_w, inner.h);
+            self.gfx.vline(right.x, inner.y, inner.b(), t.line);
+            (left, mid, Rect::new(right.x + 24.0, right.y, right.w - 24.0, right.h))
+        };
         let s = self.perf.clone();
         let used = s.mem_total.saturating_sub(s.mem_avail);
         let series: Vec<f32> = self.tot[i as usize].iter().copied().collect();
@@ -204,7 +210,7 @@ impl App {
         let bw = g.text_at(&big, left.x, left.y + 22.0, 36.0, 200.0, Font::Display, 28.0, 600, t.t1);
         g.text_at(&small, left.x + bw + 6.0, left.y + 26.0, 36.0, 260.0, Font::Ui, 13.0, 400, t.t2);
         let gw = left.w.min(520.0);
-        let gr = Rect::new(left.x, left.y + 66.0, gw, 190.0);
+        let gr = Rect::new(left.x, left.y + 66.0, if narrow { left.w } else { gw }, if narrow { 110.0 } else { 190.0 });
         for f in [0.25f32, 0.5, 0.75] {
             g.hline(gr.x, gr.r(), (gr.y + gr.h * f).round(), t.line);
         }
@@ -219,6 +225,16 @@ impl App {
         let mut stats: Vec<(String, String)> = vec![];
         let mut my = mid.y + 2.0;
         match i {
+            0 if narrow => {
+                stats.push(("Logical processors".into(), s.cores.len().to_string()));
+                stats.push(("Up time".into(), model::fmt_dur(s.uptime_s)));
+                stats.push(("Processes".into(), s.processes.to_string()));
+            }
+            1 if narrow => {
+                stats.push(("Available".into(), model::fmt_gb(s.mem_avail)));
+                stats.push(("Cached".into(), model::fmt_gb(s.cached)));
+                stats.push(("Committed".into(), format!("{:.0} of {:.0} GB", s.commit_total as f64 / 1073741824.0, s.commit_limit as f64 / 1073741824.0)));
+            }
             0 => {
                 let n = s.cores.len();
                 self.gfx.text_at(&format!("{n} logical processors"), mid.x, my, 16.0, mid.w, Font::Ui, 12.0, 400, t.t2);
@@ -270,7 +286,7 @@ impl App {
                 let compressed = self.procs.iter().find(|p| p.name.eq_ignore_ascii_case("Memory Compression")).map(|p| p.ws).unwrap_or(0);
                 stats.push(("Available".into(), model::fmt_gb(s.mem_avail)));
                 stats.push(("Cached".into(), model::fmt_gb(s.cached)));
-                stats.push(("Reserved for apps".into(), format!("{:.0} of {:.0} GB", s.commit_total as f64 / 1073741824.0, s.commit_limit as f64 / 1073741824.0)));
+                stats.push(("Committed".into(), format!("{:.0} of {:.0} GB", s.commit_total as f64 / 1073741824.0, s.commit_limit as f64 / 1073741824.0)));
                 stats.push(("Compressed".into(), model::fmt_mem(compressed)));
             }
             2 => {
@@ -302,6 +318,17 @@ impl App {
                     stats.push(("GPU counters".into(), "Starting…".into()));
                 }
             }
+        }
+        if narrow {
+            // two columns of numbers under the graph
+            let cw = (mid.w - 24.0) / 2.0;
+            for (n, (k, v)) in stats.iter().take(6).enumerate() {
+                let (cx, cy) = (mid.x + (n % 2) as f32 * (cw + 24.0), mid.y + (n / 2) as f32 * 31.0);
+                self.gfx.hline(cx, cx + cw, cy, t.line);
+                self.gfx.text(k, Rect::new(cx, cy + 7.0, cw - 70.0, 17.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
+                self.gfx.text(v, Rect::new(cx + cw - 110.0, cy + 7.0, 110.0, 17.0), Font::Ui, 12.5, 400, Align::Right, t.t1);
+            }
+            return;
         }
         for (k, v) in &stats {
             self.gfx.hline(mid.x, mid.r(), my, t.line);
@@ -386,15 +413,18 @@ impl App {
         // (glyph, label, shortcut, separator before)
         let items: Vec<(u32, String, String, bool, bool)> = match kind {
             MenuKind::Row => {
-                let sys = self.sel_group().map(|g| g.kind == crate::procs::Kind::Windows).unwrap_or(false);
+                let sys = self.sel_group().map(|g| g.kind == crate::procs::Kind::Windows || crate::procs::is_critical_name(&g.exe)).unwrap_or(false);
+                // no readable path (needs administrator): the file actions are greyed instead of doing nothing
+                let path = self.sel_pid().and_then(|p| self.proc(p)).map(|p| !p.meta.path.is_empty()).unwrap_or(false) || self.sel_group().map(|g| !g.path.is_empty()).unwrap_or(false);
+                let (loc, props) = if path { ("Open file location", "Properties") } else { ("Open file location (needs admin)", "Properties (needs admin)") };
                 vec![
                     (0xE711, "End task".into(), "Del".into(), false, true),
                     (0, "End all with this name".into(), String::new(), false, true),
                     (0xE72C, "Restart".into(), String::new(), false, !sys),
                     (0xE9CE, "What is this?".into(), "F1".into(), true, true),
                     (0xE8FD, "Why is this running?".into(), String::new(), false, true),
-                    (0xE838, "Open file location".into(), String::new(), true, true),
-                    (0xE946, "Properties".into(), "Alt+Enter".into(), false, true),
+                    (0xE838, loc.into(), String::new(), true, path),
+                    (0xE946, props.into(), if path { "Alt+Enter".into() } else { String::new() }, false, path),
                     (0xE756, "Copy as command".into(), "Ctrl+Shift+C".into(), false, true),
                 ]
             }
@@ -407,7 +437,7 @@ impl App {
             }
         };
         let mw = match kind {
-            MenuKind::Row => 248.0,
+            MenuKind::Row => 268.0,
             MenuKind::Chips => 320.0,
             _ => 180.0,
         };
@@ -423,6 +453,8 @@ impl App {
         let up = my + mh > self.h - 8.0;
         let r = Rect::new(x, y + if up { -dy } else { dy }, mw, mh);
         self.fly_card(r);
+        // the menu blocks what is under it; its items (added after this) take the clicks
+        self.hit(r, Hit::Block);
         let mut iy = r.y + 4.0;
         for (i, (gl, label, short, sep, enabled)) in items.iter().enumerate() {
             if *sep {
@@ -446,7 +478,6 @@ impl App {
             }
             iy += 32.0;
         }
-        self.hit(r, Hit::Block);
         self.gfx.pop_alpha(old);
     }
 
@@ -454,7 +485,7 @@ impl App {
     fn paint_dialog(&mut self, closed: Option<Instant>) {
         let t = self.t;
         let Some(d) = &self.dialog else { return };
-        let (title, body, job, at) = (d.title.clone(), d.body.clone(), d.job.clone(), d.at);
+        let (title, body, job, at, danger, restart, cancel) = (d.title.clone(), d.body.clone(), d.job.clone(), d.at, d.danger, d.restart.is_some(), d.cancel);
         // opening: smoke fades in, the dialog springs from 1.05 to 1; closing: both fade, the dialog shrinks a little
         let (a, s) = match closed {
             None => (self.tween_in(at, motion::NORMAL, motion::decel), 1.05 - 0.05 * self.spring_in(at, motion::POP)),
@@ -487,9 +518,13 @@ impl App {
         self.gfx.stroke_round(r, 8.0, t.fly_s, 1.0);
         let x = r.x + 24.0;
         let mut y = r.y + 24.0;
-        self.gfx.text(&title, Rect::new(x, y, w - 48.0, 28.0), Font::Display, 20.0, 600, Align::Left, t.t1);
+        if danger {
+            self.gfx.glyph(0xE7BA, Rect::new(x, y, 22.0, 28.0), 20.0, t.crit);
+        }
+        let tx = if danger { x + 30.0 } else { x };
+        self.gfx.text(&title, Rect::new(tx, y, w - 48.0 - (tx - x), 28.0), Font::Display, 20.0, 600, Align::Left, t.t1);
         y += 28.0 + 12.0;
-        self.gfx.para(&body, Rect::new(x, y, w - 48.0, 200.0), Font::Ui, 14.0, 400, Align::Left, t.t1, 20.0);
+        self.gfx.para(&body, Rect::new(x, y, w - 48.0, 200.0), Font::Ui, 14.0, 400, Align::Left, if danger { t.crit } else { t.t1 }, 20.0);
         y += bh + 14.0;
         let mut fx = x;
         if !job.icon.is_empty() {
@@ -503,10 +538,12 @@ impl App {
         }
         let bw = (w - 48.0 - 8.0) / 2.0;
         let by = fr.y + 24.0;
-        self.button(Rect::new(x, by, bw, 32.0), "End task", 0, Btn::Crit, false, true, Hit::DlgEnd);
-        self.button(Rect::new(x + bw + 8.0, by, bw, 32.0), "Wait", 0, Btn::Std, false, true, Hit::DlgWait);
-        // default focus on "Wait"
-        self.gfx.stroke_round(Rect::new(x + bw + 8.0 - 3.0, by - 3.0, bw + 6.0, 38.0), 6.0, t.t1.fade(0.0), 2.0);
+        let action = if danger { "End anyway" } else if restart { "Restart" } else { "End task" };
+        self.button(Rect::new(x, by, bw, 32.0), action, 0, Btn::Crit, false, true, Hit::DlgEnd);
+        self.button(Rect::new(x + bw + 8.0, by, bw, 32.0), cancel, 0, Btn::Std, false, true, Hit::DlgWait);
+        // keyboard focus ring: Enter presses this button, Tab moves it
+        let fx = if self.dlg_focus == 0 { x } else { x + bw + 8.0 };
+        self.gfx.stroke_round(Rect::new(fx - 3.0, by - 3.0, bw + 6.0, 38.0), 6.0, t.t1, 2.0);
         self.gfx.pop_xf();
         self.gfx.pop_alpha(old);
     }

@@ -103,8 +103,12 @@ pub struct Gfx {
     pub dw: IDWriteFactory,
     rt: Option<ID2D1HwndRenderTarget>,
     base: Option<ID2D1RenderTarget>,
+    /// the window target as a device context (for the copy blend of see-through panels)
+    dc: Option<ID2D1DeviceContext>,
     /// offscreen target used for screenshots (drawn instead of the window while set)
     over: Option<ID2D1RenderTarget>,
+    /// the offscreen target keeps per-pixel alpha like the window (`wtm gui shot-alpha`)
+    over_alpha: bool,
     brush: Option<ID2D1SolidColorBrush>,
     formats: RefCell<HashMap<FmtKey, IDWriteTextFormat>>,
     hwnd: HWND,
@@ -151,7 +155,7 @@ impl Gfx {
             // code points on Windows 10. Check the font really has them, not only that the name exists.
             let icon_family = if has_glyph(&dw, "Segoe Fluent Icons", 0xE921) { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.to_string();
             let mono_family = if has("Cascadia Mono") { "Cascadia Mono" } else { "Consolas" }.to_string();
-            let mut g = Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, alpha: false, dpi: 96.0, fa: None, fallback: None, icon_family, mono_family, alpha_mul: Cell::new(1.0), font_scale: Cell::new(1.0), corner: Cell::new(1.0), xf_stack: RefCell::new(vec![]) };
+            let mut g = Gfx { d2, dw, rt: None, base: None, dc: None, over: None, over_alpha: false, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, alpha: false, dpi: 96.0, fa: None, fallback: None, icon_family, mono_family, alpha_mul: Cell::new(1.0), font_scale: Cell::new(1.0), corner: Cell::new(1.0), xf_stack: RefCell::new(vec![]) };
             g.load_fa();
             Ok(g)
         }
@@ -223,6 +227,7 @@ impl Gfx {
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             self.brush = rt.CreateSolidColorBrush(&C(1.0, 1.0, 1.0, 1.0).d2(), None).ok();
             self.base = rt.cast::<ID2D1RenderTarget>().ok();
+            self.dc = rt.cast::<ID2D1DeviceContext>().ok();
             self.rt = Some(rt);
             true
         }
@@ -232,11 +237,17 @@ impl Gfx {
     pub fn reset(&mut self) {
         self.rt = None;
         self.base = None;
+        self.dc = None;
         self.brush = None;
     }
 
     pub fn offscreen(&self) -> bool {
         self.over.is_some()
+    }
+
+    /// An opaque preview (`wtm gui shot`): see-through panels are drawn over the solid window colour instead.
+    pub fn preview(&self) -> bool {
+        self.over.is_some() && !self.over_alpha
     }
 
     pub fn begin(&self) {
@@ -261,11 +272,11 @@ impl Gfx {
     }
 
     /// Draw the next frames into a memory DC instead of the window (for `wtm gui shot`).
-    pub fn begin_offscreen(&mut self, dc: windows::Win32::Graphics::Gdi::HDC, px_w: u32, px_h: u32) -> bool {
+    pub fn begin_offscreen(&mut self, dc: windows::Win32::Graphics::Gdi::HDC, px_w: u32, px_h: u32, alpha: bool) -> bool {
         unsafe {
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: if alpha { D2D1_ALPHA_MODE_PREMULTIPLIED } else { D2D1_ALPHA_MODE_IGNORE } },
                 dpiX: self.dpi,
                 dpiY: self.dpi,
                 ..Default::default()
@@ -277,6 +288,10 @@ impl Gfx {
             }
             dcrt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             self.brush = dcrt.CreateSolidColorBrush(&C(1.0, 1.0, 1.0, 1.0).d2(), None).ok();
+            self.over_alpha = alpha;
+            if alpha {
+                self.dc = dcrt.cast::<ID2D1DeviceContext>().ok();
+            }
             self.over = dcrt.cast::<ID2D1RenderTarget>().ok();
             self.over.is_some()
         }
@@ -284,6 +299,10 @@ impl Gfx {
 
     pub fn end_offscreen(&mut self) {
         self.over = None;
+        if self.over_alpha {
+            self.over_alpha = false;
+            self.dc = self.rt.as_ref().and_then(|r| r.cast::<ID2D1DeviceContext>().ok());
+        }
         self.brush = self.base.as_ref().and_then(|b| unsafe { b.CreateSolidColorBrush(&C(1.0, 1.0, 1.0, 1.0).d2(), None).ok() });
     }
 
@@ -312,6 +331,14 @@ impl Gfx {
         unsafe { self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c)) };
     }
 
+    /// Rounded rect with exactly this radius (not changed by Settings > Corners; for the app icon).
+    pub fn fill_round_exact(&self, r: Rect, rad: f32, c: C) {
+        if c.3 <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        unsafe { self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c)) };
+    }
+
     pub fn stroke_round(&self, r: Rect, rad: f32, c: C, w: f32) {
         if c.3 <= 0.0 {
             return;
@@ -321,9 +348,25 @@ impl Gfx {
         unsafe { self.rt().DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c), w, None) };
     }
 
+    /// A see-through panel (window, content layer, card, side pane): on the window target with per-pixel alpha its
+    /// pixels REPLACE what is under them (copy blend, antialiased edges blend), so a card on the content layer
+    /// keeps the same alpha and the backdrop shows through both evenly. Opaque fills, fading overlays and
+    /// screenshots draw normally.
+    pub fn surface(&self, r: Rect, rad: f32, c: C) {
+        if c.3 < 0.999 && c.3 > 0.0 && self.alpha && !self.preview() && self.alpha_mul.get() >= 0.999
+            && let Some(dc) = &self.dc
+        {
+            unsafe { dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY) };
+            self.fill_round(r, rad, c);
+            unsafe { dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER) };
+            return;
+        }
+        self.fill_round(r, rad, c);
+    }
+
     /// Fill + 1px border (+ optional darker bottom border, like Fluent controls).
     pub fn card(&self, r: Rect, rad: f32, fill: C, border: C) {
-        self.fill_round(r, rad, fill);
+        self.surface(r, rad, fill);
         self.stroke_round(r, rad, border, 1.0);
     }
 
@@ -539,6 +582,30 @@ impl Gfx {
             let mut m = DWRITE_TEXT_METRICS::default();
             let _ = layout.GetMetrics(&mut m);
             m.height
+        }
+    }
+
+    /// Where the caret before char `chars` is drawn in a single line of `s` (DirectWrite hit-testing, so it is
+    /// right for Persian / mixed text too), and the line's full width.
+    pub fn caret_x(&self, s: &str, chars: usize, font: Font, size: f32, weight: u32) -> (f32, f32) {
+        if s.is_empty() {
+            return (0.0, 0.0);
+        }
+        let f = self.format(font, size, weight, Align::Left, false);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let pos: u32 = s.chars().take(chars).map(|c| c.len_utf16() as u32).sum();
+        unsafe {
+            let Ok(layout) = self.dw.CreateTextLayout(&w, &f, 10000.0, 100.0) else { return (0.0, 0.0) };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = layout.GetMetrics(&mut m);
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            let mut hm = DWRITE_HIT_TEST_METRICS::default();
+            // at the end: the trailing side of the last character
+            let (p, trailing) = if pos as usize >= w.len() { (w.len() as u32 - 1, true) } else { (pos, false) };
+            if layout.HitTestTextPosition(p, trailing, &mut x, &mut y, &mut hm).is_err() {
+                return (m.widthIncludingTrailingWhitespace, m.widthIncludingTrailingWhitespace);
+            }
+            (x, m.widthIncludingTrailingWhitespace)
         }
     }
 

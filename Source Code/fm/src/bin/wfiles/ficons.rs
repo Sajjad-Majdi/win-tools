@@ -175,6 +175,7 @@ pub fn type_label(name: &str, is_dir: bool) -> String {
         "mp3" => "MP3 audio",
         "wav" => "WAV audio",
         "lnk" => "Shortcut",
+        "url" => "Internet shortcut",
         "" => "File",
         _ => "",
     };

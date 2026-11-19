@@ -278,16 +278,23 @@ pub fn explain(p: &Proc, signed: Option<bool>) -> Answer {
         Verdict::Suspicious
     } else if p.kind == crate::procs::Kind::App {
         Verdict::Work
-    } else if path_l.starts_with(r"c:\windows\") {
+    } else if crate::procs::is_critical_name(&p.name) {
         Verdict::Critical
+    } else if path_l.starts_with(r"c:\windows\") && signed == Some(true) && company.to_lowercase().contains("microsoft") {
+        Verdict::Safe
     } else {
         Verdict::Unknown
     };
     let what_en = if desc.is_empty() { format!("{} (no description in the file)", p.name) } else { desc.clone() };
-    Answer { verdict, what_fa: String::new(), what_en, maker: company.clone(), notes, source: "file-info", ends_en: crate::insight::stop_effect(&p.name).unwrap_or_default() }
+    let ends_en = match verdict {
+        Verdict::Safe if crate::insight::stop_effect(&p.name).is_none() => "A Windows tool. Ending it stops only this tool; Windows keeps running.".to_string(),
+        _ => crate::insight::stop_effect(&p.name).unwrap_or_default(),
+    };
+    Answer { verdict, what_fa: String::new(), what_en, maker: company.clone(), notes, source: "file-info", ends_en }
 }
 
-/// Authenticode check of a file (WinVerifyTrust, no network revocation check). Takes ~5-30 ms.
+/// Authenticode check of a file (WinVerifyTrust, no network revocation check): its own embedded signature, or else
+/// a Windows catalog that lists its hash (most Windows files are catalog-signed). Takes ~5-30 ms.
 pub fn is_signed(path: &str) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Security::WinTrust::*;
@@ -308,10 +315,90 @@ pub fn is_signed(path: &str) -> bool {
         let r = WinVerifyTrust(HWND(-1isize as *mut _), &mut guid, &mut data as *mut _ as *mut _);
         data.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(HWND(-1isize as *mut _), &mut guid, &mut data as *mut _ as *mut _);
-        if r == 0 {
-            return true;
+        r == 0 || catalog_signed(path)
+    }
+}
+
+/// Is the file's hash in a signed Windows catalog (and does that catalog verify)?
+fn catalog_signed(path: &str) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::Security::Cryptography::Catalog::*;
+    use windows::Win32::Security::WinTrust::*;
+    use windows::Win32::Storage::FileSystem::*;
+    use windows::core::{PCWSTR, w};
+    let wp = crate::sys::wide(path);
+    unsafe {
+        let Ok(h) = CreateFileW(PCWSTR(wp.as_ptr()), FILE_GENERIC_READ.0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None) else { return false };
+        let mut ok = false;
+        // SHA-256 catalogs first (Windows 10+), then SHA-1 ones
+        for alg in [w!("SHA256"), PCWSTR::null()] {
+            let mut admin = 0isize;
+            if CryptCATAdminAcquireContext2(&mut admin, None, alg, None, None).is_err() {
+                continue;
+            }
+            let mut n = 0u32;
+            let _ = CryptCATAdminCalcHashFromFileHandle2(admin, h, &mut n, None, None);
+            let mut hash = vec![0u8; n.max(1) as usize];
+            if n > 0 && CryptCATAdminCalcHashFromFileHandle2(admin, h, &mut n, Some(hash.as_mut_ptr()), None).is_ok() {
+                hash.truncate(n as usize);
+                let cat = CryptCATAdminEnumCatalogFromHash(admin, &hash, None, None);
+                if cat != 0 {
+                    let mut info = CATALOG_INFO { cbStruct: size_of::<CATALOG_INFO>() as u32, ..Default::default() };
+                    if CryptCATCatalogInfoFromContext(cat, &mut info, 0).is_ok() {
+                        let tag: String = hash.iter().map(|b| format!("{b:02X}")).collect();
+                        let wtag = crate::sys::wide(&tag);
+                        let mut ci = WINTRUST_CATALOG_INFO {
+                            cbStruct: size_of::<WINTRUST_CATALOG_INFO>() as u32,
+                            pcwszCatalogFilePath: PCWSTR(info.wszCatalogFile.as_ptr()),
+                            pcwszMemberTag: PCWSTR(wtag.as_ptr()),
+                            pcwszMemberFilePath: PCWSTR(wp.as_ptr()),
+                            hMemberFile: h,
+                            pbCalculatedFileHash: hash.as_mut_ptr(),
+                            cbCalculatedFileHash: hash.len() as u32,
+                            hCatAdmin: admin,
+                            ..Default::default()
+                        };
+                        let mut data = WINTRUST_DATA {
+                            cbStruct: size_of::<WINTRUST_DATA>() as u32,
+                            dwUIChoice: WTD_UI_NONE,
+                            fdwRevocationChecks: WTD_REVOKE_NONE,
+                            dwUnionChoice: WTD_CHOICE_CATALOG,
+                            Anonymous: WINTRUST_DATA_0 { pCatalog: &mut ci },
+                            dwStateAction: WTD_STATEACTION_VERIFY,
+                            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+                            ..Default::default()
+                        };
+                        let mut guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+                        ok = WinVerifyTrust(HWND(-1isize as *mut _), &mut guid, &mut data as *mut _ as *mut _) == 0;
+                        data.dwStateAction = WTD_STATEACTION_CLOSE;
+                        WinVerifyTrust(HWND(-1isize as *mut _), &mut guid, &mut data as *mut _ as *mut _);
+                    }
+                    let _ = CryptCATAdminReleaseCatalogContext(admin, cat, 0);
+                }
+            }
+            let _ = CryptCATAdminReleaseContext(admin, 0);
+            if ok {
+                break;
+            }
         }
-        // Windows files are often catalog-signed, not embedded-signed: treat files under C:\Windows as signed
-        path.to_lowercase().starts_with(r"c:\windows\")
+        let _ = CloseHandle(h);
+        ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signature_is_real() {
+        // catalog-signed Windows tools verify; an unsigned exe (our own test binary) does not
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:/Windows".into());
+        for f in ["System32/PING.EXE", "System32/notepad.exe"] {
+            let p = format!("{root}/{f}");
+            if std::path::Path::new(&p).exists() {
+                assert!(super::is_signed(&p), "{p}");
+            }
+        }
+        let me = std::env::current_exe().unwrap();
+        assert!(!super::is_signed(&me.display().to_string()));
     }
 }

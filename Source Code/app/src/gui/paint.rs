@@ -207,6 +207,17 @@ impl App {
         total
     }
 
+    /// Border of a text field: one even, subtle line all round at rest; a clean accent ring when focused
+    /// (it fades in). No bottom bar.
+    pub fn input_ring(&self, r: Rect, h: Hit, focus: bool) {
+        let t = self.t;
+        let f = self.fade(hid(7, h), focus);
+        self.gfx.stroke_round(r, 4.0, t.inp_s.fade(1.0 - f), 1.0);
+        if f > 0.0 {
+            self.gfx.stroke_round(r, 4.0, t.acc.fade(f), 1.5);
+        }
+    }
+
     /// Selection highlight for a list: `base` is the list's origin row rect (y = top of content at scroll),
     /// `y` the selected row's content y. A new selection fades in; moving the selection glides the highlight
     /// with a spring and the accent pill stretches with its speed. `key` names the spring (one per list).
@@ -288,46 +299,179 @@ impl App {
         g.text_at(s, x, y, h, max_w, Font::Ui, size, 400, c)
     }
 
+    // ------------------------------------------------------------------ navigation sidebar
+    /// Left edge of the page content (right of the sidebar).
+    pub fn cx0(&self) -> f32 {
+        // the sidebar opened over a small window does not push the page
+        if self.nav_auto() { NAV_W + 8.0 } else { self.nav_w + 8.0 }
+    }
+
+    /// Is the content area narrow (fewer columns, no sparklines in the summary)?
+    pub fn narrow(&self) -> bool {
+        self.w - self.cx0() < 960.0
+    }
+
+    /// Is the sidebar expanded (the user's choice, and the window is wide enough)?
+    pub fn nav_open(&self) -> bool {
+        if self.nav_auto() { self.nav_peek } else { self.prefs.nav_open }
+    }
+
+    /// The sidebar is the user's choice (expanded or collapsed, remembered) at any width; only a window with less
+    /// than about 600 of content collapses it by itself, and then the toggle opens it over the page.
+    pub fn nav_auto(&self) -> bool {
+        self.w - NAV_W_OPEN - 20.0 < 600.0
+    }
+
+    /// Left sidebar: pane toggle, Processes, Startup apps; Settings at the bottom. Expanded 200 (icon + label),
+    /// collapsed 48 (icons, tooltip on hover). The accent pill at the left edge springs to the selected page.
+    pub fn paint_nav(&mut self) {
+        let t = self.t;
+        let target = if self.nav_open() { NAV_W_OPEN } else { NAV_W };
+        self.nav_w = self.glide(0x6500, target, motion::GLIDE).0.clamp(NAV_W - 4.0, NAV_W_OPEN + 4.0);
+        let w = self.nav_w;
+        let ih = if self.prefs.density == 0 { 32.0 } else { 36.0 };
+        let gap = 4.0;
+        let label_a = ((w - NAV_W) / (NAV_W_OPEN - NAV_W)).clamp(0.0, 1.0);
+        // narrow window: the opened sidebar is a panel over the page (drawn after it), with a shadow
+        if self.nav_auto() && w > NAV_W + 1.0 {
+            let pr = Rect::new(0.0, TITLE_H - 4.0, w, self.h - TITLE_H + 4.0);
+            self.gfx.shadow(pr, 0.0, 0.0, 24.0, 0.2 * t.sh);
+            self.gfx.fill(pr, t.fly);
+            self.gfx.vline(pr.r(), pr.y, pr.b(), t.fly_s);
+            self.hit(pr, Hit::Block);
+        }
+        // the pane toggle
+        let tr = Rect::new(4.0, TITLE_H + 2.0, 40.0, ih);
+        self.hp(tr, 4.0, Hit::NavToggle);
+        let pressed = self.press_begin(tr, Hit::NavToggle);
+        // a side-panel glyph (not a list), so it never looks like the Processes item under it
+        self.gfx.glyph(if self.nav_open() { 0xE8A0 } else { 0xE89F }, Rect::new(tr.x + 12.0, tr.y, 16.0, tr.h), 15.0, t.t1);
+        self.press_end(pressed);
+        self.hit(tr, Hit::NavToggle);
+        if self.nav_open() {
+            self.tip(tr, "Collapse sidebar");
+        }
+        // (glyph, label, y, page): Processes, Performance, Startup apps; Settings at the bottom
+        let items: [(u32, &str, f32, u8); 4] = [
+            (0xE8FD, "Processes", tr.b() + gap + 4.0, 0),
+            (0xE9D2, "Performance", tr.b() + gap + 4.0 + ih + gap, 3),
+            (0xE7E8, "Startup apps", tr.b() + gap + 4.0 + 2.0 * (ih + gap), 1),
+            (0xE713, "Settings", self.h - 12.0 - ih, 2),
+        ];
+        let mut sel_y = None;
+        for (glyph, label, y, page) in items.iter() {
+            let r = Rect::new(4.0, *y, w - 8.0, ih);
+            let h = Hit::Tab(*page);
+            let on = self.page == *page;
+            if on {
+                sel_y = Some(r.cy());
+                self.gfx.fill_round(r, 4.0, t.hov.fade(self.fade(hid(1, h), true)));
+            } else {
+                self.fade(hid(1, h), false);
+            }
+            self.hp(r, 4.0, h);
+            let pressed = self.press_begin(r, h);
+            self.gfx.glyph(*glyph, Rect::new(r.x + 12.0, r.y, 16.0, r.h), 15.0, if on { t.t1 } else { t.t2.mix(t.t1, self.hov(h)) });
+            if label_a > 0.01 {
+                self.gfx.clip(Rect::new(r.x, r.y, r.w, r.h));
+                self.gfx.text_at(label, r.x + 40.0, r.y, r.h, (r.w - 48.0).max(0.0), Font::Ui, 13.0, if on { 600 } else { 400 }, t.t1.fade(label_a));
+                self.gfx.unclip();
+            }
+            self.press_end(pressed);
+            self.hit(r, h);
+        }
+        if let Some(cy) = sel_y {
+            let (py, v) = self.glide(0x6501, cy, motion::GLIDE);
+            let ph = 16.0 + (v.abs() * 0.01).min(12.0);
+            self.gfx.fill_round(Rect::new(4.0, py - ph / 2.0, 3.0, ph), 1.5, t.acc);
+        }
+        // collapsed: the name of the hovered item in a small tooltip
+        if label_a < 0.5
+            && matches!(self.hover, Hit::Tab(_) | Hit::NavToggle)
+        {
+            let (label, y) = match self.hover {
+                Hit::Tab(p) => items.iter().find(|x| x.3 == p).map(|x| (x.1, x.2)).unwrap_or(("", tr.y)),
+                _ => (if self.nav_open() { "Collapse sidebar" } else { "Expand sidebar" }, tr.y),
+            };
+
+            self.nav_tip = Some((label, y + ih / 2.0));
+        } else {
+            self.nav_tip = None;
+        }
+    }
+
+    /// The collapsed sidebar's tooltip (drawn last, over the page).
+    pub fn paint_nav_tip(&mut self) {
+        let t = self.t;
+        let Some((label, cy)) = self.nav_tip else { return };
+        let a = self.fade(hid(8, self.hover), true);
+        let tw = self.gfx.measure(label, Font::Ui, 12.0, 400) + 20.0;
+        let r = Rect::new(self.nav_w + 2.0 - (1.0 - a) * 4.0, cy - 14.0, tw, 28.0);
+        let old = self.gfx.push_alpha(a);
+        self.gfx.shadow(r, 4.0, 4.0, 8.0, 0.12 * t.sh);
+        self.gfx.card(r, 4.0, t.fly, t.fly_s);
+        self.gfx.text(label, r, Font::Ui, 12.0, 400, Align::Center, t.t1);
+        self.gfx.pop_alpha(old);
+    }
+
+    /// The keyboard focus ring around the focused control (not for the list, the search box or text fields:
+    /// they show focus themselves).
+    pub fn paint_focus(&mut self) {
+        let Some(f) = self.focus else { return };
+        if matches!(f, Hit::List | Hit::Search | Hit::KeyField | Hit::HexField) || self.dialog.is_some() || self.menu.is_some() {
+            return;
+        }
+        if let Some(r) = self.hits.iter().rev().find(|(_, h)| *h == f).map(|(r, _)| *r) {
+            self.gfx.stroke_round(r.inset(-2.0, -2.0), 6.0, self.t.t1, 2.0);
+        }
+    }
+
+    /// The tooltip under the pointer, once it has rested 500 ms (not while a menu or dialog is open).
+    pub fn paint_tip(&mut self) {
+        let t = self.t;
+        if self.menu.is_some() || self.dialog.is_some() || self.pressed != Hit::None || self.rest_at.elapsed() < std::time::Duration::from_millis(500) {
+            return;
+        }
+        let (mx, my) = self.mouse;
+        let Some((_, text)) = self.tips.iter().rev().find(|(r, _)| r.has(mx, my)).cloned() else { return };
+        let maxw = 420.0f32.min(self.w - 16.0);
+        let tw = (self.gfx.measure(&text, Font::Ui, 12.0, 400) + 20.0).min(maxw);
+        let th = self.gfx.para_h(&text, tw - 20.0, Font::Ui, 12.0, 400, 16.0) + 12.0;
+        let mut x = (mx - 8.0).clamp(8.0, self.w - tw - 8.0);
+        let mut y = my + 22.0;
+        if y + th > self.h - 8.0 {
+            y = my - th - 10.0;
+        }
+        x = x.round();
+        y = y.round();
+        let r = Rect::new(x, y, tw, th);
+        self.gfx.shadow(r, 4.0, 4.0, 8.0, 0.12 * t.sh);
+        self.gfx.card(r, 4.0, t.fly, t.fly_s);
+        self.gfx.para(&text, Rect::new(r.x + 10.0, r.y + 6.0, tw - 20.0, th), Font::Ui, 12.0, 400, Align::Left, t.t1, 16.0);
+    }
+
     // ------------------------------------------------------------------ title bar
     pub fn paint_title(&mut self) {
         let t = self.t;
         let narrow = self.w < 1000.0;
+        let mut x = 16.0 + 16.0 + 18.0;
         // logo
         let g = &self.gfx;
+        // the app icon (installer/wintask.ico, tools/make_icons.py "light"): a light-gray rounded tile with three
+        // dark rounded bars, drawn from the same 1024-unit geometry scaled to 16
         let lr = Rect::new(16.0, 16.0, 16.0, 16.0);
-        g.fill_round(lr, 4.0, t.acc);
-        for (bx, bh) in [(3.0f32, 5.0f32), (7.0, 9.0), (11.0, 6.0)] {
-            g.fill_round(Rect::new(lr.x + bx, lr.b() - 3.0 - bh, 2.0, bh), 1.0, t.on_acc);
+        let u = 16.0 / 1024.0;
+        let tile = Rect::new(lr.x + 48.0 * u, lr.y + 48.0 * u, 928.0 * u, 928.0 * u);
+        // a hairline keeps the light tile visible on a light title bar (the icon itself has none)
+        g.fill_round_exact(tile.inset(-0.5, -0.5), 230.0 * u + 0.5, C(0.0, 0.0, 0.0, if t.dark { 0.0 } else { 0.10 }));
+        g.fill_round_exact(tile, 230.0 * u, C::hex(0xE1E2E5));
+        for (i, bh) in [220.0f32, 430.0, 310.0].iter().enumerate() {
+            let x = 262.0 + i as f32 * 190.0;
+            g.fill_round_exact(Rect::new(lr.x + x * u, lr.y + (740.0 - bh) * u, 120.0 * u, bh * u), 60.0 * u, C::hex(0x484C53));
         }
-        let mut x = lr.r() + 18.0;
         if !narrow {
             let nw = g.text_at("Rust Task Manager", lr.r() + 10.0, 0.0, TITLE_H, 150.0, Font::Ui, 12.0, 400, t.t2);
             x = lr.r() + 10.0 + nw + 18.0;
-        }
-        // tabs
-        let tabs = ["Processes", "Startup apps", "Settings"];
-        let mut tab_rects = vec![];
-        for (i, l) in tabs.iter().enumerate() {
-            let w = (self.gfx.measure(l, Font::Ui, 14.0, 400) + 24.0).ceil();
-            tab_rects.push(Rect::new(x, 8.0, w, 32.0));
-            x += w + 2.0;
-            let _ = i;
-        }
-        for (i, r) in tab_rects.iter().enumerate() {
-            let h = Hit::Tab(i as u8);
-            self.hp(*r, 4.0, h);
-            let on = self.fade(hid(1, h), self.page == i as u8);
-            let pressed = self.press_begin(*r, h);
-            self.gfx.text(tabs[i], *r, Font::Ui, 14.0, 400, Align::Center, t.t2.mix(t.t1, on));
-            self.press_end(pressed);
-            self.hit(*r, h);
-        }
-        {
-            // the pill springs to the new tab and stretches while it moves
-            let target = tab_rects[self.page as usize].cx() - 8.0;
-            let (px, v) = self.glide(0x5001, target, motion::GLIDE);
-            let st = (v.abs() * 0.02).min(14.0);
-            self.gfx.fill_round(Rect::new(px - st / 2.0, 36.0, 16.0 + st, 3.0), 1.5, t.acc);
         }
         // search, centred on the window
         let sw = if narrow { 280.0 } else { 340.0 };
@@ -338,12 +482,10 @@ impl App {
         {
             let g = &self.gfx;
             g.fill_round(sr, 4.0, t.inp.mix(t.ctl_h, shv));
-            g.stroke_round(sr, 4.0, t.inp_s, 1.0);
-            if focus {
-                g.fill_round(Rect::new(sr.x + 1.0, sr.b() - 2.0, sr.w - 2.0, 2.0), 1.0, t.acc);
-            } else {
-                g.fill(Rect::new(sr.x + 3.0, sr.b() - 1.0, sr.w - 6.0, 1.0), t.inp_b);
-            }
+        }
+        self.input_ring(sr, Hit::Search, focus);
+        {
+            let g = &self.gfx;
             g.glyph(0xE721, Rect::new(sr.r() - 10.0 - 12.0, sr.y, 12.0, sr.h), 12.0, t.t2);
             let tx = Rect::new(sr.x + 12.0, sr.y, sr.w - 12.0 - 60.0, sr.h);
             if self.query.is_empty() {
@@ -352,10 +494,18 @@ impl App {
                     g.fill(Rect::new(tx.x, sr.y + 8.0, 1.0, 16.0), t.t1);
                 }
             } else {
-                let qw = g.text_at(&self.query, tx.x, sr.y, sr.h, tx.w, Font::Ui, 13.0, 400, t.t1);
-                if focus {
-                    g.fill(Rect::new(tx.x + qw + 1.0, sr.y + 8.0, 1.0, 16.0), t.t1);
+                // the text scrolls so the caret stays in view (no "..." over a long query)
+                let (cx, full) = g.caret_x(&self.query, self.qcaret(), Font::Ui, 13.0, 400);
+                let off = if full <= tx.w - 2.0 { 0.0 } else { (cx - (tx.w - 4.0)).clamp(0.0, full - tx.w + 4.0) };
+                g.clip(Rect::new(tx.x - 2.0, sr.y, tx.w + 4.0, sr.h));
+                if self.q_all && self.search_focus {
+                    g.fill(Rect::new(tx.x - 1.0 - off, sr.y + 7.0, full + 2.0, 18.0), t.acc.a(0.30));
                 }
+                g.text(&self.query, Rect::new(tx.x - off, sr.y, full + 20.0, sr.h), Font::Ui, 13.0, 400, Align::Left, t.t1);
+                if focus && !self.q_all {
+                    g.fill(Rect::new(tx.x + cx - off, sr.y + 8.0, 1.0, 16.0), t.t1);
+                }
+                g.unclip();
             }
         }
         self.hit(sr, Hit::Search);
@@ -364,6 +514,7 @@ impl App {
             self.hp(cr, 4.0, Hit::SearchClear);
             self.gfx.glyph(0xE711, cr, 10.0, t.t2);
             self.hit(cr, Hit::SearchClear);
+            self.tip(cr, "Clear search (Esc)");
         }
         // caption buttons (Settings is the third tab, so nothing else sits next to them)
         let cx = self.w - CAP_W * 3.0;
@@ -444,12 +595,7 @@ impl App {
     pub fn paint_processes(&mut self) {
         let t = self.t;
         let mut y = TITLE_H;
-        if self.prefs.tiles {
-            self.paint_tiles();
-            y += TILES_H;
-        } else {
-            y -= 8.0;
-        }
+        y -= 8.0;
         let chips = if self.searching() || !self.prefs.chips { vec![] } else { self.chips() };
         // the chips row opens and closes with motion (height 0 <-> 30, fade)
         let ch = self.glide(0x6001, if chips.is_empty() { 0.0 } else { 8.0 + CHIPS_H }, motion::GLIDE).0.max(0.0);
@@ -460,20 +606,31 @@ impl App {
             self.gfx.pop_alpha(old);
         }
         y += ch;
-        let layer = Rect::new(12.0, y + 8.0, self.w - 24.0, self.h - y - 8.0 - 12.0);
+        let layer = Rect::new(self.cx0(), y + 8.0, self.w - self.cx0() - 12.0, self.h - y - 8.0 - 12.0);
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
         self.paint_cmdbar(layer);
-        let pane_w = self.pane.as_ref().map(|p| self.pane_w(p.kind)).unwrap_or(0.0);
-        let list = Rect::new(layer.x, layer.y + CMD_H, layer.w - pane_w, layer.h - CMD_H);
+        // a small window shows the pane over the list (the list keeps its full width)
+        let over = self.pane_overlay();
+        let pane_w = self.pane.as_ref().map(|p| self.pane_w(p.kind)).unwrap_or(0.0).min(layer.w - 40.0);
+        let list = Rect::new(layer.x, layer.y + CMD_H, layer.w - if over { 0.0 } else { pane_w }, layer.h - CMD_H);
         self.paint_list(list);
+        if self.focus == Some(Hit::List) {
+            self.gfx.stroke_round(list.inset(2.0, 2.0), 4.0, t.acc, 2.0);
+        }
         if pane_w > 0.0 {
-            let pr = Rect::new(list.r(), list.y, pane_w, list.h);
+            let pr = Rect::new(layer.r() - pane_w, list.y, pane_w, list.h);
+            if over {
+                self.gfx.shadow(pr, 0.0, 0.0, 24.0, 0.18 * t.sh);
+                // the list must not show through the pane laid over it
+                self.gfx.fill(pr, t.layer.a(1.0));
+            }
             self.paint_pane(pr, None);
         } else {
             self.pane_rect = Rect::default();
             if let Some((p, w, closed)) = { self.mo.borrow().ghost_pane.clone() } {
-                let pr = Rect::new(list.r() - w, list.y, w, list.h);
+                let w = w.min(layer.w - 40.0);
+                let pr = Rect::new(layer.r() - w, list.y, w, list.h);
                 let saved = self.scroll[3];
                 self.ghost(|a| {
                     a.pane = Some(p);
@@ -488,13 +645,16 @@ impl App {
         self.paint_toast(layer);
     }
 
+    #[allow(dead_code)]
     fn paint_tiles(&mut self) {
         let t = self.t;
-        let narrow = self.w < 1000.0;
-        let card = Rect::new(12.0, TITLE_H, self.w - 24.0, TILES_H);
+        let narrow = self.narrow();
+        let card = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, TILES_H);
         self.gfx.card(card, 8.0, t.card, t.card_s);
         let n = 5.0;
         let sw = (card.w - 2.0) / n;
+        // sparklines only where a tile has room for them next to "9.7 GB of 16 GB" (else the text is cut)
+        let narrow = narrow || sw < 215.0;
         let s = &self.perf;
         let used = s.mem_total.saturating_sub(s.mem_avail);
         let disk_rate: f64 = s.disks.iter().map(|d| d.read_rate + d.write_rate).sum();
@@ -509,13 +669,8 @@ impl App {
         let tdisk = top(&|g| g.io);
         let tgpu = top(&|g| g.gpu as f64);
         let cpu_first = self.tot[0].len() < 2;
-        // the big numbers glide to each new sample
-        let used = self.tv(0x7000, 1, used as f32) as u64;
-        let disk_rate = self.tv(0x7000, 2, disk_rate as f32) as f64;
-        let disk_pct = self.tv(0x7000, 3, disk_pct);
-        let net_rate = self.tv(0x7000, 4, net_rate as f32) as f64;
-        let gpu = self.tv(0x7000, 5, gpu);
-        let cpu_now = self.tv(0x7000, 0, if cpu_first { self.groups.iter().map(|g| g.cpu).sum::<f32>().min(100.0) } else { s.cpu });
+        // numbers change in place (no gliding: a calm, readable list)
+        let cpu_now = if cpu_first { self.groups.iter().map(|g| g.cpu).sum::<f32>().min(100.0) } else { s.cpu };
         let items: [(Res, &str, String, String, (String, String), f32, f32); 5] = [
             (Res::Cpu, "CPU", format!("{:.0}%", cpu_now), String::new(), tcpu.map(|(l, v)| (l, model::fmt_pct(v as f32))).unwrap_or_default(), 0.0, 10.0),
             (Res::Mem, "Memory", model::fmt_gb(used), format!("of {}", model::fmt_gb(s.mem_total)), tmem.map(|(l, v)| (l, model::fmt_mem(v as u64))).unwrap_or_default(), 0.0, s.mem_total as f32),
@@ -540,6 +695,14 @@ impl App {
                 let lit = on_a.max(self.hov(h)).max(self.hov(Hit::Tile(i as u8 - 1))).max(self.fade(hid(1, Hit::Tile(i as u8 - 1)), on == Some(i as u8 - 1)));
                 self.gfx.vline(r.x, card.y + 14.0, card.b() - 14.0, t.line.fade(1.0 - lit));
             }
+            // the tile's full text, also when it is cut
+            let tip = match res {
+                Res::Net => format!("Network {value} {small}\nDown {} · Up {}", model::fmt_rate(down), model::fmt_rate(up)),
+                _ if tn.is_empty() => format!("{label} {value} {small}"),
+                Res::Disk => format!("{label} {value} {small}\nTop I/O: {tn} {tv}"),
+                _ => format!("{label} {value} {small}\nTop: {tn} {tv}"),
+            };
+            self.tip(r, format!("{}\nClick for details", tip.replace("  ", " ")));
             let pressed = self.press_begin(r, h);
             let x = r.x + 16.0;
             let c = self.res_color(*res);
@@ -547,17 +710,21 @@ impl App {
             g.ellipse(x + 3.0, card.y + 18.0, 3.0, c, true, 0.0);
             g.text_at(label, x + 12.0, card.y + 10.0, 16.0, r.w - 40.0, Font::Ui, 12.0, 400, t.t2);
             let vw = g.text_at(value, x, card.y + 26.0, 26.0, r.w - 32.0, Font::Display, 20.0, 600, t.t1);
-            if !small.is_empty() {
+            // very small tiles keep only the name and the value (their details are in the flyout)
+            let tiny = sw < 150.0;
+            if !small.is_empty() && !tiny {
                 g.text_at(small, x + vw + 4.0, card.y + 28.0, 26.0, (r.w - 32.0 - vw - 4.0 - if narrow { 0.0 } else { 70.0 }).max(10.0), Font::Ui, 12.0, 400, t.t2);
             }
             // line 3: "Top: <name> <value>" (network: down / up, there is no per-app network counter)
             let ly = card.y + 52.0;
             let maxw = r.w - 32.0 - 4.0;
-            if *res == Res::Net {
-                let s3 = format!("Down {} · Up {}", if down < 1.0 { "0".into() } else { model::fmt_rate(down) }, if up < 1.0 { "0".into() } else { model::fmt_rate(up) });
+            if tiny {
+            } else if *res == Res::Net {
+                let s3 = format!("Down {} · Up {}", model::fmt_rate(down), model::fmt_rate(up));
                 g.text_at(&s3, x, ly, 16.0, maxw, Font::Ui, 12.0, 400, t.t2);
             } else if !tn.is_empty() {
-                let w1 = g.text_at("Top: ", x, ly, 16.0, maxw, Font::Ui, 12.0, 400, t.t2);
+                // the per-app number under Disk is all I/O (files, pipes, devices), so it says so
+                let w1 = g.text_at(if *res == Res::Disk { "Top I/O: " } else { "Top: " }, x, ly, 16.0, maxw, Font::Ui, 12.0, 400, t.t2);
                 let vw2 = g.measure(tv, Font::Ui, 12.0, 400);
                 let nw = g.measure(tn, Font::Ui, 12.0, 400).min(maxw - w1 - vw2 - 4.0).max(0.0);
                 g.text(tn, Rect::new(x + w1, ly, nw + 2.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t1);
@@ -580,7 +747,7 @@ impl App {
 
     fn paint_chips(&mut self, chips: &[Chip], y: f32) {
         let t = self.t;
-        let mut x = 12.0;
+        let mut x = self.cx0();
         let max_x = self.w - 12.0;
         for (i, c) in chips.iter().enumerate().take(3) {
             let tw = self.gfx.measure(&c.text, Font::Ui, 12.5, 400);
@@ -629,38 +796,74 @@ impl App {
         let y = layer.y + 8.0;
         let has = self.sel_group().is_some();
         let mut x = layer.x + 8.0;
+        // a small window shows the command bar as icons (each has a tooltip)
+        let compact = layer.w < 820.0;
+        let lab = |s: &'static str| if compact { "" } else { s };
         let end_label = if self.shift && has { "End process" } else { "End task" };
-        x += self.cmd_btn(x, y, end_label, 0xE711, false, false, has, Hit::EndTask) + 2.0;
+        let ew = self.cmd_btn(x, y, lab(end_label), 0xE711, false, false, has, Hit::EndTask);
+        if compact && has {
+            self.tip(Rect::new(x, y, ew, 32.0), format!("{end_label} (Del)"));
+        }
+        x += ew + 2.0;
+        let x_end = x;
         let can_restart = self.sel_group().map(|g| g.kind != Kind::Windows).unwrap_or(false);
-        x += self.cmd_btn(x, y, "Restart", 0xE72C, false, false, can_restart, Hit::Restart) + 2.0;
+        let rw = self.cmd_btn(x, y, lab("Restart"), 0xE72C, false, false, can_restart, Hit::Restart);
+        if compact && can_restart {
+            self.tip(Rect::new(x, y, rw, 32.0), "Restart");
+        }
+        // disabled buttons say why
+        if !has {
+            self.tip(Rect::new(layer.x + 8.0, y, x - layer.x - 8.0 + rw, 32.0), "Select a process first");
+        } else if !can_restart {
+            self.tip(Rect::new(x, y, rw, 32.0), "Windows processes are not restarted here");
+        }
+        x += rw + 2.0;
         let det_on = self.pane.as_ref().map(|p| p.kind == PaneKind::Details).unwrap_or(false);
-        x += self.cmd_btn(x, y, "Details", 0xE946, false, det_on, has, Hit::Details) + 2.0;
-        self.cmd_btn(x, y, "", 0xE712, false, false, has, Hit::More);
+        let dw = self.cmd_btn(x, y, lab("Details"), 0xE946, false, det_on, has, Hit::Details);
+        if compact && has {
+            self.tip(Rect::new(x, y, dw, 32.0), "Details (F1)");
+        }
+        x += dw + 2.0;
+        let mw = self.cmd_btn(x, y, "", 0xE712, false, false, has, Hit::More);
+        self.tip(Rect::new(x, y, mw, 32.0), if has { "More actions" } else { "Select a process first" });
+        let _ = x_end;
+        let left_end = x + mw;
         // right side
-        let sort = format!("Sort: {}", self.sort.label());
+        let sort = if compact { self.sort.label().to_string() } else { format!("Sort: {}", self.sort.label()) };
         let sw = 10.0 + 14.0 + 8.0 + self.gfx.measure(&sort, Font::Ui, 13.0, 400) + 6.0 + 9.0 + 10.0;
         let mut rx = layer.r() - 8.0 - sw.ceil();
         let menu_sort = self.menu.as_ref().map(|m| m.kind == MenuKind::Sort).unwrap_or(false);
         self.cmd_btn(rx, y, &sort, 0xE8CB, true, menu_sort, true, Hit::Sort);
-        let fw = 10.0 + 14.0 + 8.0 + self.gfx.measure("Free up memory", Font::Ui, 13.0, 400) + 10.0;
+        let fw = if compact { 34.0 } else { 10.0 + 14.0 + 8.0 + self.gfx.measure("Free up memory", Font::Ui, 13.0, 400) + 10.0 };
         rx -= fw.ceil() + 2.0;
         let free_on = self.pane.as_ref().map(|p| p.kind == PaneKind::Free).unwrap_or(false);
-        self.cmd_btn(rx, y, "Free up memory", 0xEA99, false, free_on, true, Hit::Free);
+        self.cmd_btn(rx, y, lab("Free up memory"), 0xEA99, false, free_on, true, Hit::Free);
+        if compact {
+            self.tip(Rect::new(rx, y, fw, 32.0), "Free up memory");
+        }
         let count = if self.searching() {
             let n = self.rows.iter().filter(|r| matches!(r.k, RowK::Group(_) | RowK::Child(..) | RowK::Startup(_) | RowK::Service(_))).count();
             let n = n - self.rows.iter().filter(|r| matches!(r.k, RowK::Group(gi) if self.groups[gi].members.len() > 1)).count();
-            format!("{n} matches")
+            if n == 1 { "1 match".to_string() } else { format!("{n} matches") }
         } else {
             format!("{} processes", self.procs.len().saturating_sub(1))
         };
         let cw = self.gfx.measure(&count, Font::Ui, 12.0, 400);
-        self.gfx.text(&count, Rect::new(rx - 8.0 - cw - 2.0, y, cw + 2.0, 32.0), Font::Ui, 12.0, 400, Align::Right, t.t3);
+        // the count only where it fits between the two button groups
+        if rx - 8.0 - cw - 2.0 > left_end + 12.0 {
+            self.gfx.text(&count, Rect::new(rx - 8.0 - cw - 2.0, y, cw + 2.0, 32.0), Font::Ui, 12.0, 400, Align::Right, t.t3);
+        }
     }
 
     /// List columns for a list of width `w` (content box x0..x1).
+    /// Is the side pane drawn over the list (content narrower than 800)?
+    pub fn pane_overlay(&self) -> bool {
+        self.w - self.cx0() - 12.0 < 800.0
+    }
+
     pub fn columns(&self, x0: f32, x1: f32) -> Vec<(Col, f32, f32)> {
-        let pane = self.pane.is_some();
-        let narrow = self.w < 1000.0;
+        let pane = self.pane.is_some() && !self.pane_overlay();
+        let narrow = self.narrow();
         let mut right: Vec<(Col, f32)> = vec![];
         let res: Vec<Res> = if pane { vec![Res::Cpu, Res::Mem] } else if narrow { vec![Res::Cpu, Res::Mem, Res::Disk] } else { RES_ALL.to_vec() };
         // a narrow list with the pane open drops the Type column so names stay readable
@@ -674,7 +877,8 @@ impl App {
             .into_iter()
             .filter(|r| match r {
                 Res::Disk => self.prefs.col_disk,
-                Res::Net => self.prefs.col_net,
+                // no per-app network counter without admin / ETW: the column is hidden until there is one
+                Res::Net => false,
                 Res::Gpu => self.prefs.col_gpu,
                 _ => true,
             })
@@ -689,6 +893,13 @@ impl App {
                     Res::Gpu => 84.0,
                 },
             ));
+        }
+        // a small window drops columns (GPU, PID, I/O, then Type) before the name gets too narrow
+        for drop in [Col::M(Res::Gpu), Col::Pid, Col::M(Res::Disk), Col::Type] {
+            if x1 - x0 - right.iter().map(|c| c.1).sum::<f32>() >= 200.0 {
+                break;
+            }
+            right.retain(|c| c.0 != drop);
         }
         let fixed: f32 = right.iter().map(|c| c.1).sum();
         let mut out = vec![(Col::Name, x0, (x1 - x0 - fixed).max(120.0))];
@@ -727,7 +938,7 @@ impl App {
                 Col::Pid => ("PID", true, 255),
                 Col::M(Res::Cpu) => ("CPU", true, 1),
                 Col::M(Res::Mem) => ("Memory", true, 2),
-                Col::M(Res::Disk) => ("Disk", true, 3),
+                Col::M(Res::Disk) => ("I/O", true, 3),
                 Col::M(Res::Net) => ("Network", true, 4),
                 Col::M(Res::Gpu) => ("GPU", true, 5),
             };
@@ -747,7 +958,7 @@ impl App {
             let lx = if right { x + w - lw - chev } else if *c == Col::Name { x + 46.0 } else { *x };
             self.gfx.text(label, Rect::new(lx, hy, lw + 2.0, HEAD_H), Font::Ui, 12.0, 400, Align::Left, fg);
             if on {
-                self.gfx.glyph(0xE70D, Rect::new(lx + lw + 4.0, hy + 1.0, 8.0, HEAD_H), 8.0, t.t1);
+                self.gfx.glyph(if self.sort_rev { 0xE70E } else { 0xE70D }, Rect::new(lx + lw + 4.0, hy + 1.0, 8.0, HEAD_H), 8.0, t.t1);
             }
             // "since boot" until the second CPU sample
             if *c == Col::M(Res::Cpu) && self.tot[0].len() < 2 && !self.procs.is_empty() {
@@ -759,6 +970,8 @@ impl App {
         // rows
         let view = Rect::new(list.x, hy + HEAD_H, list.w, list.h - HEAD_H);
         self.list_rect = view;
+        // the list as one keyboard stop (rows drawn after it take the clicks)
+        self.hit(view, Hit::List);
         self.view_h[0] = view.h;
         self.clamp_scroll();
         if std::mem::take(&mut self.want_scroll_sel)
@@ -792,9 +1005,12 @@ impl App {
             self.paint_row(i, row.k, r, &cols, &maxes);
             self.gfx.pop_alpha(old);
         }
+        self.painted = rows.iter().map(|r| self.row_id(r.k)).collect();
         self.rows = rows;
         if self.rows.is_empty() && !self.procs.is_empty() && self.searching() {
-            self.gfx.text("No matches", Rect::new(view.x, view.y + 30.0, view.w, 24.0), Font::Ui, 13.0, 400, Align::Center, t.t2);
+            let msg = format!("Nothing matches \"{}\"", self.query.trim());
+            self.gfx.text(&msg, Rect::new(view.x, view.y + 30.0, view.w, 24.0), Font::Ui, 13.0, 400, Align::Center, t.t2);
+            self.gfx.text("Search looks in names, descriptions, paths, command lines, startup apps and services.", Rect::new(view.x, view.y + 54.0, view.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.t3);
         }
         self.gfx.unclip();
         self.scrollbar(view, 0);
@@ -831,6 +1047,22 @@ impl App {
                 self.gfx.text_at(&n.to_string(), r.x + 12.0 + w + 8.0, r.y, r.h, 60.0, Font::Ui, 12.0, 400, t.t3);
                 return;
             }
+            RowK::Kind(si, n) => return self.paint_section(si, n, r, cols),
+            RowK::More(si, n) => {
+                let h = Hit::Row(i);
+                let label = if n > 0 { format!("Show all ({n})") } else { "Show fewer".to_string() };
+                let x = cols[0].1 + 46.0;
+                let lw = self.gfx.measure(&label, Font::Ui, 12.5, 600);
+                let br = Rect::new(x - 8.0, r.y + 3.0, lw + 16.0 + 16.0, r.h - 6.0);
+                self.hp(br, 4.0, h);
+                let pressed = self.press_begin(br, h);
+                self.gfx.text(&label, Rect::new(x, r.y, lw + 2.0, r.h), Font::Ui, 12.5, 600, Align::Left, t.acc_t);
+                self.gfx.glyph(if n > 0 { 0xE70D } else { 0xE70E }, Rect::new(x + lw + 6.0, r.y + 1.0, 9.0, r.h), 9.0, t.acc_t);
+                self.press_end(pressed);
+                self.hit(br, h);
+                let _ = si;
+                return;
+            }
             RowK::Startup(si) => return self.paint_search_startup(i, si, r),
             RowK::Service(si) => return self.paint_search_service(i, si, r),
             _ => {}
@@ -853,12 +1085,8 @@ impl App {
             }
             None => (g.cpu, g.mem, g.io, g.gpu, g.members.first().map(|m| m.pid).unwrap_or(0)),
         };
-        // numbers glide to each new sample
+        // numbers change in place; only the small bars ease (150 ms)
         let rid = self.row_id(k);
-        let cpu = self.tv(rid, 0, cpu);
-        let mem = self.tv(rid, 1, mem as f32) as u64;
-        let io = self.tv(rid, 2, io as f32) as f64;
-        let gpu = self.tv(rid, 3, gpu);
         let flag = if child.is_none() { self.flag(gi) } else { None };
         // ---- name cell
         let (nc_x, nc_w) = (cols[0].1, cols[0].2);
@@ -878,7 +1106,7 @@ impl App {
         self.draw_icon(&path, Rect::new(x, r.cy() - 8.0, 16.0, 16.0), 0xE737);
         x += 16.0 + 10.0;
         let limit = nc_x + nc_w - 12.0;
-        let show_exe = child.is_none() && self.pane.is_none() && self.w >= 1000.0 && flag.is_none() && !g.exe.eq_ignore_ascii_case(&g.label) && !g.label.starts_with("Service Host");
+        let show_exe = child.is_none() && self.pane.is_none() && !self.narrow() && flag.is_none() && !g.exe.eq_ignore_ascii_case(&g.label) && !g.label.starts_with("Service Host");
         // fixed parts after the name
         let count = if child.is_none() && multi { format!("({})", g.members.len()) } else { String::new() };
         let cw = if count.is_empty() { 0.0 } else { 5.0 + self.gfx.measure(&count, Font::Ui, 13.0, 400) };
@@ -890,6 +1118,9 @@ impl App {
         };
         let name_max = (limit - x - cw - lockw - flagw - if sub.is_empty() { 0.0 } else { 40.0 }).max(24.0);
         let nw = self.text_marked(&name, x, r.y, r.h, name_max, 13.0, t.t1);
+        // cut text gets a tooltip (the drawn width reaching the room means it was cut; no extra measuring)
+        let name_x = x;
+        let mut cut = nw >= name_max - 0.5;
         x += nw;
         if !count.is_empty() {
             self.gfx.text_at(&count, x + 5.0, r.y, r.h, 60.0, Font::Ui, 13.0, 400, t.t2);
@@ -900,8 +1131,16 @@ impl App {
             x += lockw;
         }
         if !sub.is_empty() && limit - x - 8.0 > 20.0 {
-            let sw = self.text_marked(&sub, x + 8.0, r.y + 0.5, r.h, limit - x - 8.0 - flagw, 12.0, t.t3);
+            let room = limit - x - 8.0 - flagw;
+            let sw = self.text_marked(&sub, x + 8.0, r.y + 0.5, r.h, room, 12.0, t.t3);
+            cut |= sw >= room - 0.5;
             x += 8.0 + sw;
+        } else if !sub.is_empty() {
+            cut = true;
+        }
+        if cut {
+            let full = if sub.is_empty() || child.is_some() { name.clone() } else { format!("{name} · {sub}") };
+            self.tip(Rect::new(name_x, r.y, limit - name_x, r.h), full);
         }
         if let Some((gl, s)) = &flag {
             self.pill(x + 10.0, r.cy(), s, *gl, t.warn, t.warn_bg, 20.0, 11.5, 400);
@@ -919,7 +1158,9 @@ impl App {
             match c {
                 Col::Type => {
                     if child.is_none() {
-                        self.pill(cell.x, r.cy(), g.type_label(), 0, t.t2, t.tag, 20.0, 11.5, 400);
+                        // on the selected row the tag needs more contrast than the usual tint
+                        let bg = if self.row_sel(k) { t.t1.a(if t.dark { 0.14 } else { 0.10 }) } else { t.tag };
+                        self.pill(cell.x, r.cy(), g.type_label(), 0, t.t2, bg, 20.0, 11.5, 400);
                     }
                 }
                 Col::Pid => {
@@ -981,6 +1222,26 @@ impl App {
                 Col::Name => {}
             }
         }
+    }
+
+    /// Section header of the grouped list: name + count, and the section's total CPU and memory in their columns.
+    fn paint_section(&mut self, si: u8, n: usize, r: Rect, cols: &[(Col, f32, f32)]) {
+        let t = self.t;
+        let kind = [Kind::App, Kind::Background, Kind::Windows][si as usize % 3];
+        let label = ["Apps", "Background processes", "Windows processes"][si as usize % 3];
+        let x = cols[0].1 + 20.0;
+        let w = self.gfx.text_at(label, x, r.y + 4.0, r.h - 4.0, 300.0, Font::Ui, 13.0, 600, t.t1);
+        self.gfx.text_at(&format!("({n})"), x + w + 6.0, r.y + 4.0, r.h - 4.0, 80.0, Font::Ui, 13.0, 400, t.t2);
+        let (cpu, mem) = self.groups.iter().filter(|g| g.kind == kind).fold((0.0f32, 0u64), |a, g| (a.0 + g.cpu, a.1 + g.mem));
+        for (c, cx, cw) in cols.iter().skip(1) {
+            let s = match c {
+                Col::M(Res::Cpu) => model::fmt_pct(cpu),
+                Col::M(Res::Mem) => model::fmt_mem(mem),
+                _ => continue,
+            };
+            self.gfx.text(&s, Rect::new(*cx, r.y + 4.0, *cw, r.h - 4.0), Font::Ui, 12.5, 600, Align::Right, t.t2);
+        }
+        self.gfx.hline(r.x + 8.0, r.r() - 8.0, r.b() - 1.0, t.line);
     }
 
     fn paint_search_startup(&mut self, i: usize, si: usize, r: Rect) {

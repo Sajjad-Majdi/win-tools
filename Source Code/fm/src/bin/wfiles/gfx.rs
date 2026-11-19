@@ -113,6 +113,44 @@ pub enum P {
     Z,
 }
 
+/// The see-through renderer: a premultiplied-alpha DXGI flip swap chain shown through DirectComposition. A GDI
+/// HwndRenderTarget only reaches DWM through the window's redirection bitmap, which is neither guaranteed to keep
+/// partial alpha nor drawn at all for a window off every monitor; a composition swap chain is DWM's own surface:
+/// every pixel's alpha is blended over the Mica / Acrylic backdrop.
+struct Comp {
+    swap: windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+    dc: ID2D1DeviceContext,
+    dcomp: windows::Win32::Graphics::DirectComposition::IDCompositionDevice,
+    target: windows::Win32::Graphics::DirectComposition::IDCompositionTarget,
+    _visual: windows::Win32::Graphics::DirectComposition::IDCompositionVisual,
+    size: (u32, u32),
+    has_bitmap: bool,
+}
+
+/// A D3D11 device made on a worker thread (driver loading is the slow part of the composition path).
+pub struct Dev(windows::Win32::Graphics::Direct3D11::ID3D11Device);
+// SAFETY: a D3D11 device made without D3D11_CREATE_DEVICE_SINGLETHREADED is free-threaded.
+unsafe impl Send for Dev {}
+
+/// Start making the hardware D3D11 device on a worker thread at once (before the window exists), so the first
+/// frame can already use it. No WARP: a failed device falls back to the CPU HwndRenderTarget.
+pub fn device_early() -> std::sync::mpsc::Receiver<Option<Dev>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::*;
+        let t0 = std::time::Instant::now();
+        let mut dev: Option<ID3D11Device> = None;
+        unsafe {
+            let _ = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut dev), None, None);
+        }
+        crate::app::trace(&format!("D3D11 device (worker) {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+        let _ = tx.send(dev.map(Dev));
+    });
+    rx
+}
+
 pub struct Gfx {
     pub d2: ID2D1Factory,
     pub dw: IDWriteFactory,
@@ -131,10 +169,22 @@ pub struct Gfx {
     /// corner radius factor: 1 = rounded, 0 = square (Personalize)
     pub corner: f32,
     xf: RefCell<Vec<windows_numerics::Matrix3x2>>,
+    comp: Option<Comp>,
+    /// the device being made on a worker thread
+    dev_rx: Option<std::sync::mpsc::Receiver<Option<Dev>>>,
+    dev: Option<windows::Win32::Graphics::Direct3D11::ID3D11Device>,
+    /// the HwndRenderTarget of the first frames: cleared to transparent once the composition frame is up
+    stale_rt: Option<ID2D1HwndRenderTarget>,
+    /// DirectComposition failed once: stay on the HwndRenderTarget
+    comp_failed: bool,
+    /// panels are see-through (Transparency above Off): only then the composition path (it costs a GPU device)
+    see_through: bool,
+    /// what draws the window now, for `wfm gui state`
+    pub renderer: &'static str,
 }
 
 impl Gfx {
-    pub fn new(hwnd: HWND, software: bool, alpha_target: bool) -> windows::core::Result<Gfx> {
+    pub fn new(hwnd: HWND, software: bool, alpha_target: bool, dev_rx: Option<std::sync::mpsc::Receiver<Option<Dev>>>) -> windows::core::Result<Gfx> {
         unsafe {
             let d2: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, Some(&D2D1_FACTORY_OPTIONS::default()))?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -150,7 +200,7 @@ impl Gfx {
                 c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).is_ok() && exists.as_bool()
             };
             let icon_family = if has("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }.to_string();
-            Ok(Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, dpi: 96.0, alpha_target, fa: None, icon_family, corner: 1.0, xf: RefCell::new(vec![]) })
+            Ok(Gfx { d2, dw, rt: None, base: None, over: None, brush: None, formats: RefCell::new(HashMap::new()), hwnd, software, dpi: 96.0, alpha_target, fa: None, icon_family, corner: 1.0, xf: RefCell::new(vec![]), comp: None, comp_failed: dev_rx.is_none(), dev_rx, dev: None, stale_rt: None, see_through: true, renderer: "none" })
         }
     }
 
@@ -181,18 +231,168 @@ impl Gfx {
     pub fn set_alpha(&mut self, on: bool) {
         if self.alpha_target != on {
             self.alpha_target = on;
-            self.rt = None;
-            self.base = None;
-            if self.over.is_none() {
-                self.brush = None;
+            // the composition swap chain is premultiplied either way (an opaque frame is just alpha 1); only the
+            // CPU fallback target has to be made again
+            if self.comp.is_none() {
+                self.rt = None;
+                self.base = None;
+                if self.over.is_none() {
+                    self.brush = None;
+                }
             }
         }
+    }
+
+    /// Panels see-through or not (kept for `wfm gui state`; one renderer draws both).
+    pub fn set_see_through(&mut self, on: bool) {
+        self.see_through = on;
+    }
+
+    /// Create the composition swap chain (D3D11 hardware, WARP as fallback) at the window's pixel size.
+    fn make_comp(&mut self, w: u32, h: u32) -> windows::core::Result<Comp> {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::DirectComposition::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let dev = match self.dev.clone() {
+                Some(d) => d,
+                None => {
+                    let mut dev: Option<ID3D11Device> = None;
+                    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+                    let made = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None);
+                    if made.is_err() || dev.is_none() {
+                        D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None)?;
+                    }
+                    let d = dev.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)))?;
+                    self.dev = Some(d.clone());
+                    d
+                }
+            };
+            let dxgi: IDXGIDevice = dev.cast()?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: w,
+                Height: h,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                ..Default::default()
+            };
+            let swap = factory.CreateSwapChainForComposition(&dev, &desc, None)?;
+            let f1: ID2D1Factory1 = self.d2.cast()?;
+            let d2dev = f1.CreateDevice(&dxgi)?;
+            let dc = d2dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
+            let target = dcomp.CreateTargetForHwnd(self.hwnd, true)?;
+            let visual = dcomp.CreateVisual()?;
+            visual.SetContent(&swap)?;
+            target.SetRoot(&visual)?;
+            dcomp.Commit()?;
+            Ok(Comp { swap, dc, dcomp, target, _visual: visual, size: (w, h), has_bitmap: false })
+        }
+    }
+
+    /// Point the device context at the swap chain's back buffer (after creation and every resize).
+    fn comp_bind(c: &mut Comp, dpi: f32) -> windows::core::Result<()> {
+        use windows::Win32::Graphics::Dxgi::IDXGISurface;
+        unsafe {
+            let surf: IDXGISurface = c.swap.GetBuffer(0)?;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: dpi,
+                dpiY: dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let bmp = c.dc.CreateBitmapFromDxgiSurface(&surf, Some(&props))?;
+            c.dc.SetTarget(&bmp);
+            c.dc.SetDpi(dpi, dpi);
+            c.has_bitmap = true;
+            Ok(())
+        }
+    }
+
+    /// The composition path for a see-through window; false = use the HwndRenderTarget.
+    fn ensure_comp(&mut self, w: u32, h: u32) -> bool {
+        if self.comp.is_none() {
+            // the device is still being made: draw through the HwndRenderTarget until then (the first frames)
+            // the device has been made on a worker since the start: wait for it once (no CPU / WARP frame first:
+            // WARP alone costs ~12 MB of working set and ~18 MB private)
+            if let Some(rx) = self.dev_rx.take() {
+                match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                    Ok(Some(d)) => self.dev = Some(d.0),
+                    _ => {
+                        self.comp_failed = true;
+                        return false;
+                    }
+                }
+            }
+            // the window's own surface is cleared after the first composition frame (nothing under the visual)
+            if let Some(rt) = self.rt.take() {
+                self.stale_rt = Some(rt);
+                self.base = None;
+                self.brush = None;
+            }
+            let t0 = std::time::Instant::now();
+            match self.make_comp(w, h) {
+                Ok(c) => self.comp = Some(c),
+                Err(_) => {
+                    self.comp_failed = true;
+                    return false;
+                }
+            }
+            crate::app::trace(&format!("composition swap chain {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+        }
+        let dpi = self.dpi;
+        let c = self.comp.as_mut().unwrap();
+        unsafe {
+            if c.size != (w, h) {
+                c.dc.SetTarget(None::<&ID2D1Image>);
+                c.has_bitmap = false;
+                if c.swap.ResizeBuffers(0, w, h, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN, windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0)).is_err() {
+                    self.comp = None;
+                    self.base = None;
+                    return false;
+                }
+                c.size = (w, h);
+            }
+            if !c.has_bitmap && Gfx::comp_bind(c, dpi).is_err() {
+                self.comp = None;
+                self.base = None;
+                return false;
+            }
+            c.dc.SetDpi(dpi, dpi);
+            if self.base.is_none() {
+                c.dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                self.brush = c.dc.CreateSolidColorBrush(&C(1.0, 1.0, 1.0, 1.0).d2(), None).ok();
+                self.base = c.dc.cast::<ID2D1RenderTarget>().ok();
+            }
+        }
+        self.renderer = "DirectComposition flip swap chain, premultiplied alpha";
+        true
     }
 
     pub fn ensure(&mut self, px_w: u32, px_h: u32) -> bool {
         if self.over.is_some() {
             return true;
         }
+        if !self.comp_failed {
+            if self.ensure_comp(px_w, px_h) {
+                return true;
+            }
+            if self.comp.is_none() && self.rt.is_none() {
+                self.base = None;
+                self.brush = None;
+            }
+        }
+        self.renderer = if self.alpha_target { "HwndRenderTarget, premultiplied alpha" } else { "HwndRenderTarget, opaque" };
         unsafe {
             if let Some(rt) = &self.rt {
                 let s = rt.GetPixelSize();
@@ -225,6 +425,26 @@ impl Gfx {
 
     pub fn end(&mut self) -> bool {
         let r = unsafe { self.rt().EndDraw(None, None) };
+        if self.over.is_none()
+            && let Some(c) = &self.comp
+        {
+            let p = unsafe { c.swap.Present(1, windows::Win32::Graphics::Dxgi::DXGI_PRESENT(0)) };
+            if let Some(rt) = self.stale_rt.take() {
+                unsafe {
+                    rt.BeginDraw();
+                    rt.Clear(Some(&C(0.0, 0.0, 0.0, 0.0).d2()));
+                    let _ = rt.EndDraw(None, None);
+                }
+            }
+            if r.is_err() || p.is_err() {
+                // device lost: everything is made again on the next frame
+                self.comp = None;
+                self.base = None;
+                self.brush = None;
+                return false;
+            }
+            return true;
+        }
         if r.is_err() && self.over.is_none() {
             self.rt = None;
             self.base = None;
@@ -505,6 +725,67 @@ impl Gfx {
         unsafe { self.rt().DrawText(&w, &f, &r.d2(), self.b(c), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL) };
     }
 
+    /// Cap height of a UI font as a share of its size (DirectWrite font metrics), cached.
+    fn cap_ratio(&self, font: Font, weight: u32) -> f32 {
+        thread_local! {
+            static CAP: RefCell<HashMap<(u8, u32), f32>> = RefCell::new(HashMap::new());
+        }
+        let key = (font as u8, weight);
+        if let Some(v) = CAP.with(|c| c.borrow().get(&key).copied()) {
+            return v;
+        }
+        let family = match font {
+            Font::Display => "Segoe UI Variable Display",
+            Font::Mono => "Cascadia Mono",
+            _ => "Segoe UI Variable Text",
+        };
+        let v = unsafe {
+            (|| -> Option<f32> {
+                let mut coll = None;
+                self.dw.GetSystemFontCollection(&mut coll, false).ok()?;
+                let c = coll?;
+                let w = wide(family);
+                let (mut idx, mut exists) = (0u32, windows::core::BOOL(0));
+                c.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).ok()?;
+                if !exists.as_bool() {
+                    return None;
+                }
+                let f = c.GetFontFamily(idx).ok()?.GetFirstMatchingFont(DWRITE_FONT_WEIGHT(weight as i32), DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL).ok()?;
+                let mut m = DWRITE_FONT_METRICS::default();
+                f.GetMetrics(&mut m);
+                (m.designUnitsPerEm > 0).then(|| m.capHeight as f32 / m.designUnitsPerEm as f32)
+            })()
+        }
+        .unwrap_or(0.7);
+        CAP.with(|c| c.borrow_mut().insert(key, v));
+        v
+    }
+
+    /// One line whose capital letters are centred on `r.cy()` (real font metrics, not the line box), so text lines up
+    /// with icons and glyph buttons drawn around the same centre. Cut with an ellipsis when too long.
+    pub fn text_mid(&mut self, s: &str, r: Rect, font: Font, size: f32, weight: u32, align: Align, c: C) {
+        if s.is_empty() || r.w <= 1.0 {
+            return;
+        }
+        let f = self.format(font, size, weight, align, false, false);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let cap = self.cap_ratio(font, weight) * size;
+        unsafe {
+            let Ok(layout) = self.dw.CreateTextLayout(&w, &f, r.w, r.h) else { return };
+            let mut lm = [DWRITE_LINE_METRICS::default()];
+            let mut n = 0u32;
+            if layout.GetLineMetrics(Some(&mut lm), &mut n).is_err() || n == 0 {
+                self.text(s, r, font, size, weight, align, c);
+                return;
+            }
+            // the format centres the line box in r; move it so the baseline sits cap/2 under the centre
+            let top = (r.h - lm[0].height) / 2.0;
+            let shift = (r.cy() + cap / 2.0) - (r.y + top + lm[0].baseline);
+            let shift = (shift * self.dpi / 96.0).round() / (self.dpi / 96.0);
+            self.rt().DrawTextLayout(Vector2 { X: r.x, Y: r.y + shift }, &layout, self.b(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
     /// Single line with coloured / bold ranges (search matches, tokens, tabular parts).
     pub fn text_spans(&mut self, s: &str, r: Rect, font: Font, size: f32, weight: u32, c: C, spans: &[Span]) {
         if s.is_empty() || r.w <= 1.0 {
@@ -622,6 +903,18 @@ impl Gfx {
     /// Draw part `src` (in bitmap pixels) of a bitmap into `dst`.
     pub fn bitmap_src(&self, bmp: &ID2D1Bitmap, dst: Rect, src: Rect, opacity: f32) {
         unsafe { self.rt().DrawBitmap(bmp, Some(&dst.d2()), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&src.d2())) };
+    }
+
+    /// Part `src` of a bitmap drawn into `dst` inside a rounded rectangle (thumbnails: no square corners stick out).
+    pub fn bitmap_round(&self, bmp: &ID2D1Bitmap, dst: Rect, src: Rect, rad: f32) {
+        unsafe {
+            let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+            let Ok(br) = self.rt().CreateBitmapBrush(bmp, Some(&props), None) else { return self.bitmap_src(bmp, dst, src, 1.0) };
+            let (sx, sy) = (dst.w / src.w.max(1.0), dst.h / src.h.max(1.0));
+            br.SetTransform(&windows_numerics::Matrix3x2 { M11: sx, M12: 0.0, M21: 0.0, M22: sy, M31: dst.x - src.x * sx, M32: dst.y - src.y * sy });
+            let rad = self.rad(rad);
+            self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: dst.d2(), radiusX: rad, radiusY: rad }, &br);
+        }
     }
 
     /// Left-to-right gradient fill (the Mica fallback).

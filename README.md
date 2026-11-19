@@ -34,6 +34,9 @@ Upgrading from 0.1.0 ("Win Tools"): just run the new installer. It removes the o
 - **Uninstall:** Settings > Apps > Installed apps > the app > Uninstall, or run `uninstall.exe` in the install folder.
   Your settings in `%LOCALAPPDATA%\WinTools` are kept; delete that folder to remove them too.
 - **Portable:** the `-portable.exe` files run from anywhere and change nothing on install.
+- **Everything:** the Rust File Explorer setup also installs [Everything](https://www.voidtools.com/) (voidtools, MIT)
+  when it is not on the PC, for instant whole-PC search and folder sizes. Windows asks for administrator rights for that
+  step only. Without Everything, search walks the current folder instead.
 
 The installer never changes system settings.
 

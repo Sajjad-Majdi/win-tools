@@ -52,6 +52,9 @@ pub struct Theme {
     pub foot: C,
     /// shadow strength for flyouts and dialogs
     pub sh: f32,
+    /// panel alpha: how opaque the window, title bar, sidebar, content, cards and side pane are over the
+    /// Mica / Acrylic backdrop (1 = opaque; Settings > Transparency)
+    pub pa: f32,
 }
 
 const fn rgba(r: u8, g: u8, b: u8, a: f32) -> C {
@@ -107,6 +110,7 @@ pub const LIGHT: Theme = Theme {
     code: C::hex(0xF0F3F7),
     foot: C::hex(0xF0F2F6),
     sh: 1.0,
+    pa: 1.0,
 };
 
 pub const DARK: Theme = Theme {
@@ -158,6 +162,7 @@ pub const DARK: Theme = Theme {
     code: C::hex(0x1F2228),
     foot: C::hex(0x262930),
     sh: 2.9,
+    pa: 1.0,
 };
 
 /// Windows app theme: HKCU ...\Themes\Personalize AppsUseLightTheme (missing = light).
@@ -184,6 +189,9 @@ fn mix(a: C, b: C, f: f32) -> C {
 fn luma(c: C) -> f32 {
     0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
 }
+
+/// Panel alpha for Settings > Transparency: Off, Low, Medium, High.
+pub const PANEL_ALPHA: [f32; 4] = [1.0, 0.75, 0.5, 0.3];
 
 /// Accent presets offered in Settings (base colours; light and dark shades are derived).
 pub const PRESETS: [(&str, u32); 8] = [
@@ -246,6 +254,12 @@ pub fn hex(c: C) -> String {
 /// The theme for light/dark, with the accent (`None` = the system accent) and the surface transparency
 /// (0 off .. 3 high) applied. The defaults keep the exact design values.
 pub fn make(dark: bool, accent: Option<u32>, transp: u8) -> Theme {
+    make_toned(dark, accent, transp, None)
+}
+
+/// Like `make`, with every neutral surface re-toned to one base hue (`base` = hue in degrees, chroma 0..1): one
+/// tonal palette for the whole window, steps differing mainly in lightness. Text is then checked for WCAG AA.
+pub fn make_toned(dark: bool, accent: Option<u32>, transp: u8, base: Option<(f32, f32)>) -> Theme {
     let mut t = make_sys(dark);
     if let Some(rgb) = accent {
         let (l, d) = accent_pair(rgb);
@@ -256,14 +270,23 @@ pub fn make(dark: bool, accent: Option<u32>, transp: u8) -> Theme {
         t.on_acc = if dark { mix(a, C::hex(0x000000), 0.85) } else { C::hex(0xF7FAFF) };
         t.acc_soft = t.acc.a(if dark { 0.15 } else { 0.11 });
     }
+    if let Some((hue, chroma)) = base {
+        tone(&mut t, hue, chroma);
+    }
     if transp > 0 {
-        // surfaces let the backdrop through; hover / press / selection become tints so they work on any surface
-        let (layer_a, card_a) = [(1.0, 1.0), (0.86, 0.9), (0.72, 0.8), (0.55, 0.68)][transp.min(3) as usize];
-        t.layer = t.layer.a(layer_a);
-        t.card = t.card.a(card_a);
-        t.layer_s = t.layer_s.a(0.8);
-        t.card_s = t.card_s.a(0.8);
+        // every panel (window, title bar, sidebar, content, cards, side pane) is the palette colour at one alpha,
+        // so the backdrop shows through evenly; text stays opaque. Hover / press / selection become tints that
+        // work on any surface. The window paints panels with a copy blend, so nested panels never add up.
+        let pa = PANEL_ALPHA[transp.min(3) as usize];
+        t.pa = pa;
+        for x in [&mut t.mica, &mut t.layer, &mut t.card, &mut t.foot, &mut t.code] {
+            *x = x.a(pa);
+        }
         let ink = if dark { C(1.0, 1.0, 1.0, 1.0) } else { C(0.0, 0.0, 0.0, 1.0) };
+        // borders: a tint, not an opaque grey, so they read on a see-through panel
+        t.layer_s = ink.a(if dark { 0.09 } else { 0.08 });
+        t.card_s = ink.a(if dark { 0.10 } else { 0.09 });
+        t.line = ink.a(if dark { 0.08 } else { 0.07 });
         t.hov = ink.a(if dark { 0.06 } else { 0.045 });
         t.prs = ink.a(if dark { 0.035 } else { 0.03 });
         t.sel = t.acc.a(if dark { 0.16 } else { 0.10 });
@@ -318,5 +341,91 @@ pub fn radius(r: f32, rounded: bool) -> f32 {
         r + 4.0
     } else {
         r
+    }
+}
+
+/// Re-tone the neutral tokens to `hue` with low chroma (clamped), keeping each token's lightness, then make the
+/// text colours meet WCAG AA (4.5:1) on every surface.
+pub fn tone(t: &mut Theme, hue: f32, chroma: f32) {
+    // `chroma` is absolute (0..1 of the full colour range), so light and dark tones get the same visible tint:
+    // near-white and near-black tokens have little room for colour, so they take a higher saturation
+    let c = chroma.clamp(0.0, 0.14);
+    let re = |x: C, k: f32| -> C {
+        let (_, _, l) = to_hsl(x);
+        let room = 1.0 - (2.0 * l - 1.0).abs();
+        let sat = if room > 1e-3 { (c * k / room).min(1.0) } else { 0.0 };
+        from_hsl(hue, sat, l).a(x.3)
+    };
+    for x in [&mut t.mica, &mut t.layer, &mut t.card, &mut t.fly, &mut t.hov, &mut t.prs, &mut t.ctl, &mut t.ctl_h, &mut t.inp, &mut t.code, &mut t.foot, &mut t.tag, &mut t.track] {
+        *x = re(*x, 1.0);
+    }
+    for x in [&mut t.layer_s, &mut t.card_s, &mut t.fly_s, &mut t.line, &mut t.ctl_s, &mut t.ctl_b, &mut t.inp_s, &mut t.inp_b] {
+        *x = re(*x, 0.8);
+    }
+    t.sel = re(t.sel, 1.6);
+    for x in [&mut t.t1, &mut t.t2, &mut t.t3] {
+        *x = re(*x, 0.35);
+    }
+    let surfaces = [t.mica, t.layer, t.card, t.fly, t.hov, t.sel];
+    t.t1 = readable(t.t1, &surfaces, 7.0, t.dark);
+    t.t2 = readable(t.t2, &surfaces, 4.5, t.dark);
+    t.t3 = readable(t.t3, &surfaces, 4.5, t.dark);
+}
+
+fn lum(c: C) -> f32 {
+    let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * f(c.0) + 0.7152 * f(c.1) + 0.0722 * f(c.2)
+}
+
+/// WCAG contrast ratio of two opaque colours.
+pub fn contrast(a: C, b: C) -> f32 {
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Darken (light theme) or lighten (dark theme) `fg` until it reaches `ratio` on every surface.
+fn readable(fg: C, on: &[C], ratio: f32, dark: bool) -> C {
+    let (h, s, mut l) = to_hsl(fg);
+    let mut c = fg;
+    for _ in 0..60 {
+        if on.iter().all(|b| contrast(c, b.a(1.0)) >= ratio) {
+            break;
+        }
+        l = if dark { (l + 0.01).min(1.0) } else { (l - 0.01).max(0.0) };
+        c = from_hsl(h, s, l);
+    }
+    c.a(fg.3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparency_sets_one_panel_alpha_and_keeps_text_opaque() {
+        for (tr, want) in [(0u8, 1.0f32), (1, 0.75), (2, 0.5), (3, 0.3)] {
+            let t = make_toned(true, None, tr, Some((25.0, 0.14)));
+            assert_eq!(t.pa, want);
+            for s in [t.mica, t.layer, t.card] {
+                assert!((s.3 - want).abs() < 1e-6);
+            }
+            assert!(t.t1.3 == 1.0 && t.t2.3 == 1.0 && t.fly.3 == 1.0);
+        }
+    }
+
+    #[test]
+    fn toned_palettes_keep_text_readable() {
+        for dark in [false, true] {
+            for hue in [25.0f32, 210.0, 120.0, 300.0] {
+                let t = make_toned(dark, None, 0, Some((hue, 0.3)));
+                for s in [t.mica, t.layer, t.card, t.fly, t.sel] {
+                    assert!(contrast(t.t2, s) >= 4.5 && contrast(t.t3, s) >= 4.5, "dark {dark} hue {hue}");
+                }
+                // one hue: the window background and the cards share it
+                let (h1, _, _) = to_hsl(t.mica);
+                let (h2, _, _) = to_hsl(t.card);
+                assert!((h1 - h2).abs() < 2.0);
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 
 pub fn size(n: u64) -> String {
     if n < 1024 {
-        return format!("{n} bytes");
+        return if n == 1 { "1 byte".into() } else { format!("{n} bytes") };
     }
     let units = ["KB", "MB", "GB", "TB"];
     let mut v = n as f64 / 1024.0;

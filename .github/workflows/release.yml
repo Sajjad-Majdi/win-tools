@@ -34,6 +34,16 @@ jobs:
         run: |
           if (-not (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) { choco install nsis -y --no-progress }
 
+      - name: Everything setup (voidtools, MIT; bundled into the File Explorer installer)
+        shell: pwsh
+        run: |
+          $d = "Source Code/installer/third-party"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $f = "$d/Everything-1.4.1.1032.x64-Setup.exe"
+          Invoke-WebRequest "https://www.voidtools.com/Everything-1.4.1.1032.x64-Setup.exe" -OutFile $f
+          $h = (Get-FileHash $f -Algorithm SHA256).Hash
+          if ($h -ne "C42EFAD041D4C0BB4D4AC97AE7CBE89F153EC1FE078772392E749C7F5D5282D3") { throw "Everything setup hash mismatch: $h" }
+
       - name: Build both apps and installers
         shell: pwsh
         run: |

@@ -44,10 +44,19 @@ VIAddVersionKey "LegalCopyright" "Sajjad"
 Section "${APPNAME}"
   ReadRegStr $R0 HKCU "Software\${APPID}" "InstallDir"
   SetOutPath "$INSTDIR"
-  ; an older copy may be open: replace it on the next start if the file is in use
-  SetOverwrite try
+  ; an older copy may be open: a running exe cannot be overwritten, but it can be renamed. Move it aside so the new
+  ; files always land; the old copies are deleted now if free, else at the next restart.
+  Delete "$INSTDIR\${EXE}.old"
+  Delete "$INSTDIR\${CLI}.old"
+  IfFileExists "$INSTDIR\${EXE}" 0 +2
+  Rename "$INSTDIR\${EXE}" "$INSTDIR\${EXE}.old"
+  IfFileExists "$INSTDIR\${CLI}" 0 +2
+  Rename "$INSTDIR\${CLI}" "$INSTDIR\${CLI}.old"
+  SetOverwrite on
   File "${STAGE}\${EXE}"
   File "${STAGE}\${CLI}"
+  Delete /REBOOTOK "$INSTDIR\${EXE}.old"
+  Delete /REBOOTOK "$INSTDIR\${CLI}.old"
   File "${STAGE}\LICENSES.txt"
   SetOverwrite on
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -80,12 +89,38 @@ Section "${APPNAME}"
 !endif
 SectionEnd
 
+!ifdef EVERYTHING
+; Everything (voidtools, MIT) gives Rust File Explorer instant whole-PC search and folder sizes.
+; Installed only when no Everything is found. Its own setup asks for administrator rights (it installs a service).
+Section "Everything search (voidtools)"
+  ReadRegStr $R1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything" "UninstallString"
+  StrCmp $R1 "" 0 ev_done
+  SetRegView 64
+  ReadRegStr $R1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything" "UninstallString"
+  SetRegView 32
+  StrCmp $R1 "" 0 ev_done
+  IfFileExists "$PROGRAMFILES64\Everything\Everything.exe" ev_done
+  IfFileExists "$PROGRAMFILES32\Everything\Everything.exe" ev_done
+  IfFileExists "$LOCALAPPDATA\Programs\Everything\Everything.exe" ev_done
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\EverythingSetup.exe" "${EVERYTHING}"
+  DetailPrint "Installing Everything search (voidtools)..."
+  ; ShellExecute so Windows shows the UAC prompt (a plain Exec of an elevated setup fails)
+  ExecShellWait "open" "$PLUGINSDIR\EverythingSetup.exe" "/S"
+  IfFileExists "$PROGRAMFILES64\Everything\Everything.exe" 0 ev_done
+  Exec '"$PROGRAMFILES64\Everything\Everything.exe" -startup'
+  ev_done:
+SectionEnd
+!endif
+
 Section "Uninstall"
   ; ask the open window to quit through its own CLI (no taskkill by name)
   nsExec::Exec '"$INSTDIR\${CLI}" gui quit'
   Sleep 400
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\${CLI}"
+  Delete "$INSTDIR\${EXE}.old"
+  Delete "$INSTDIR\${CLI}.old"
   Delete "$INSTDIR\LICENSES.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"

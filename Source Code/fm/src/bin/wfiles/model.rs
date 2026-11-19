@@ -73,6 +73,8 @@ pub struct Item {
     pub hl: Vec<(u32, u32)>,
     /// recycle bin: the record (for restore)
     pub recycled: Option<usize>,
+    /// a folder with nothing in it at all (not "0 bytes": that can be empty files or folders)
+    pub empty: bool,
 }
 
 impl Item {
@@ -89,6 +91,7 @@ impl Item {
             folder: String::new(),
             hl: vec![],
             recycled: None,
+            empty: false,
         }
     }
     pub fn hidden(&self) -> bool {
@@ -196,7 +199,8 @@ pub struct Pane {
     pub error: Option<String>,
     pub shown_at: Instant,
     pub back_anim: bool,
-    pub watch: Option<fmcore::watch::Watcher>,
+    /// the folder's watchers (the Desktop also watches the Public Desktop)
+    pub watch: Vec<fmcore::watch::Watcher>,
     pub hidden_count: usize,
     /// keyboard focus ring visible (set by arrow keys)
     pub kb: bool,
@@ -229,7 +233,7 @@ impl Pane {
             error: None,
             shown_at: Instant::now() - std::time::Duration::from_secs(5),
             back_anim: false,
-            watch: None,
+            watch: vec![],
             hidden_count: 0,
             kb: false,
             want: None,
@@ -270,6 +274,10 @@ impl Pane {
             let d = b.is_dir.cmp(&a.is_dir);
             if d != std::cmp::Ordering::Equal {
                 return d;
+            }
+            // by size, an unknown size goes after the known ones in both orders (it is not "0"); then by name
+            if col == SortCol::Size && a.size.is_some() != b.size.is_some() {
+                return b.size.is_some().cmp(&a.size.is_some());
             }
             let o = match col {
                 SortCol::Name => fmcore::list::natural_cmp(&a.name, &b.name),
@@ -329,6 +337,7 @@ pub fn recycle_items() -> (Vec<Item>, Vec<fmcore::recycle::Recycled>) {
                 folder: r.original.parent().map(|p| p.display().to_string()).unwrap_or_default(),
                 hl: vec![],
                 recycled: Some(i),
+                empty: false,
             }
         })
         .collect();
@@ -363,13 +372,53 @@ pub fn match_ranges(name: &str, words: &str) -> Vec<(u32, u32)> {
 }
 
 /// Known folders for the sidebar.
+/// Shell names Windows passes for its virtual folders (the desktop icons, "shell:" links) -> our pages.
+/// This PC: `::{20D04FE0-3AEA-1069-A2D8-08002B30309D}` / `shell:MyComputerFolder`; Recycle Bin:
+/// `::{645FF040-5081-101B-9F08-08002B27103E}` / `shell:RecycleBinFolder`.
+pub fn special_loc(s: &str) -> Option<Loc> {
+    let s = s.trim().trim_matches('"').to_ascii_lowercase();
+    let s = s.strip_prefix("shell:").unwrap_or(&s);
+    let s = s.trim_start_matches(':');
+    match s {
+        "{20d04fe0-3aea-1069-a2d8-08002b30309d}" | "mycomputerfolder" | "this pc" => Some(Loc::ThisPc),
+        "{645ff040-5081-101b-9f08-08002b27103e}" | "recyclebinfolder" | "recycle bin" => Some(Loc::RecycleBin),
+        _ => None,
+    }
+}
+
 pub fn known(id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
-    let p = match id {
-        "Desktop" => home.join("Desktop"),
-        "Downloads" => home.join("Downloads"),
-        "Documents" => home.join("Documents"),
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads};
+    let guid = match id {
+        "Desktop" => FOLDERID_Desktop,
+        "Downloads" => FOLDERID_Downloads,
+        "Documents" => FOLDERID_Documents,
         _ => return None,
     };
-    p.is_dir().then_some(p)
+    known_folder(&guid, id)
+}
+
+/// A known folder's real path (OneDrive-redirected folders included), cached; `name` = the fallback under the profile.
+fn known_folder(id: &windows::core::GUID, name: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::UI::Shell::{KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+    let c = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = c.lock().unwrap().get(name) {
+        return p.clone();
+    }
+    let p = unsafe { SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None) }
+        .ok()
+        .map(fmcore::util::take_pwstr)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(name)))
+        .filter(|p| p.is_dir());
+    c.lock().unwrap().insert(name.to_string(), p.clone());
+    p
+}
+
+/// The Public Desktop (FOLDERID_PublicDesktop): shortcuts installed "for all users" live there.
+pub fn public_desktop() -> Option<PathBuf> {
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_PublicDesktop, "PublicDesktop")
 }

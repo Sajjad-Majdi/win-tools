@@ -180,15 +180,13 @@ pub fn zip(srcs: &[PathBuf], out: &Path) -> Res<PathBuf> {
 
 /// Unpack an archive into `dir` (created when missing). .zip always works; .tar, .tgz, .7z and others go through
 /// tar.exe. Existing files with the same names are replaced.
-pub fn unzip(archive: &Path, dir: &Path) -> Res<PathBuf> {
+fn unzip_raw(archive: &Path, dir: &Path) -> Res<PathBuf> {
     let archive = abs(archive);
     let dir = abs(dir);
     if !archive.is_file() {
         return Err(format!("not found: {}", archive.display()));
     }
-    let created = !dir.exists();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let before: std::collections::HashSet<String> = crate::list::list_dir(&dir, true)?.into_iter().map(|e| e.name.to_lowercase()).collect();
     let is_zip = std::fs::File::open(&archive).ok().and_then(|mut f| {
         let mut m = [0u8; 4];
         f.read_exact(&mut m).ok().map(|_| m == [0x50, 0x4b, 0x03, 0x04] || m == [0x50, 0x4b, 0x05, 0x06])
@@ -215,6 +213,16 @@ pub fn unzip(archive: &Path, dir: &Path) -> Res<PathBuf> {
         run_ps(&script)
     };
     r?;
+    Ok(dir)
+}
+
+/// Extract `archive` into `dir` (made when missing) with no undo record. Existing files may be replaced: callers
+/// that must not overwrite give a new, empty folder (see `extract_safe`).
+pub fn unzip(archive: &Path, dir: &Path) -> Res<PathBuf> {
+    let dir = abs(dir);
+    let created = !dir.exists();
+    let before: std::collections::HashSet<String> = if created { Default::default() } else { crate::list::list_dir(&dir, true)?.into_iter().map(|e| e.name.to_lowercase()).collect() };
+    unzip_raw(archive, &dir)?;
     let mut op = crate::journal::Op::new("unzip");
     if created {
         op.created.push(dir.clone());
@@ -227,6 +235,47 @@ pub fn unzip(archive: &Path, dir: &Path) -> Res<PathBuf> {
     }
     crate::journal::record_quiet(op);
     Ok(dir)
+}
+
+/// Extract without ever overwriting anything, for the window's "Extract to" / "Extract here".
+/// "Extract to": into `parent\stem`, or `parent\stem (2)` when that name is taken.
+/// "Extract here": into a fresh hidden folder first; when no top-level name clashes with what is already in
+/// `parent` the entries move there, else the whole set stays together in `parent\stem (2)`.
+/// One undo step removes exactly what this run made. Returns (where it went, true when it had to use a new
+/// folder because of a clash).
+pub fn extract_safe(archive: &Path, parent: &Path, stem: &str, here: bool) -> Res<(PathBuf, bool)> {
+    let parent = abs(parent);
+    let want = parent.join(stem);
+    if !here {
+        let target = if crate::journal::exists(&want) { crate::ops::unique_name(&want) } else { want.clone() };
+        let out = unzip_raw(archive, &target)?;
+        let mut op = crate::journal::Op::new("unzip");
+        op.created.push(out.clone());
+        crate::journal::record_quiet(op);
+        return Ok((out, target != want));
+    }
+    let tmp = parent.join(format!(".rfe-extract-{}", std::process::id()));
+    let tmp = if crate::journal::exists(&tmp) { crate::ops::unique_name(&tmp) } else { tmp };
+    unzip_raw(archive, &tmp)?;
+    let names: Vec<String> = crate::list::list_dir(&tmp, true)?.into_iter().map(|e| e.name).collect();
+    let clash = names.iter().any(|n| crate::journal::exists(&parent.join(n)));
+    let mut op = crate::journal::Op::new("unzip");
+    let (out, moved_to_new) = if clash {
+        let target = crate::ops::unique_name(&want);
+        std::fs::rename(&tmp, &target).map_err(|e| format!("cannot rename {}: {e}", tmp.display()))?;
+        op.created.push(target.clone());
+        (target, true)
+    } else {
+        for n in &names {
+            let to = parent.join(n);
+            std::fs::rename(tmp.join(n), &to).map_err(|e| format!("cannot move {n}: {e}"))?;
+            op.created.push(to);
+        }
+        let _ = std::fs::remove_dir(&tmp);
+        (parent.clone(), false)
+    };
+    crate::journal::record_quiet(op);
+    Ok((out, moved_to_new))
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ pub mod motion;
 mod over;
 mod pages;
 mod paint;
+mod perfpage;
 pub mod prefs;
 mod side;
 pub mod theme;

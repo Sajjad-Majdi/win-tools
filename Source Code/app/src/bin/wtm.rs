@@ -14,6 +14,7 @@ USAGE: wtm <command> [args] [--json]
 Processes
   list [--sort impact|cpu|mem|io|name|pid] [--top N] [--kind app|background|windows] [--interval MS]
   list --merge [--top N]             same-name processes as one row (children named by their script / role)
+  list --group [--sort K] [--top N]  sections like the window: Apps, Background, Windows (count, CPU, memory)
   find <words...> [--top N]          search name, window title, description, company, PID, path, command line
   info <pid|name>                    details: path, command line, parent, children, memory, services inside
   tree [pid]                         process tree (all, or below one PID)
@@ -217,6 +218,8 @@ fn run(args: &[String]) -> R {
     }
 }
 
+const SORTS: [&str; 9] = ["cpu", "mem", "memory", "io", "disk", "name", "pid", "impact", "gpu"];
+
 fn sort_procs(v: &mut [&Proc], by: &str) {
     match by {
         "mem" | "memory" => v.sort_by(|a, b| b.mem.cmp(&a.mem)),
@@ -240,7 +243,17 @@ fn cmd_list(args: &[String]) -> R {
     if let Some(k) = opt(args, "--kind") {
         v.retain(|p| p.kind.as_str() == k);
     }
-    sort_procs(&mut v, opt(args, "--sort").unwrap_or("cpu"));
+    // grouped like the window: Impact unless --sort says otherwise
+    let grouped = flag(args, "--group");
+    if let Some(k) = opt(args, "--sort")
+        && !SORTS.contains(&k)
+    {
+        return Err(usage(&format!("unknown --sort '{k}' (cpu, memory, io, name, pid, impact)")));
+    }
+    sort_procs(&mut v, opt(args, "--sort").unwrap_or(if grouped { "impact" } else { "cpu" }));
+    if grouped {
+        return list_grouped(args, &s, v);
+    }
     let total = v.len();
     if let Some(n) = opt(args, "--top").and_then(|n| n.parse::<usize>().ok()) {
         v.truncate(n);
@@ -248,6 +261,29 @@ fn cmd_list(args: &[String]) -> R {
     let mut text = table(&v);
     text += &format!("{total} processes, CPU {:.0}%\n", s.total_cpu);
     Ok(Out { v: json!({"ok": true, "cpu_total": (s.total_cpu as f64 * 10.0).round() / 10.0, "count": total, "processes": v.iter().map(|p| proc_json(p)).collect::<Vec<_>>()}), text })
+}
+
+/// `wtm list --group`: the window's sections (Apps, Background processes, Windows processes), each sorted by
+/// --sort, with a count and total CPU / memory per section; --top N limits each section.
+fn list_grouped(args: &[String], s: &Sampler, v: Vec<&Proc>) -> R {
+    let top = opt(args, "--top").and_then(|n| n.parse::<usize>().ok());
+    let mut text = String::new();
+    let mut groups = vec![];
+    for (kind, title) in [("app", "Apps"), ("background", "Background processes"), ("windows", "Windows processes")] {
+        let mut sec: Vec<&Proc> = v.iter().copied().filter(|p| p.kind.as_str() == kind).collect();
+        let (n, cpu, mem) = (sec.len(), sec.iter().map(|p| p.cpu).sum::<f32>(), sec.iter().map(|p| p.mem).sum::<u64>());
+        if let Some(t) = top {
+            sec.truncate(t);
+        }
+        text += &format!("{title} ({n})  CPU {cpu:.1}%  memory {:.0} MB\n", mem as f64 / 1048576.0);
+        if !sec.is_empty() {
+            text += &table(&sec);
+        }
+        text += "\n";
+        groups.push(json!({"name": title, "kind": kind, "count": n, "cpu": (cpu as f64 * 10.0).round() / 10.0, "mem": mem, "processes": sec.iter().map(|p| proc_json(p)).collect::<Vec<_>>()}));
+    }
+    text += &format!("{} processes, CPU {:.0}%\n", v.len(), s.total_cpu);
+    Ok(Out { v: json!({"ok": true, "cpu_total": (s.total_cpu as f64 * 10.0).round() / 10.0, "count": v.len(), "groups": groups}), text })
 }
 
 fn cmd_find(args: &[String], words: &[String]) -> R {
@@ -338,6 +374,13 @@ fn cmd_kill(args: &[String], target: Option<&String>) -> R {
     let s = quick();
     let list = resolve(&s, target)?;
     let tree = flag(args, "--tree");
+    // processes Windows needs are refused unless --force is given
+    if !flag(args, "--force") {
+        let crit: Vec<String> = list.iter().filter(|p| procs::is_critical_name(&p.name)).map(|p| format!("{} ({})", p.name, p.pid)).collect();
+        if !crit.is_empty() {
+            return Err((1, format!("refused: Windows needs {}; ending it can crash Windows or sign you out (add --force to end it anyway)", crit.join(", "))));
+        }
+    }
     let mut ended = vec![];
     let mut failed = vec![];
     for p in list {
@@ -420,7 +463,8 @@ fn cmd_explain(args: &[String], target: Option<&String>) -> R {
 }
 
 fn cmd_perf(args: &[String]) -> R {
-    let gpu = flag(args, "--gpu");
+    // GPU counters are on by default now (both adapters); --no-gpu skips them
+    let gpu = !flag(args, "--no-gpu");
     let ms: u64 = opt(args, "--interval").and_then(|v| v.parse().ok()).unwrap_or(500);
     let mut pf = perf::Perf::new();
     pf.refresh(gpu);
@@ -428,29 +472,43 @@ fn cmd_perf(args: &[String]) -> R {
     pf.refresh(gpu);
     let s = &pf.snap;
     let used = s.mem_total - s.mem_avail;
+    let ghz = |m: u32| format!("{:.2} GHz", m as f64 / 1000.0);
     let mut text = format!(
-        "CPU      {:.0}%  {}\n  cores  {}\nMemory   {} / {} ({:.0}%), committed {} / {}, cached {}\nSystem   {} processes, {} threads, {} handles, up {}h {}m\n",
-        s.cpu, s.cpu_name, s.cores.iter().map(|c| format!("{c:.0}")).collect::<Vec<_>>().join(" "),
-        fmt_bytes(used as f64), fmt_bytes(s.mem_total as f64), used as f64 / s.mem_total.max(1) as f64 * 100.0,
-        fmt_bytes(s.commit_total as f64), fmt_bytes(s.commit_limit as f64), fmt_bytes(s.cached as f64),
+        "CPU      {:.0}%  {}\n         speed {} (base {}), {} cores / {} threads\n         {} processes, {} threads, {} handles, up {}h {}m\n",
+        s.cpu, s.cpu_name, if s.cur_mhz > 0 { ghz(s.cur_mhz) } else { "?".into() }, ghz(s.base_mhz), s.phys_cores, s.cores.len(),
         s.processes, s.threads, s.handles, s.uptime_s / 3600, s.uptime_s / 60 % 60,
     );
+    text += &format!(
+        "Memory   {} of {} in use ({:.0}%), {} available\n         committed {} of {}, cached {}, paged pool {}, non-paged pool {}\n",
+        fmt_bytes(used as f64), fmt_bytes(s.mem_total as f64), used as f64 / s.mem_total.max(1) as f64 * 100.0, fmt_bytes(s.mem_avail as f64),
+        fmt_bytes(s.commit_total as f64), fmt_bytes(s.commit_limit as f64), fmt_bytes(s.cached as f64), fmt_bytes(s.paged_pool as f64), fmt_bytes(s.nonpaged_pool as f64),
+    );
     for d in &s.disks {
-        text += &format!("{:<8} {:.0}% active, read {}/s, write {}/s\n", d.name, d.active, fmt_bytes(d.read_rate), fmt_bytes(d.write_rate));
+        let kind = match d.ssd { Some(true) => "SSD", Some(false) => "HDD", None => "disk" };
+        text += &format!(
+            "{} {} ({}) {}: {:.0}% active, read {}/s, write {}/s, {} used of {}\n",
+            d.name, d.letters, kind, d.model, d.active, fmt_bytes(d.read_rate), fmt_bytes(d.write_rate), fmt_bytes(d.total.saturating_sub(d.free) as f64), fmt_bytes(d.total as f64)
+        );
     }
     for n in &s.nets {
-        text += &format!("{:<8} {} recv {}/s, send {}/s ({})\n", "Network", n.name, fmt_bytes(n.recv_rate), fmt_bytes(n.send_rate), n.desc);
+        text += &format!("Network  {}: down {}/s, up {}/s, link {} Mbps, IPv4 {} ({})\n", n.name, fmt_bytes(n.recv_rate), fmt_bytes(n.send_rate), n.link_bps / 1_000_000, if n.ipv4.is_empty() { "-" } else { &n.ipv4 }, n.desc);
     }
     if let Some(g) = &s.gpu {
-        text += &format!("GPU      {:.0}% ({}), dedicated memory {}, shared {}\n", g.util, g.engines.iter().take(3).map(|e| format!("{} {:.0}%", e.0, e.1)).collect::<Vec<_>>().join(", "), fmt_bytes(g.dedicated_used as f64), fmt_bytes(g.shared_used as f64));
+        for (i, a) in g.adapters.iter().enumerate() {
+            text += &format!(
+                "GPU {i}    {}: {:.0}% ({}), dedicated {} of {}, shared {} of {}, driver {}\n",
+                a.name, a.util, a.engines.iter().take(4).map(|e| format!("{} {:.0}%", e.0, e.1)).collect::<Vec<_>>().join(", "),
+                fmt_bytes(a.dedicated_used as f64), fmt_bytes(a.dedicated_total as f64), fmt_bytes(a.shared_used as f64), fmt_bytes(a.shared_total as f64), a.driver
+            );
+        }
     }
     let v = json!({
-        "ok": true, "cpu": s.cpu, "cpu_name": s.cpu_name, "cores": s.cores,
-        "memory": {"total": s.mem_total, "available": s.mem_avail, "used": used, "commit": s.commit_total, "commit_limit": s.commit_limit, "cached": s.cached},
+        "ok": true, "cpu": s.cpu, "cpu_name": s.cpu_name, "cores": s.cores, "speed_mhz": s.cur_mhz, "base_mhz": s.base_mhz, "physical_cores": s.phys_cores,
+        "memory": {"total": s.mem_total, "available": s.mem_avail, "used": used, "commit": s.commit_total, "commit_limit": s.commit_limit, "cached": s.cached, "paged_pool": s.paged_pool, "nonpaged_pool": s.nonpaged_pool},
         "processes": s.processes, "threads": s.threads, "handles": s.handles, "uptime_s": s.uptime_s,
-        "disks": s.disks.iter().map(|d| json!({"name": d.name, "active": d.active, "read_per_sec": d.read_rate.round(), "write_per_sec": d.write_rate.round()})).collect::<Vec<_>>(),
-        "network": s.nets.iter().map(|n| json!({"name": n.name, "description": n.desc, "recv_per_sec": n.recv_rate.round(), "send_per_sec": n.send_rate.round(), "link_bps": n.link_bps})).collect::<Vec<_>>(),
-        "gpu": s.gpu.as_ref().map(|g| json!({"util": g.util, "engines": g.engines, "dedicated_used": g.dedicated_used, "shared_used": g.shared_used})),
+        "disks": s.disks.iter().map(|d| json!({"name": d.name, "letters": d.letters, "model": d.model, "ssd": d.ssd, "active": d.active, "read_per_sec": d.read_rate.round(), "write_per_sec": d.write_rate.round(), "total": d.total, "free": d.free})).collect::<Vec<_>>(),
+        "network": s.nets.iter().map(|n| json!({"name": n.name, "description": n.desc, "recv_per_sec": n.recv_rate.round(), "send_per_sec": n.send_rate.round(), "link_bps": n.link_bps, "ipv4": n.ipv4})).collect::<Vec<_>>(),
+        "gpus": s.gpu.as_ref().map(|g| g.adapters.iter().map(|a| json!({"name": a.name, "util": a.util, "engines": a.engines, "other_engines": a.other, "dedicated_used": a.dedicated_used, "dedicated_total": a.dedicated_total, "shared_used": a.shared_used, "shared_total": a.shared_total, "driver": a.driver})).collect::<Vec<_>>()),
     });
     Ok(Out { v, text })
 }

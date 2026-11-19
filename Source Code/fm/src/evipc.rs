@@ -189,6 +189,34 @@ pub fn query(search: &str, max: u32, request: u32, sort: u32, match_path: bool, 
     Ok(r)
 }
 
+/// The total size of every result of `search` (files only make sense), read straight from Everything's reply
+/// without building a result list (a folder of 300 000 files would otherwise allocate tens of MB for a moment).
+/// None when the index does not know a size or the reply was cut at `max`.
+pub fn size_sum(search: &str, max: u32, timeout: Duration) -> Res<Option<(u32, u64)>> {
+    let here = unsafe { FindWindowW(w!("EVERYTHING_TASKBAR_NOTIFICATION"), PCWSTR::null()).is_ok() };
+    if !here {
+        let r = query(search, max, REQ_SIZE, 0, false, timeout)?;
+        if (r.total as usize) > r.items.len() || r.items.iter().any(|i| i.size.is_none()) {
+            return Ok(None);
+        }
+        return Ok(Some((r.total, r.items.iter().map(|i| i.size.unwrap_or(0)).sum())));
+    }
+    let b = raw(search, max, REQ_SIZE, 0, false, timeout)?;
+    let (Some(total), Some(num), Some(req)) = (u32_at(&b, 0), u32_at(&b, 4), u32_at(&b, 12)) else { return Err("bad reply from Everything".into()) };
+    if req & REQ_SIZE == 0 || total > num {
+        return Ok(None);
+    }
+    let mut sum = 0u64;
+    for i in 0..num as usize {
+        let Some(o) = u32_at(&b, 20 + i * 8 + 4) else { return Err("bad reply from Everything".into()) };
+        match u64_at(&b, o as usize) {
+            Some(u64::MAX) | None => return Ok(None),
+            Some(v) => sum += v,
+        }
+    }
+    Ok(Some((total, sum)))
+}
+
 fn raw(search: &str, max: u32, request: u32, sort: u32, match_path: bool, timeout: Duration) -> Res<Vec<u8>> {
     let t0 = Instant::now();
     unsafe {

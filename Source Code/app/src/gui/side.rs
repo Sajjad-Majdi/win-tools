@@ -27,7 +27,7 @@ impl App {
             },
         };
         let old = self.gfx.push_alpha(a);
-        self.gfx.fill(Rect::new(pr.x, pr.y, pr.w, pr.h), t.layer);
+        self.gfx.surface(Rect::new(pr.x, pr.y, pr.w, pr.h), 0.0, t.layer);
         self.gfx.vline(pr.x, pr.y, pr.b(), t.line);
         self.hit(pr, Hit::Block);
         self.gfx.clip(Rect::new(pr.x + 1.0, pr.y, pr.w - 1.0, pr.h));
@@ -52,6 +52,7 @@ impl App {
         self.hp(cr, 4.0, Hit::PaneClose);
         self.gfx.glyph(0xE711, cr, 11.0, t.t2);
         self.hit(cr, Hit::PaneClose);
+        self.tip(cr, "Close (Esc)");
     }
 
     /// Section card header (44 high). Returns the y below it.
@@ -130,6 +131,7 @@ impl App {
             }
             v.push(
                 match a.verdict {
+                    Verdict::Safe if !a.ends_en.is_empty() => a.ends_en.as_str(),
                     Verdict::Safe => "Ending it is safe; it starts again when needed.",
                     Verdict::Work if !a.ends_en.is_empty() => a.ends_en.as_str(),
                     Verdict::Work => "Ending it closes the app; work you have not saved is lost.",
@@ -168,6 +170,10 @@ impl App {
         let can_restart = g.kind != crate::procs::Kind::Windows;
         self.button(Rect::new(x + ew + 8.0, y, rw, 32.0), "Restart", 0xE72C, Btn::Std, false, can_restart, Hit::PaneRestart);
         self.button(Rect::new(x + ew + rw + 16.0, y, 34.0, 32.0), "", 0xE712, Btn::Std, false, true, Hit::PaneMore);
+        self.tip(Rect::new(x + ew + rw + 16.0, y, 34.0, 32.0), "More actions");
+        if !can_restart {
+            self.tip(Rect::new(x + ew + 8.0, y, rw, 32.0), "Windows processes are not restarted here");
+        }
         y += 32.0 + 12.0;
 
         // ---- What is this?
@@ -273,6 +279,14 @@ impl App {
             }
         }
         y = card.b() + 16.0;
+        // a process this window may not read: one small way out, run the window as administrator
+        if !self.elevated && g.path.is_empty() {
+            self.gfx.para("Windows shows its path, publisher and icon only to administrators.", Rect::new(x, y, w, 40.0), Font::Ui, 12.5, 400, Align::Left, t.t2, 18.0);
+            y += self.gfx.para_h("Windows shows its path, publisher and icon only to administrators.", w, Font::Ui, 12.5, 400, 18.0) + 8.0;
+            let bw = self.btn_w("Restart as administrator", 0xEA18, false);
+            self.button(Rect::new(x, y, bw, 32.0), "Restart as administrator", 0xEA18, Btn::Std, false, true, Hit::RunAdmin);
+            y += 32.0 + 16.0;
+        }
         y - y0
     }
 
@@ -288,7 +302,8 @@ impl App {
             v.push(("Started by".into(), exe.clone()));
         }
         let path = p.map(|p| p.meta.path.clone()).filter(|s| !s.is_empty()).unwrap_or(g.path.clone());
-        v.push(("Location".into(), if path.is_empty() { "No access (protected)".into() } else { path }));
+        let none = if self.elevated { "No access (protected)" } else { "Needs administrator to read" };
+        v.push(("Location".into(), if path.is_empty() { none.into() } else { path }));
         if let Some(p) = p {
             let secs = ((App::now_ft() - p.create_time) / 10_000_000).max(0) as u64;
             v.push(("Running for".into(), model::fmt_dur(secs)));
@@ -318,7 +333,9 @@ impl App {
             v.push(WhyItem { glyph: 0xE90F, title: "No service and no scheduled task".into(), value: String::new(), code: String::new(), button: None, muted: true, crit: None });
         }
         let path = self.proc(pid).map(|p| p.meta.path.to_lowercase()).unwrap_or_default();
-        let place = if path.is_empty() {
+        let place = if path.is_empty() && !self.elevated {
+            "Not readable without administrator".to_string()
+        } else if path.is_empty() {
             "Protected Windows process".to_string()
         } else if path.starts_with(r"c:\windows\") {
             "Runs from Windows".into()
