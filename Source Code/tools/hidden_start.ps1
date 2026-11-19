@@ -1,0 +1,21 @@
+# Starts a program on the never-shown desktop "wt_hidden" and returns at once (prints its PID).
+# Nothing appears on the owner's screen. Stop it with `wtm gui quit` or `wtm kill <pid>`.
+param([string]$Exe, [string]$ArgLine = "")
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class HS {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SI { public int cb; public string r; public string desk; public string title; public int x, y, w, h, cx, cy, fill, flags; public short show, cb2; public IntPtr r2, i, o, e; }
+    [StructLayout(LayoutKind.Sequential)] struct PI { public IntPtr hp, ht; public int pid, tid; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateDesktop(string n, IntPtr d, IntPtr m, int f, uint a, IntPtr s);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcess(string a, StringBuilder c, IntPtr pa, IntPtr ta, bool inh, uint f, IntPtr env, string dir, ref SI si, out PI pi);
+    public static string Start(string exe, string args) {
+        IntPtr d = CreateDesktop("wt_hidden", IntPtr.Zero, IntPtr.Zero, 0, 0x10000000u, IntPtr.Zero);
+        if (d == IntPtr.Zero) return "error=CreateDesktop " + Marshal.GetLastWin32Error();
+        var si = new SI(); si.cb = Marshal.SizeOf(si); si.desk = @"WinSta0\wt_hidden"; si.flags = 1; si.show = 4;
+        PI pi; if (!CreateProcess(null, new StringBuilder("\"" + exe + "\" " + args), IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref si, out pi)) return "error=CreateProcess " + Marshal.GetLastWin32Error();
+        return "pid=" + pi.pid;
+    }
+}
+"@
+[HS]::Start($Exe, $ArgLine)

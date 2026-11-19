@@ -1,0 +1,13 @@
+Win Tools (Task Manager and Files)
+Copyright (c) 2026 Sajjad. All rights reserved.
+
+Third-party parts
+-----------------
+Vazirmatn font (used only for Persian text in AI answers)
+  Copyright (c) 2015 The Vazirmatn Project Authors (https://github.com/rastikerdar/vazirmatn)
+  Licensed under the SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+
+windows-rs (Microsoft), serde_json: MIT or Apache-2.0.
+
+AI features and meaning search are optional and not included. When the user turns them on in Settings, their
+model files are downloaded separately and keep their own licenses.

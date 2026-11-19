@@ -1,0 +1,10 @@
+First release of Win Tools: a fast Task Manager and a fast file manager for Windows 10/11.
+
+Downloads
+- WinTools-TaskManager-<version>-setup.exe   install for the current user (no admin), Start menu shortcut, uninstaller
+- WinTools-TaskManager-<version>-portable.exe run without installing
+- WinTools-Files-<version>-setup.exe         install for the current user (no admin), Start menu shortcut, uninstaller
+- WinTools-Files-<version>-portable.exe       run without installing
+
+These files are not code-signed yet, so Windows SmartScreen may warn on first start ("More info" > "Run anyway").
+AI features and meaning search are off by default and are not included in these files.
