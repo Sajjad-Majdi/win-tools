@@ -1,14 +1,17 @@
-Rust Task Manager and Rust File Explorer 0.2.1: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.2: a fast Task Manager and a fast file manager for Windows 10/11.
 
-New in 0.2.1
-- Rust Task Manager: a new Performance page (CPU, memory, disks, network and every GPU, with "used of total" facts);
-  process groups (Apps / Background / Windows) with a calm order; a collapsible sidebar; confirms before ending or
-  restarting critical or multi-process apps; real signature checks.
-- Rust File Explorer: This PC start page; the Desktop includes the Public Desktop; real icons for files, shortcuts and
-  custom folders; "Open with" with app icons and a one-click default per file type; type-ahead select; tooltips;
-  Extract never overwrites; folder sizes from Everything; a scrollable, manually collapsible sidebar.
-- Both: the accent colour you pick themes the whole window (with a Colour strength setting), and Transparency works.
-- The Rust File Explorer setup also installs Everything (voidtools, MIT) when it is missing.
+New in 0.2.2
+- Rust File Explorer: AI Search. Describe what you need in your own words, in any language, and press Shift+Enter
+  (or the AI Search button). It uses your own Google Gemini key (with an optional relay) and is off by default.
+  When a normal search finds nothing, it offers AI Search.
+- Rust File Explorer: search settings choose which file kinds and which places are searched (a folder tree, like
+  Indexing Options). System and temp files are off by default. Hidden folders never show in results.
+- Rust File Explorer: faster search while you type.
+- Rust File Explorer: Win+E opens Rust File Explorer when it is the default file manager (a small helper,
+  installed and removed by the setup).
+- Rust File Explorer: "Choose default app" opens the Windows dialog and sets the real system default; file icons
+  update after the change. New tabs open This PC. A second click on an open menu closes it.
+- Rust Task Manager: the command line list no longer cuts text in narrow windows.
 
 Downloads
 - RustTaskManager-<version>-setup.exe    install for the current user (no admin), Start menu shortcut, uninstaller
@@ -17,6 +20,6 @@ Downloads
 - RustFileExplorer-<version>-portable.exe run without installing
 
 These files are not code-signed yet, so Windows SmartScreen may warn on first start ("More info" > "Run anyway").
-AI features and meaning search are off by default and are not included in these files.
+AI Search is off by default. Nothing is sent anywhere until you turn it on and add your own key.
 
 Written in Rust. Not affiliated with or endorsed by the Rust Project or the Rust Foundation.
