@@ -466,11 +466,20 @@ impl App {
         self.gfx.text_at("Settings", lx, y, 28.0, 300.0, Font::Display, 20.0, 600, t.t1);
         y += 28.0 + 12.0;
         // default Task Manager
-        // the two buttons sit side by side when they fit, else the second goes under the first (never past the card)
-        let sw = self.btn_w("Set as default Task Manager", 0xEA18, false);
-        let rw = self.btn_w("Restore Windows Task Manager", 0, false);
-        let bx = if lx + 48.0 + sw.max(rw) <= lx + lw - 16.0 { lx + 48.0 } else { lx + 16.0 };
-        let one_row = bx + sw + 14.0 + rw <= lx + lw - 16.0;
+        // the two buttons always try to share one row: full labels under the title, then full labels from the card
+        // edge, then short labels; only a very narrow card stacks them (both full width)
+        let edge = lx + lw - 16.0;
+        let mut pick = None;
+        for (set_l, res_l) in [("Set as default Task Manager", "Restore Windows Task Manager"), ("Set as default", "Restore Windows")] {
+            let (sw, rw) = (self.btn_w(set_l, 0xEA18, false), self.btn_w(res_l, 0, false));
+            for bx in [lx + 48.0, lx + 16.0] {
+                if pick.is_none() && bx + sw + 14.0 + rw <= edge {
+                    pick = Some((set_l, res_l, sw, rw, bx));
+                }
+            }
+        }
+        let one_row = pick.is_some();
+        let (set_l, res_l, sw, rw, bx) = pick.unwrap_or(("Set as default", "Restore Windows", lw - 32.0, lw - 32.0, lx + 16.0));
         let card = Rect::new(lx, y, lw, 64.0 + 52.0 + if one_row { 0.0 } else { 42.0 });
         self.gfx.card(card, 8.0, t.card, t.card_s);
         self.gfx.glyph(0xE7EF, Rect::new(lx + 16.0, y, 18.0, 64.0), 16.0, t.t1);
@@ -479,9 +488,9 @@ impl App {
         self.gfx.text(now, Rect::new(lx + 48.0, y + 32.0, lw - 64.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t2);
         self.gfx.hline(lx + 1.0, lx + lw - 1.0, y + 64.0, t.line);
         let by = y + 64.0 + 10.0;
-        self.button(Rect::new(bx, by, sw, 32.0), "Set as default Task Manager", 0xEA18, Btn::Accent, false, !self.is_default, Hit::SetDefault);
+        self.button(Rect::new(bx, by, sw, 32.0), set_l, 0xEA18, Btn::Accent, false, !self.is_default, Hit::SetDefault);
         let (rx0, ry0) = if one_row { (bx + sw + 14.0, by) } else { (bx, by + 42.0) };
-        self.button(Rect::new(rx0, ry0, rw, 32.0), "Restore Windows Task Manager", 0, Btn::Std, false, self.is_default, Hit::RestoreDefault);
+        self.button(Rect::new(rx0, ry0, rw, 32.0), res_l, 0, Btn::Std, false, self.is_default, Hit::RestoreDefault);
         y = card.b();
         // Personalize
         y += 18.0;
