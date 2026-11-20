@@ -289,6 +289,8 @@ pub struct DropMenu {
     pub at: Instant,
     /// a submenu of the context menu (stays with it)
     pub child: bool,
+    /// the button that opened it: a click on that button while it is open only closes it
+    pub by: Hit,
 }
 
 pub struct Pv {

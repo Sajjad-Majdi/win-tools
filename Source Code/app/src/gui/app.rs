@@ -340,6 +340,8 @@ pub struct App {
     pub startup_hold: Option<(usize, bool, Instant)>,
     /// the details pane of a startup entry (index, what is known about it)
     pub st_pane: Option<(usize, super::pages::StInfo)>,
+    /// the button that opened the open menu: clicking it again closes the menu (never reopens it)
+    pub menu_anchor: Option<Hit>,
     pub query: String,
     pub search_focus: bool,
     /// caret in the search text (chars; usize::MAX = at the end) and "all selected" (Ctrl+A)
@@ -1414,7 +1416,7 @@ impl App {
         self.scroll_to(i);
         let r = self.rows[i];
         let y = (self.list_rect.y + r.y - self.scroll[0] + r.h / 2.0).clamp(self.list_rect.y, self.list_rect.b());
-        self.menu = Some(Menu { kind: MenuKind::Row, x: self.list_rect.x + 80.0, y, at: Instant::now() });
+        self.open_menu(Menu { kind: MenuKind::Row, x: self.list_rect.x + 80.0, y, at: Instant::now() }, None);
         self.animate(180);
     }
 
@@ -2261,6 +2263,18 @@ impl App {
         }
     }
 
+    /// The one way a menu opens. `anchor` = the button that opened it: a second click on it closes the menu.
+    pub fn open_menu(&mut self, m: Menu, anchor: Option<Hit>) {
+        self.menu = Some(m);
+        self.menu_anchor = anchor;
+    }
+
+    /// What a click does to an open menu: None = the click is used up (it closed the menu: outside on nothing, or on
+    /// the menu's own button), Some = closed it and the click goes on to its target.
+    pub fn menu_click_passes(menu_open: bool, anchor: Option<Hit>, h: Hit) -> bool {
+        !(menu_open && (matches!(h, Hit::Block | Hit::None) || anchor == Some(h)))
+    }
+
     pub fn click(&mut self, h: Hit, x: f32, y: f32) {
         // an open menu takes the click
         if self.menu.is_some() {
@@ -2269,7 +2283,9 @@ impl App {
                 return;
             }
             self.menu = None;
-            if matches!(h, Hit::Block | Hit::None) {
+            // the button that opened this menu closes it (a toggle), it never opens it again
+            let anchor = self.menu_anchor.take();
+            if !Self::menu_click_passes(true, anchor, h) {
                 return;
             }
         }
@@ -2311,7 +2327,7 @@ impl App {
                     }
                 }
             }
-            Hit::ChipMore => self.menu = Some(Menu { kind: MenuKind::Chips, x, y: y + 8.0, at: Instant::now() }),
+            Hit::ChipMore => self.open_menu(Menu { kind: MenuKind::Chips, x, y: y + 8.0, at: Instant::now() }, Some(h)),
             Hit::EndTask => self.end_selected(self.shift),
             Hit::Restart => self.restart_selected(),
             Hit::Details => {
@@ -2323,13 +2339,13 @@ impl App {
             }
             Hit::More | Hit::PaneMore => {
                 if self.sel_group().is_some() {
-                    self.menu = Some(Menu { kind: MenuKind::Row, x, y: y + 10.0, at: Instant::now() });
+                    self.open_menu(Menu { kind: MenuKind::Row, x, y: y + 10.0, at: Instant::now() }, Some(h));
                     self.animate(180);
                 }
             }
             Hit::Free | Hit::FlyFree => self.open_free(),
             Hit::Sort => {
-                self.menu = Some(Menu { kind: MenuKind::Sort, x: x - 40.0, y: y + 14.0, at: Instant::now() });
+                self.open_menu(Menu { kind: MenuKind::Sort, x: x - 40.0, y: y + 14.0, at: Instant::now() }, Some(h));
                 self.animate(180);
             }
             Hit::Header(c) => {
@@ -2400,7 +2416,7 @@ impl App {
                     self.test_or_spawn(&c, &d, 0);
                 }
             }
-            Hit::StSort => self.menu = Some(Menu { kind: MenuKind::StartupSort, x: x - 60.0, y: y + 14.0, at: Instant::now() }),
+            Hit::StSort => self.open_menu(Menu { kind: MenuKind::StartupSort, x: x - 60.0, y: y + 14.0, at: Instant::now() }, Some(h)),
             Hit::SetDefault => self.set_default(true),
             Hit::RestoreDefault => self.set_default(false),
             Hit::Seg(g, i) => match g {
@@ -2493,7 +2509,7 @@ impl App {
                 }
             }
             Hit::DefSort => {
-                self.menu = Some(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now() });
+                self.open_menu(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now() }, Some(h));
             }
             _ => {}
         }
@@ -3126,7 +3142,7 @@ impl App {
                     let (x, y) = (parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(330.0), parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(322.0));
                     match a1 {
                         "row" => self.menu = Some(Menu { kind: MenuKind::Row, x, y, at: Instant::now() }),
-                        "sort" => self.menu = Some(Menu { kind: MenuKind::Sort, x: self.w - 190.0, y: TITLE_H + TILES_H + 70.0, at: Instant::now() }),
+                        "sort" => self.open_menu(Menu { kind: MenuKind::Sort, x: self.w - 190.0, y: TITLE_H + TILES_H + 70.0, at: Instant::now() }, Some(Hit::Sort)),
                         "close" => self.menu = None,
                         _ => return err("menu row [x y]|sort|close"),
                     }
@@ -4235,6 +4251,7 @@ pub fn run(software: bool) -> i32 {
             startup_sort: 0,
             startup_hold: None,
             st_pane: None,
+            menu_anchor: None,
             query: String::new(),
             search_focus: false,
             caret: usize::MAX,

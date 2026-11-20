@@ -457,10 +457,10 @@ impl App {
         let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
-        let one_col = layer.w < 900.0;
+        // always one column (Sajjad: a large window must not split Settings in two), centred, at most 760 wide
         let pad_x = 24.0;
-        let lx = layer.x + pad_x;
-        let lw = if one_col { layer.w - pad_x * 2.0 } else { 500.0 };
+        let lw = (layer.w - pad_x * 2.0).min(760.0);
+        let lx = layer.x + ((layer.w - lw) / 2.0).max(pad_x);
         let top = layer.y + 20.0 - self.scroll[2];
         let mut y = top;
         self.gfx.text_at("Settings", lx, y, 28.0, 300.0, Font::Display, 20.0, 600, t.t1);
@@ -594,7 +594,7 @@ impl App {
         }
         y = card.b() + 20.0;
         // right column (below on narrow windows)
-        let (rx, rw2, mut ry) = if one_col { (lx, lw, y + 8.0) } else { (lx + lw + 24.0, layer.r() - pad_x - (lx + lw + 24.0), top + 40.0) };
+        let (rx, rw2, mut ry) = (lx, lw, y + 8.0);
         // AI features: off by default; Google Gemini with the user's own key (stored encrypted, never shown again)
         self.gfx.text_at("AI features", rx, ry, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
         ry += 28.0;
@@ -809,6 +809,19 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::impact_level;
+    use crate::gui::app::{App, Hit};
+
+    #[test]
+    fn a_menu_button_toggles_its_menu() {
+        // open menu + a click on the button that opened it: the click only closes the menu
+        assert!(!App::menu_click_passes(true, Some(Hit::StSort), Hit::StSort));
+        // open menu + a click on something else: closes the menu and the click goes on
+        assert!(App::menu_click_passes(true, Some(Hit::StSort), Hit::Sort));
+        // a click outside on nothing just closes it
+        assert!(!App::menu_click_passes(true, Some(Hit::StSort), Hit::None));
+        // closed menu: the button opens it
+        assert!(App::menu_click_passes(false, None, Hit::StSort));
+    }
 
     #[test]
     fn impact_from_measured_use() {

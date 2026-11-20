@@ -1234,13 +1234,12 @@ impl App {
         if !in_menu && (self.menu.is_some() || self.drop.is_some()) {
             let drop_was = self.drop.as_ref().map(|d| d.kind);
             let anchor_was = self.drop.as_ref().map(|d| d.anchor);
+            let by_was = self.drop.as_ref().map(|d| d.by);
             self.close_popups();
-            // a click on the same dropdown button just closes it (any dropdown opened under its own button)
-            let same_button = match (anchor_was, self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0)) {
-                (Some(a), Some(r)) => (a.x - r.x).abs() < 1.0 && (a.y - r.y).abs() < 1.0 && (a.w - r.w).abs() < 1.0,
-                _ => false,
-            };
-            if same_button || matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New))) {
+            // a click on the same dropdown button just closes it: the button that opened it, or any hit drawn at
+            // exactly the dropdown's anchor rectangle
+            let hit_rect = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0);
+            if drop_toggle_click(h, by_was, anchor_was, hit_rect) || matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New))) {
                 return;
             }
         }
@@ -2517,7 +2516,7 @@ impl App {
             DropKind::OpenWith => 300.0,
             _ => 240.0,
         };
-        self.sub = Some(DropMenu { kind, anchor: r, items, width, at: Instant::now(), child: true });
+        self.sub = Some(DropMenu { kind, anchor: r, items, width, at: Instant::now(), child: true, by: Hit::None });
     }
 
     fn drop_items(&self, kind: DropKind) -> Vec<MItem> {
@@ -2661,9 +2660,12 @@ impl App {
         v
     }
 
+    /// The one way a dropdown opens. It remembers the button that was pressed to open it (and its rectangle), so a
+    /// second click on that button closes it instead of opening it again (see `drop_toggle_click`).
     pub fn open_drop(&mut self, kind: DropKind, anchor: Rect, width: f32) {
         let items = self.drop_items(kind);
-        self.drop = Some(DropMenu { kind, anchor, items, width, at: Instant::now(), child: false });
+        let by = self.pressed;
+        self.drop = Some(DropMenu { kind, anchor, items, width, at: Instant::now(), child: false, by });
     }
 
     fn menu_click(&mut self, i: usize) {
@@ -4307,4 +4309,37 @@ pub fn sub_folders(p: &Path) -> Vec<PathBuf> {
         .unwrap_or_default();
     v.sort_by_key(|x| x.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default());
     v
+}
+
+/// Is this mouse-down on the button of the dropdown that is open (so it must only close it)? `by` = the hit that
+/// opened it, `anchor` = its rectangle, `hit_rect` = where the clicked hit is drawn.
+pub fn drop_toggle_click(h: Hit, by: Option<Hit>, anchor: Option<Rect>, hit_rect: Option<Rect>) -> bool {
+    if matches!(h, Hit::None | Hit::Block) {
+        return false;
+    }
+    if by == Some(h) {
+        return true;
+    }
+    match (anchor, hit_rect) {
+        (Some(a), Some(r)) => (a.x - r.x).abs() < 1.0 && (a.y - r.y).abs() < 1.0 && (a.w - r.w).abs() < 1.0,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod drop_toggle_tests {
+    use super::*;
+
+    #[test]
+    fn a_dropdown_button_toggles_its_dropdown() {
+        let r = Rect::new(10.0, 20.0, 120.0, 32.0);
+        // the button that opened it: close only
+        assert!(drop_toggle_click(Hit::ViewBtn, Some(Hit::ViewBtn), Some(r), Some(Rect::new(0.0, 0.0, 1.0, 1.0))));
+        // a hit drawn at the anchor rectangle: close only
+        assert!(drop_toggle_click(Hit::New, Some(Hit::None), Some(r), Some(r)));
+        // another button elsewhere: the click goes on
+        assert!(!drop_toggle_click(Hit::New, Some(Hit::ViewBtn), Some(r), Some(Rect::new(300.0, 20.0, 80.0, 32.0))));
+        // empty space never counts as the button
+        assert!(!drop_toggle_click(Hit::None, Some(Hit::None), Some(r), None));
+    }
 }
