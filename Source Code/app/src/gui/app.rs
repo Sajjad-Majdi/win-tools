@@ -94,11 +94,11 @@ pub enum Hit {
     StToggle(usize),
     StSort,
     StRow(usize),
+    StPaneClose,
     SetDefault,
     RestoreDefault,
     Seg(u8, u8),
     Toggle(u8),
-    CliCopy(u8),
     KeyField,
     KeySave,
     KeyTest,
@@ -148,11 +148,11 @@ pub fn focusable(h: Hit) -> bool {
             | Hit::FreeAll
             | Hit::StToggle(_)
             | Hit::StSort
+            | Hit::StPaneClose
             | Hit::SetDefault
             | Hit::RestoreDefault
             | Hit::Seg(..)
             | Hit::Toggle(_)
-            | Hit::CliCopy(_)
             | Hit::KeyField
             | Hit::KeySave
             | Hit::KeyTest
@@ -330,6 +330,10 @@ pub struct App {
     pub expanded: HashSet<String>,
     pub sort: SortKey,
     pub startup_sort: u8,
+    /// a just-switched startup row: (index, its place before, when) -> it moves after STARTUP_HOLD
+    pub startup_hold: Option<(usize, bool, Instant)>,
+    /// the details pane of a startup entry (index, what is known about it)
+    pub st_pane: Option<(usize, super::pages::StInfo)>,
     pub query: String,
     pub search_focus: bool,
     /// caret in the search text (chars; usize::MAX = at the end) and "all selected" (Ctrl+A)
@@ -1894,17 +1898,27 @@ impl App {
 
     pub fn toggle_startup(&mut self, i: usize) {
         let Some(e) = self.startup.get(i).cloned() else { return };
-        if self.test {
-            self.last_action = format!("startup toggle blocked in test mode: {}", e.name);
-            self.toast_msg(&format!("{} {} at startup (test mode: not changed)", e.name, if e.enabled { "off" } else { "on" }), true);
+        if e.source == "Service" {
             return;
         }
-        match crate::startup::set_enabled_in(&e.name, Some(e.source), !e.enabled) {
+        let res = if self.test {
+            // test mode: only this window's copy changes (the switch and the row move can be seen), never Windows
+            self.last_action = format!("startup toggle in test mode (not written): {}", e.name);
+            Ok(e.clone())
+        } else {
+            crate::startup::set_enabled_in(&e.name, Some(e.source), !e.enabled)
+        };
+        match res {
             Ok(_) => {
                 let mut v = (*self.startup).clone();
                 v[i].enabled = !e.enabled;
                 self.startup = Arc::new(v);
-                self.ctl.reload_startup.store(true, Relaxed);
+                // the row keeps its place while the switch slides, then moves to its group
+                self.startup_hold = Some((i, e.enabled, Instant::now()));
+                self.animate(super::pages::STARTUP_HOLD.as_millis() as u64 + 60);
+                if !self.test {
+                    self.ctl.reload_startup.store(true, Relaxed);
+                }
             }
             Err(err) => self.toast_msg(&format!("Could not change {}: {err}", e.name), false),
         }
@@ -2161,7 +2175,11 @@ impl App {
                     }
                 }
             }
-            Hit::StRow(i) => self.sel = Some(Sel::Startup(i)),
+            Hit::StRow(i) => {
+                self.sel = Some(Sel::Startup(i));
+                self.open_st_pane(i);
+            }
+            Hit::StPaneClose => self.st_pane = None,
             Hit::Scroll(k) => {
                 self.drag_scroll = Some((k, y, self.scroll[k as usize]));
                 unsafe {
@@ -2379,10 +2397,6 @@ impl App {
                     self.set_ai(on)
                 }
             },
-            Hit::CliCopy(i) => {
-                let c = super::pages::CLI.get(i as usize).map(|c| c.0.to_string()).unwrap_or_default();
-                self.copy(&c);
-            }
             Hit::KeyField => self.key_focus = true,
             Hit::KeySave => self.key_save(),
             Hit::KeyTest => self.key_test(),
@@ -2615,6 +2629,8 @@ impl App {
                     self.build_rows();
                 } else if self.pane.is_some() {
                     self.pane = None;
+                } else if self.page == 1 && self.st_pane.is_some() {
+                    self.st_pane = None;
                 } else {
                     self.sel = None;
                 }
@@ -3180,6 +3196,17 @@ impl App {
                     self.free_end(i, parts.get(2) == Some(&"disable"));
                 }
                 "free-all" => self.free_all(),
+                "stpane" => {
+                    // stpane <name> | stpane close: the details pane of a startup entry
+                    let name = parts.get(1..).map(|v| v.join(" ")).unwrap_or_default();
+                    if name == "close" {
+                        self.st_pane = None;
+                    } else {
+                        let Some(i) = self.startup.iter().position(|e| e.name.eq_ignore_ascii_case(&name) || e.name.rsplit('\\').next().is_some_and(|n| n.eq_ignore_ascii_case(&name))) else { return err("no startup entry with that name") };
+                        self.sel = Some(Sel::Startup(i));
+                        self.open_st_pane(i);
+                    }
+                }
                 "startup" => {
                     // startup <name> on|off  (changes the real startup entry)
                     let name = parts.get(1..parts.len().saturating_sub(1)).map(|v| v.join(" ")).unwrap_or_default();
@@ -4156,6 +4183,8 @@ pub fn run(software: bool) -> i32 {
             expanded: HashSet::new(),
             sort: SortKey::Impact,
             startup_sort: 0,
+            startup_hold: None,
+            st_pane: None,
             query: String::new(),
             search_focus: false,
             caret: usize::MAX,

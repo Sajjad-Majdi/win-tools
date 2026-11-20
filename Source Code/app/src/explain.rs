@@ -214,7 +214,7 @@ wsl.exe|Microsoft|w|Windows Subsystem for Linux command.|دستور زیرسیس
 wslservice.exe|Microsoft|c|WSL service.|سرویس WSL.
 ";
 
-fn lookup(name: &str) -> Option<(String, Verdict, String, String)> {
+pub(crate) fn lookup(name: &str) -> Option<(String, Verdict, String, String)> {
     let n = name.to_lowercase();
     for line in KB.lines() {
         let f: Vec<&str> = line.split('|').collect();

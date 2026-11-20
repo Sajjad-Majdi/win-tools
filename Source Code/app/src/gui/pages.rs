@@ -6,21 +6,62 @@ use super::paint::{Btn, exe_of, keep_from};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// Settings > Command line: (command, meaning, new)
-pub const CLI: [(&str, &str, bool); 12] = [
-    ("wtm list --sort impact", "All processes, in this window\u{2019}s order", false),
-    ("wtm find <words>", "Search name, path, command line", false),
-    ("wtm info <pid|name>", "Path, command line, parent, services", false),
-    ("wtm why <pid|name>", "Why it is running", true),
-    ("wtm explain <pid|name>", "What is it, is it safe to end", false),
-    ("wtm kill <pid|name> [--tree]", "End a process, or its whole tree", false),
-    ("wtm restart <pid>", "Restart, same command line", true),
-    ("wtm free [--end]", "What can be ended to free memory", true),
-    ("wtm startup [enable|disable <name>]", "List or change startup apps", false),
-    ("wtm services [words]", "List services", false),
-    ("wtm perf", "CPU, memory, disk, network, GPU", false),
-    ("wtm default [set|restore]", "Default Task Manager (admin)", true),
-];
+/// How long a switched startup row stays in place (its switch animation runs first).
+pub const STARTUP_HOLD: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Windows-style impact words from measured use: private memory and average CPU (% of one core).
+pub fn impact_level(mem: u64, avg_cpu: f64) -> &'static str {
+    if mem >= 300 << 20 || avg_cpu >= 2.0 {
+        "High"
+    } else if mem >= 80 << 20 || avg_cpu >= 0.3 {
+        "Medium"
+    } else {
+        "Low"
+    }
+}
+
+/// What the details pane of a startup entry says (read once when it opens).
+#[derive(Clone, Debug)]
+pub struct StInfo {
+    pub what: String,
+    pub maker: String,
+    pub off: String,
+    pub service: bool,
+    pub path: String,
+}
+
+/// Facts about a startup entry without AI: Windows' own service description, the built-in list of known programs,
+/// else the file's version info.
+pub fn startup_info(e: &crate::startup::Entry) -> StInfo {
+    let path = exe_of(&e.command);
+    let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let (fdesc, company) = if path.is_empty() { (String::new(), String::new()) } else { crate::procs::version_strings(&path) };
+    let known = crate::explain::lookup(&file);
+    let maker = known.as_ref().map(|k| k.0.clone()).filter(|m| !m.is_empty()).unwrap_or(company);
+    if e.source == "Service" {
+        let svc = crate::services::list().into_iter().find(|s| s.display == e.name);
+        let desc = svc.as_ref().and_then(|s| crate::services::details(&s.name)).map(|d| d.2).unwrap_or_default();
+        let what = if !desc.is_empty() {
+            desc
+        } else if let Some(k) = &known {
+            k.2.clone()
+        } else if !fdesc.is_empty() {
+            fdesc
+        } else {
+            "No description from Windows or from the file.".into()
+        };
+        let key = svc.map(|s| format!(" (service name: {})", s.name)).unwrap_or_default();
+        let off = format!("A background service{key} that Windows starts by itself. If it did not start, its work (updates, sync, licence checks, device helpers) would wait until a program starts it.");
+        return StInfo { what, maker, off, service: true, path };
+    }
+    let what = known.as_ref().map(|k| k.2.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| if fdesc.is_empty() { "No description in the file.".into() } else { fdesc });
+    let base = if e.source == "Scheduled task" { "Task Scheduler no longer runs it when you sign in. You can still open it yourself." } else { "It no longer opens by itself when you sign in. You can still open it yourself." };
+    let off = match crate::insight::stop_effect(&file) {
+        Some(x) if !x.is_empty() => format!("{base} While it is not running, {}.", x.trim_start_matches("Ending it is safe, but ").trim_end_matches('.')),
+        _ => base.to_string(),
+    };
+    StInfo { what, maker, off, service: false, path }
+}
 
 pub const STARTUP_SORT: [&str; 3] = ["On first", "Name", "Starts from"];
 
@@ -61,8 +102,9 @@ fn referenced(command: &str) -> Vec<String> {
 }
 
 impl App {
-    /// "Running · 347 MB", "Running · python.exe · 81 MB" or "Not running".
-    pub fn startup_now(&self, e: &crate::startup::Entry) -> (bool, String) {
+    /// The running processes of a startup entry: every copy of its own exe ("direct"), else the first process that
+    /// runs the program or script its command (or shortcut) names.
+    pub fn startup_procs(&self, e: &crate::startup::Entry) -> (Vec<&crate::procs::Proc>, bool) {
         let refs = NOW_CACHE.with(|c| {
             let gn = self.startup.len();
             if let Some((g, v)) = c.borrow().get(&e.name)
@@ -74,9 +116,6 @@ impl App {
             c.borrow_mut().insert(e.name.clone(), (gn, v.clone()));
             v
         });
-        if refs.is_empty() {
-            return (false, "Not running".into());
-        }
         let direct = !exe_of(&e.command).to_lowercase().ends_with(".lnk") && refs.len() == 1 && refs[0].ends_with(".exe") && exe_of(&e.command).to_lowercase().ends_with(&refs[0]);
         for r in &refs {
             let hits: Vec<&crate::procs::Proc> = if r.ends_with(".exe") {
@@ -84,12 +123,38 @@ impl App {
             } else {
                 self.procs.iter().filter(|p| self.cmdlines.get(&p.pid).map(|c| c.to_lowercase().contains(r.as_str())).unwrap_or(false)).collect()
             };
-            if let Some(p) = hits.first() {
-                let mem: u64 = if direct { hits.iter().map(|p| p.mem).sum() } else { p.mem };
-                return (true, if direct { format!("Running · {}", model::fmt_mem(mem)) } else { format!("Running · {} · {}", p.name, model::fmt_mem(mem)) });
+            if !hits.is_empty() {
+                return (if direct { hits } else { hits.into_iter().take(1).collect() }, direct);
             }
         }
-        (false, "Not running".into())
+        (vec![], direct)
+    }
+
+    /// "Running · 347 MB", "Running · python.exe · 81 MB" or "Not running".
+    pub fn startup_now(&self, e: &crate::startup::Entry) -> (bool, String) {
+        let (hits, direct) = self.startup_procs(e);
+        let Some(p) = hits.first() else { return (false, "Not running".into()) };
+        let mem: u64 = hits.iter().map(|p| p.mem).sum();
+        (true, if direct { format!("Running · {}", model::fmt_mem(mem)) } else { format!("Running · {} · {}", p.name, model::fmt_mem(mem)) })
+    }
+
+    /// Startup impact from what the program really uses now: High / Medium / Low, or "Not measured" when it is not
+    /// running. Memory (private working set) and its average CPU since it started; the text says the numbers.
+    pub fn startup_impact(&self, e: &crate::startup::Entry) -> (&'static str, String) {
+        let (hits, _) = self.startup_procs(e);
+        if hits.is_empty() {
+            return ("Not measured", "Not running now, so there is nothing to measure.".into());
+        }
+        let now = unsafe {
+            let ft = windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime();
+            ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64
+        };
+        let mem: u64 = hits.iter().map(|p| p.mem).sum();
+        let cpu_s: f64 = hits.iter().map(|p| p.cpu_time as f64 / 1e7).sum();
+        let age_s = hits.iter().map(|p| ((now - p.create_time) as f64 / 1e7).max(1.0)).fold(1.0, f64::max);
+        let avg = cpu_s / age_s * 100.0;
+        let io_mb = hits.iter().map(|p| p.io_bytes).sum::<u64>() as f64 / 1_048_576.0;
+        (impact_level(mem, avg), format!("Uses {} of memory and {:.1}% of one CPU core on average since it started {} ago; {:.0} MB read and written.", model::fmt_mem(mem), avg, model::fmt_dur(age_s as u64), io_mb))
     }
 
     pub fn startup_order(&self) -> Vec<usize> {
@@ -100,14 +165,74 @@ impl App {
         match self.startup_sort {
             1 => v.sort_by_key(|&i| s[i].name.to_lowercase()),
             2 => v.sort_by_key(|&i| (source_label(s[i].source), s[i].name.to_lowercase())),
-            _ => v.sort_by_key(|&i| (!s[i].enabled, s[i].source == "Service", s[i].source == "Scheduled task")),
+            // on, then off, then services (no switch); a just-switched row keeps its place until its switch has moved
+            _ => {
+                let held = |i: usize| match self.startup_hold {
+                    Some((h, was, at)) if h == i && at.elapsed() < STARTUP_HOLD => was,
+                    _ => s[i].enabled,
+                };
+                v.sort_by_key(|&i| (s[i].source == "Service", !held(i), s[i].source == "Scheduled task"))
+            }
         }
         v
     }
 
+    pub fn open_st_pane(&mut self, i: usize) {
+        if let Some(e) = self.startup.get(i) {
+            self.st_pane = Some((i, startup_info(e)));
+        }
+        self.invalidate();
+    }
+
+    /// The details pane of the selected startup entry: what it is, who made it, its measured impact, what turning
+    /// it off changes (and why a service has no switch).
+    fn paint_st_pane(&mut self, r: Rect) {
+        let t = self.t;
+        let Some((i, info)) = self.st_pane.clone() else { return };
+        let Some(e) = self.startup.get(i).cloned() else {
+            self.st_pane = None;
+            return;
+        };
+        self.gfx.card(r, 8.0, t.layer, t.layer_s);
+        self.hit(r, Hit::Block);
+        self.gfx.clip(r.inset(1.0, 1.0));
+        let (x, w) = (r.x + 20.0, r.w - 40.0);
+        let mut y = r.y + 18.0;
+        let cr = Rect::new(r.r() - 16.0 - 32.0 + 6.0, y - 2.0, 32.0, 32.0);
+        self.hp(cr, 4.0, Hit::StPaneClose);
+        self.gfx.glyph(0xE711, cr, 11.0, t.t2);
+        self.hit(cr, Hit::StPaneClose);
+        self.tip(cr, "Close (Esc)".to_string());
+        let glyph = if e.source == "Service" { 0xE713 } else if e.source == "Scheduled task" { 0xE916 } else { 0xE8A5 };
+        self.draw_icon(&info.path, Rect::new(x, y + 2.0, 24.0, 24.0), glyph);
+        let shown = if e.source == "Scheduled task" { e.name.rsplit('\\').next().unwrap_or(&e.name).to_string() } else { e.name.clone() };
+        let th = self.gfx.para(&shown, Rect::new(x + 36.0, y, w - 36.0 - 30.0, 80.0), Font::Ui, 15.0, 600, Align::Left, t.t1, 20.0);
+        y += th.max(20.0) + 2.0;
+        self.gfx.text(source_label(e.source), Rect::new(x + 36.0, y, w - 36.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t2);
+        y += 30.0;
+        let (level, detail) = self.startup_impact(&e);
+        let maker = if info.maker.is_empty() { "Unknown (the file names no company)".to_string() } else { info.maker.clone() };
+        let rows = [("What it is", info.what.clone()), ("Made by", maker), ("Startup impact", format!("{level}. {detail}")), ("If it is off", info.off.clone()), ("Command", e.command.clone())];
+        for (label, body) in rows {
+            self.gfx.text(label, Rect::new(x, y, w, 18.0), Font::Ui, 12.0, 600, Align::Left, t.t2);
+            y += 20.0;
+            let h = self.gfx.para(&body, Rect::new(x, y, w, 400.0), Font::Ui, 13.0, 400, Align::Left, t.t1, 19.0);
+            y += h + 14.0;
+        }
+        if info.service {
+            self.gfx.para("No switch here: changing when a service starts needs administrator rights.", Rect::new(x, y, w, 60.0), Font::Ui, 12.5, 400, Align::Left, t.t2, 18.0);
+        }
+        self.gfx.unclip();
+    }
+
     pub fn paint_startup(&mut self) {
         let t = self.t;
-        let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
+        let pane_w = if self.st_pane.is_some() { PANE_W } else { 0.0 };
+        let gap = if pane_w > 0.0 { pane_w + 12.0 } else { 0.0 };
+        let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0 - gap, self.h - TITLE_H - 12.0);
+        if pane_w > 0.0 {
+            self.paint_st_pane(Rect::new(layer.r() + 12.0, layer.y, pane_w, layer.h));
+        }
         self.gfx.card(layer, 8.0, t.layer, t.layer_s);
         self.gfx.clip(layer.inset(1.0, 1.0));
         let on = self.startup.iter().filter(|e| e.enabled).count();
@@ -128,10 +253,11 @@ impl App {
         let (x0, x1) = (layer.x + 4.0 + 8.0, layer.r() - 4.0 - 12.0);
         let tog_x = x1 - 96.0;
         // a narrow window drops "Now", then "Starts from", so the name keeps its room
-        let (show_now, show_src) = (layer.w >= 860.0, layer.w >= 640.0);
-        let now_x = if show_now { tog_x - 220.0 } else { tog_x };
+        let (show_imp, show_now, show_src) = (layer.w >= 560.0, layer.w >= 960.0, layer.w >= 740.0);
+        let imp_x = if show_imp { tog_x - 104.0 } else { tog_x };
+        let now_x = if show_now { imp_x - 220.0 } else { imp_x };
         let src_x = if show_src { now_x - 196.0 } else { now_x };
-        for (s, x, on) in [("Name", x0 + 36.0, true), ("Starts from", src_x, show_src), ("Now", now_x, show_now)] {
+        for (s, x, on) in [("Name", x0 + 36.0, true), ("Starts from", src_x, show_src), ("Now", now_x, show_now), ("Impact", imp_x, show_imp)] {
             if on {
                 self.gfx.text_at(s, x, hy, 32.0, 200.0, Font::Ui, 12.0, 400, t.t2);
             }
@@ -183,6 +309,16 @@ impl App {
                 self.gfx.text_at(&now["Running".len()..], now_x + rw, r.y, 48.0, 220.0 - 12.0 - rw, Font::Ui, 12.5, 400, t.t2);
             } else {
                 self.gfx.text_at(&now, now_x, r.y, 48.0, 208.0, Font::Ui, 12.5, 400, t.t2);
+            }
+            if show_imp {
+                let (level, detail) = self.startup_impact(&e);
+                let c = match level {
+                    "High" => t.warn,
+                    "Not measured" => t.t3,
+                    _ => t.t1,
+                };
+                self.gfx.text_at(level, imp_x, r.y, 48.0, 100.0, Font::Ui, 12.5, if level == "High" { 600 } else { 400 }, c);
+                self.tip(Rect::new(imp_x, r.y, 96.0, r.h), detail);
             }
             if e.source == "Service" {
                 self.gfx.text("Service", Rect::new(tog_x, r.y, 96.0, 48.0), Font::Ui, 12.5, 400, Align::Right, t.t3);
@@ -330,50 +466,7 @@ impl App {
         }
         y = card.b() + 20.0;
         // right column (below on narrow windows)
-        let (rx, rw2, mut ry) = if one_col { (lx, lw, y + 8.0) } else { (lx + lw + 24.0, layer.r() - pad_x - (lx + lw + 24.0), top) };
-        let hw = self.gfx.text_at("Command line", rx, ry, 28.0, 300.0, Font::Display, 20.0, 600, t.t1);
-        self.gfx.text_at("wtm.exe", rx + hw + 10.0, ry + 2.0, 28.0, 100.0, Font::Ui, 13.0, 400, t.t2);
-        ry += 28.0 + 12.0;
-        // the command column is as wide as the widest command; when the description does not fit beside it,
-        // each row puts the description under its command (no "..." at any width)
-        let cmd_need = CLI.iter().map(|(c, _, n)| self.gfx.measure(c, Font::Mono, 12.0, 400) + if *n { 36.0 } else { 0.0 }).fold(0.0f32, f32::max).ceil();
-        let desc_need = CLI.iter().map(|(_, d, _)| self.gfx.measure(d, Font::Ui, 12.5, 400)).fold(0.0f32, f32::max).ceil();
-        let side = 15.0 + cmd_need + 16.0 + desc_need + 44.0 <= rw2;
-        let row_h = if side { 34.0 } else { 52.0 };
-        let card = Rect::new(rx, ry, rw2, row_h * CLI.len() as f32);
-        self.gfx.card(card, 8.0, t.card, t.card_s);
-        for (i, (cmd, desc, new)) in CLI.iter().enumerate() {
-            let r = Rect::new(rx + 1.0, ry + i as f32 * row_h, rw2 - 2.0, row_h);
-            if i > 0 {
-                self.gfx.hline(r.x, r.r(), r.y, t.line);
-            }
-            let h = Hit::CliCopy(i as u8);
-            let hv = self.hov(h);
-            let hov = hv > 0.5;
-            if hv > 0.0 {
-                self.gfx.fill(Rect::new(r.x, r.y + if i > 0 { 1.0 } else { 0.0 }, r.w, r.h - if i > 0 { 1.0 } else { 0.0 }), t.hov.fade(hv));
-            }
-            self.hit(r, h);
-            self.tip(r, format!("{cmd}\n{desc}\nClick to copy"));
-            let text_w = r.w - 15.0 - 44.0;
-            let (cy, ch) = if side { (r.y, 34.0) } else { (r.y + 6.0, 22.0) };
-            let cw = self.gfx.text_at(cmd, r.x + 15.0, cy, ch, if side { cmd_need } else { text_w }, Font::Mono, 12.0, 400, t.t1);
-            if *new {
-                self.gfx.text_at("new", r.x + 15.0 + cw + 6.0, cy, ch, 40.0, Font::Ui, 10.5, 600, t.acc_t);
-            }
-            if side {
-                self.gfx.text(desc, Rect::new(r.x + 15.0 + cmd_need + 16.0, r.y, text_w - cmd_need - 16.0, 34.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
-            } else {
-                self.gfx.text(desc, Rect::new(r.x + 15.0, r.y + 27.0, text_w, 18.0), Font::Ui, 12.5, 400, Align::Left, t.t2);
-            }
-            self.gfx.glyph(0xE8C8, Rect::new(r.r() - 12.0 - 20.0, r.y, 20.0, row_h), 12.0, if hov { t.t1 } else { t.t3 });
-        }
-        ry = card.b() + 10.0;
-        self.gfx.glyph(0xE756, Rect::new(rx, ry, 14.0, 20.0), 12.0, t.t2);
-        let w1 = self.gfx.text_at("Add ", rx + 22.0, ry, 20.0, 60.0, Font::Ui, 12.0, 400, t.t2);
-        let w2 = self.gfx.text_at("--json", rx + 22.0 + w1, ry, 20.0, 80.0, Font::Mono, 12.0, 400, t.t1);
-        self.gfx.text_at(" to any command for agents", rx + 22.0 + w1 + w2, ry, 20.0, 300.0, Font::Ui, 12.0, 400, t.t2);
-        ry += 20.0 + 18.0;
+        let (rx, rw2, mut ry) = if one_col { (lx, lw, y + 8.0) } else { (lx + lw + 24.0, layer.r() - pad_x - (lx + lw + 24.0), top + 40.0) };
         // AI features: off by default; Google Gemini with the user's own key (stored encrypted, never shown again)
         self.gfx.text_at("AI features", rx, ry, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
         ry += 28.0;
@@ -582,5 +675,19 @@ impl App {
             self.gfx.fill(Rect::new(fr.x + 10.0 + tw + 1.0, fr.y + 8.0, 1.0, 16.0), t.t1);
         }
         self.hit(fr, Hit::HexField);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::impact_level;
+
+    #[test]
+    fn impact_from_measured_use() {
+        assert_eq!(impact_level(20 << 20, 0.05), "Low");
+        assert_eq!(impact_level(120 << 20, 0.05), "Medium");
+        assert_eq!(impact_level(20 << 20, 0.5), "Medium");
+        assert_eq!(impact_level(400 << 20, 0.0), "High");
+        assert_eq!(impact_level(10 << 20, 3.0), "High");
     }
 }
