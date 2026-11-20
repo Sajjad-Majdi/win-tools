@@ -95,6 +95,9 @@ pub enum Hit {
     StSort,
     StRow(usize),
     StPaneClose,
+    StSecHead(u8),
+    StMore(u8),
+    StFoldAll,
     SetDefault,
     RestoreDefault,
     Seg(u8, u8),
@@ -149,6 +152,9 @@ pub fn focusable(h: Hit) -> bool {
             | Hit::StToggle(_)
             | Hit::StSort
             | Hit::StPaneClose
+            | Hit::StSecHead(_)
+            | Hit::StMore(_)
+            | Hit::StFoldAll
             | Hit::SetDefault
             | Hit::RestoreDefault
             | Hit::Seg(..)
@@ -1443,17 +1449,18 @@ impl App {
 
     /// Up / Down on the Startup apps page (in its shown order).
     fn move_startup(&mut self, d: i32) {
-        let order = self.startup_order();
-        if order.is_empty() {
+        // only the rows on screen (folded sections and rows past "Show all" are skipped)
+        let rows: Vec<(f32, usize)> = self.startup_rows().into_iter().filter_map(|r| if let super::pages::StRow::Item(i) = r.1 { Some((r.0, i)) } else { None }).collect();
+        if rows.is_empty() {
             return;
         }
-        let cur = order.iter().position(|&i| self.sel == Some(Sel::Startup(i)));
+        let cur = rows.iter().position(|&(_, i)| self.sel == Some(Sel::Startup(i)));
         let n = match cur {
-            Some(c) => (c as i32 + d).clamp(0, order.len() as i32 - 1) as usize,
+            Some(c) => (c as i32 + d).clamp(0, rows.len() as i32 - 1) as usize,
             None => 0,
         };
-        self.sel = Some(Sel::Startup(order[n]));
-        let y = self.startup_rows().iter().find(|r| r.1 == Some(order[n])).map(|r| r.0).unwrap_or(0.0);
+        self.sel = Some(Sel::Startup(rows[n].1));
+        let y = rows[n].0;
         let view = self.view_h[1];
         if y < self.scroll[1] {
             self.scroll_smooth(1, y);
@@ -2206,6 +2213,12 @@ impl App {
                 self.open_st_pane(i);
             }
             Hit::StPaneClose => self.st_pane = None,
+            Hit::StSecHead(k) => self.set_pref(|p| p.st_fold[k as usize % 3] = !p.st_fold[k as usize % 3]),
+            Hit::StMore(k) => self.set_pref(|p| p.st_all[k as usize % 3] = !p.st_all[k as usize % 3]),
+            Hit::StFoldAll => {
+                let fold = (0..3).any(|k| !self.prefs.st_fold[k]);
+                self.set_pref(|p| p.st_fold = [fold; 3]);
+            }
             Hit::Scroll(k) => {
                 self.drag_scroll = Some((k, y, self.scroll[k as usize]));
                 unsafe {
@@ -3222,6 +3235,17 @@ impl App {
                     self.free_end(i, parts.get(2) == Some(&"disable"));
                 }
                 "free-all" => self.free_all(),
+                "stsec" => {
+                    // stsec <0 apps|1 tasks|2 services> fold|open|all|top
+                    let k = a1.parse::<usize>().unwrap_or(0).min(2);
+                    match parts.get(2).copied().unwrap_or("") {
+                        "fold" => self.set_pref(|p| p.st_fold[k] = true),
+                        "open" => self.set_pref(|p| p.st_fold[k] = false),
+                        "all" => self.set_pref(|p| p.st_all[k] = true),
+                        "top" => self.set_pref(|p| p.st_all[k] = false),
+                        _ => return err("stsec <0|1|2> fold|open|all|top"),
+                    }
+                }
                 "stpane" => {
                     // stpane <name> | stpane close: the details pane of a startup entry
                     let name = parts.get(1..).map(|v| v.join(" ")).unwrap_or_default();

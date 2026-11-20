@@ -63,7 +63,20 @@ pub fn startup_info(e: &crate::startup::Entry) -> StInfo {
     StInfo { what, maker, off, service: false, path }
 }
 
-pub const STARTUP_SORT: [&str; 3] = ["Default", "Name", "Starts from"];
+pub const STARTUP_SORT: [&str; 3] = ["Impact", "Name", "Starts from"];
+
+/// Rows a section shows before "Show N more".
+pub const ST_TOP: usize = 5;
+
+/// One drawn row of the startup page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StRow {
+    Head,
+    Item(usize),
+    /// "Show all (N)" (N = the section size)
+    More(usize),
+    Less,
+}
 
 /// Startup page sections, in this order; each has on items first, then off items.
 pub const ST_SECTIONS: [&str; 3] = ["Apps", "Scheduled tasks", "Services"];
@@ -185,25 +198,58 @@ impl App {
         match self.startup_sort {
             1 => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i), s[i].name.to_lowercase())),
             2 => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i), source_label(s[i].source), s[i].name.to_lowercase())),
-            _ => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i))),
+            // impact: High, Medium, Low, Not measured; the bigger memory first inside a level (8 MB steps, so rows do
+            // not swap on small changes), then the name
+            _ => {
+                let rank: std::collections::HashMap<usize, (u8, std::cmp::Reverse<u64>)> = v.iter().map(|&i| (i, self.startup_rank(&s[i]))).collect();
+                v.sort_by_key(|&i| (startup_section(&s[i]), !held(i), rank[&i], s[i].name.to_lowercase()))
+            }
         }
         v
     }
 
-    /// The startup list as drawn: (y from the top, Some(entry) or None for the header of `section`, section).
-    pub fn startup_rows(&self) -> Vec<(f32, Option<usize>, u8)> {
+    /// Sort key by impact: (level 0 High .. 3 Not measured, memory in 8 MB steps, larger first).
+    pub fn startup_rank(&self, e: &crate::startup::Entry) -> (u8, std::cmp::Reverse<u64>) {
+        let (hits, _) = self.startup_procs(e);
+        if hits.is_empty() {
+            return (3, std::cmp::Reverse(0));
+        }
+        let (level, _) = self.startup_impact(e);
+        let r = match level {
+            "High" => 0,
+            "Medium" => 1,
+            _ => 2,
+        };
+        (r, std::cmp::Reverse(hits.iter().map(|p| p.mem).sum::<u64>() >> 23))
+    }
+
+    /// The startup list as drawn: (y from the top, row, section). A folded section shows only its header; a section
+    /// shows its top ST_TOP rows and "Show all (N)" unless it is open in full ("Show fewer"). A search shows all matches.
+    pub fn startup_rows(&self) -> Vec<(f32, StRow, u8)> {
+        let searching = !self.query.trim().is_empty();
+        let order = self.startup_order();
         let mut out = vec![];
         let mut y = 0.0;
-        let mut last = None;
-        for i in self.startup_order() {
-            let sec = startup_section(&self.startup[i]);
-            if last != Some(sec) {
-                out.push((y, None, sec));
-                y += ST_HEAD_H;
-                last = Some(sec);
+        for sec in 0..3u8 {
+            let items: Vec<usize> = order.iter().copied().filter(|&i| startup_section(&self.startup[i]) == sec).collect();
+            if items.is_empty() {
+                continue;
             }
-            out.push((y, Some(i), sec));
-            y += ST_ROW_H;
+            out.push((y, StRow::Head, sec));
+            y += ST_HEAD_H;
+            if self.prefs.st_fold[sec as usize] && !searching {
+                continue;
+            }
+            let all = searching || self.prefs.st_all[sec as usize];
+            let shown = if all { items.len() } else { items.len().min(ST_TOP) };
+            for &i in &items[..shown] {
+                out.push((y, StRow::Item(i), sec));
+                y += ST_ROW_H;
+            }
+            if !searching && items.len() > ST_TOP {
+                out.push((y, if all { StRow::Less } else { StRow::More(items.len()) }, sec));
+                y += ST_HEAD_H;
+            }
         }
         out
     }
@@ -274,6 +320,10 @@ impl App {
         let bw = (12.0 + 13.0 + 8.0 + self.gfx.measure(&label, Font::Ui, 13.0, 400) + 8.0 + 9.0 + 12.0).ceil();
         let br = Rect::new(layer.r() - 20.0 - bw, layer.y + 16.0, bw, 32.0);
         self.button(br, "", 0, Btn::Std, false, true, Hit::StSort);
+        let any_open = (0..3).any(|k| !self.prefs.st_fold[k]);
+        let fl = if any_open { "Collapse all" } else { "Expand all" };
+        let fw = (12.0 + self.gfx.measure(fl, Font::Ui, 13.0, 400) + 12.0).ceil();
+        self.button(Rect::new(br.x - 8.0 - fw, br.y, fw, 32.0), fl, 0, Btn::Std, false, true, Hit::StFoldAll);
         self.gfx.glyph(0xE8CB, Rect::new(br.x + 12.0, br.y, 13.0, 32.0), 13.0, t.t1);
         self.gfx.text_at(&label, br.x + 33.0, br.y, 32.0, bw, Font::Ui, 13.0, 400, t.t1);
         self.gfx.glyph(0xE70D, Rect::new(br.r() - 12.0 - 9.0, br.y + 1.0, 9.0, 32.0), 9.0, t.t2);
@@ -298,11 +348,11 @@ impl App {
         let view = Rect::new(layer.x, hy + 32.0, layer.w, layer.b() - hy - 32.0);
         let order = self.startup_order();
         let rows = self.startup_rows();
-        self.content_h[1] = rows.last().map(|r| r.0 + if r.1.is_some() { ST_ROW_H } else { ST_HEAD_H }).unwrap_or(0.0) + 8.0;
+        self.content_h[1] = rows.last().map(|r| r.0 + if matches!(r.1, StRow::Item(_)) { ST_ROW_H } else { ST_HEAD_H }).unwrap_or(0.0) + 8.0;
         self.view_h[1] = view.h;
         self.clamp_scroll();
         self.gfx.clip(view);
-        if let Some(&(sy, Some(i), _)) = rows.iter().find(|r| r.1.is_some() && self.sel == r.1.map(Sel::Startup)) {
+        if let Some(&(sy, StRow::Item(i), _)) = rows.iter().find(|r| matches!(r.1, StRow::Item(i) if self.sel == Some(Sel::Startup(i)))) {
             self.sel_highlight(Rect::new(layer.x + 4.0, view.y + 4.0 - self.scroll[1], layer.w - 8.0, 48.0), (2 << 56) | i as u64, sy, 0x6200);
         }
         for &(ry, item, sec) in &rows {
@@ -310,16 +360,42 @@ impl App {
             if y + 48.0 < view.y || y > view.b() {
                 continue;
             }
-            let Some(i) = item else {
-                // section header: name (count), and how many are on
-                let members: Vec<&crate::startup::Entry> = order.iter().map(|&k| &self.startup[k]).filter(|e| startup_section(e) == sec).collect();
-                let on = members.iter().filter(|e| e.enabled).count();
-                let hx = layer.x + 20.0;
-                let w = self.gfx.text_at(ST_SECTIONS[sec as usize], hx, y + 6.0, ST_HEAD_H - 6.0, 300.0, Font::Ui, 13.0, 600, t.t1);
-                self.gfx.text_at(&format!("({})", members.len()), hx + w + 6.0, y + 6.0, ST_HEAD_H - 6.0, 80.0, Font::Ui, 13.0, 400, t.t2);
-                self.gfx.text(&format!("{on} on · {} off", members.len() - on), Rect::new(layer.x, y + 6.0, layer.w - 24.0, ST_HEAD_H - 6.0), Font::Ui, 12.5, 400, Align::Right, t.t2);
-                self.gfx.hline(layer.x + 12.0, layer.r() - 12.0, y + ST_HEAD_H - 1.0, t.line);
-                continue;
+            let i = match item {
+                StRow::Item(i) => i,
+                StRow::Head => {
+                    // section header: chevron, name (count), how many are on; a click folds or opens the section
+                    let (total, on) = order.iter().map(|&k| &self.startup[k]).filter(|e| startup_section(e) == sec).fold((0usize, 0usize), |a, e| (a.0 + 1, a.1 + e.enabled as usize));
+                    let folded = self.prefs.st_fold[sec as usize] && self.query.trim().is_empty();
+                    let hr = Rect::new(layer.x + 4.0, y, layer.w - 8.0, ST_HEAD_H);
+                    let h = Hit::StSecHead(sec);
+                    self.hp(hr, 4.0, h);
+                    self.hit(hr, h);
+                    let hx = layer.x + 16.0;
+                    self.gfx.glyph(if folded { 0xE76C } else { 0xE70D }, Rect::new(hx, y + 6.0, 12.0, ST_HEAD_H - 6.0), 10.0, t.t2);
+                    let w = self.gfx.text_at(ST_SECTIONS[sec as usize], hx + 20.0, y + 6.0, ST_HEAD_H - 6.0, 300.0, Font::Ui, 13.0, 600, t.t1);
+                    self.gfx.text_at(&format!("({total})"), hx + 20.0 + w + 6.0, y + 6.0, ST_HEAD_H - 6.0, 80.0, Font::Ui, 13.0, 400, t.t2);
+                    self.gfx.text(&format!("{on} on · {} off", total - on), Rect::new(layer.x, y + 6.0, layer.w - 24.0, ST_HEAD_H - 6.0), Font::Ui, 12.5, 400, Align::Right, t.t2);
+                    self.gfx.hline(layer.x + 12.0, layer.r() - 12.0, y + ST_HEAD_H - 1.0, t.line);
+                    continue;
+                }
+                StRow::More(_) | StRow::Less => {
+                    // the same row as on the Processes page: "Show all (N)" ▾ / "Show fewer" ▴
+                    let (label, down) = match item {
+                        StRow::More(n) => (format!("Show all ({n})"), true),
+                        _ => ("Show fewer".to_string(), false),
+                    };
+                    let h = Hit::StMore(sec);
+                    let x = x0 + 36.0;
+                    let lw = self.gfx.measure(&label, Font::Ui, 12.5, 600);
+                    let br = Rect::new(x - 8.0, y + 3.0, lw + 16.0 + 16.0, ST_HEAD_H - 6.0);
+                    self.hp(br, 4.0, h);
+                    let pressed = self.press_begin(br, h);
+                    self.gfx.text(&label, Rect::new(x, y, lw + 2.0, ST_HEAD_H), Font::Ui, 12.5, 600, Align::Left, t.acc_t);
+                    self.gfx.glyph(if down { 0xE70D } else { 0xE70E }, Rect::new(x + lw + 6.0, y + 1.0, 9.0, ST_HEAD_H), 9.0, t.acc_t);
+                    self.press_end(pressed);
+                    self.hit(br, h);
+                    continue;
+                }
             };
             let e = self.startup[i].clone();
             let r = Rect::new(layer.x + 4.0, y, layer.w - 8.0, 48.0);
@@ -390,7 +466,12 @@ impl App {
         self.gfx.text_at("Settings", lx, y, 28.0, 300.0, Font::Display, 20.0, 600, t.t1);
         y += 28.0 + 12.0;
         // default Task Manager
-        let card = Rect::new(lx, y, lw, 64.0 + 52.0);
+        // the two buttons sit side by side when they fit, else the second goes under the first (never past the card)
+        let sw = self.btn_w("Set as default Task Manager", 0xEA18, false);
+        let rw = self.btn_w("Restore Windows Task Manager", 0, false);
+        let bx = if lx + 48.0 + sw.max(rw) <= lx + lw - 16.0 { lx + 48.0 } else { lx + 16.0 };
+        let one_row = bx + sw + 14.0 + rw <= lx + lw - 16.0;
+        let card = Rect::new(lx, y, lw, 64.0 + 52.0 + if one_row { 0.0 } else { 42.0 });
         self.gfx.card(card, 8.0, t.card, t.card_s);
         self.gfx.glyph(0xE7EF, Rect::new(lx + 16.0, y, 18.0, 64.0), 16.0, t.t1);
         self.gfx.text("Default Task Manager", Rect::new(lx + 48.0, y + 13.0, lw - 64.0, 18.0), Font::Ui, 13.0, 400, Align::Left, t.t1);
@@ -398,10 +479,9 @@ impl App {
         self.gfx.text(now, Rect::new(lx + 48.0, y + 32.0, lw - 64.0, 16.0), Font::Ui, 12.0, 400, Align::Left, t.t2);
         self.gfx.hline(lx + 1.0, lx + lw - 1.0, y + 64.0, t.line);
         let by = y + 64.0 + 10.0;
-        let sw = self.btn_w("Set as default Task Manager", 0xEA18, false);
-        self.button(Rect::new(lx + 48.0, by, sw, 32.0), "Set as default Task Manager", 0xEA18, Btn::Accent, false, !self.is_default, Hit::SetDefault);
-        let rw = self.btn_w("Restore Windows Task Manager", 0, false);
-        self.button(Rect::new(lx + 48.0 + sw + 14.0, by, rw, 32.0), "Restore Windows Task Manager", 0, Btn::Std, false, self.is_default, Hit::RestoreDefault);
+        self.button(Rect::new(bx, by, sw, 32.0), "Set as default Task Manager", 0xEA18, Btn::Accent, false, !self.is_default, Hit::SetDefault);
+        let (rx0, ry0) = if one_row { (bx + sw + 14.0, by) } else { (bx, by + 42.0) };
+        self.button(Rect::new(rx0, ry0, rw, 32.0), "Restore Windows Task Manager", 0, Btn::Std, false, self.is_default, Hit::RestoreDefault);
         y = card.b();
         // Personalize
         y += 18.0;

@@ -45,12 +45,26 @@ pub struct Prefs {
     pub group: bool,
     /// sections showing all rows (else the top 5 + "Show all")
     pub sec_open: [bool; 3],
+    /// Startup page sections (Apps, Scheduled tasks, Services): all rows shown (else the top 5), and folded shut
+    pub st_all: [bool; 3],
+    pub st_fold: [bool; 3],
     /// sidebar expanded (icon + label) or collapsed (icons)
     pub nav_open: bool,
     /// the accent follows the desktop (wallpaper / DWM colour) instead of `accent`; one choice, never the default
     pub desktop: bool,
     /// how strongly the whole window takes the accent hue: 0 subtle, 1 medium, 2 strong
     pub strength: u8,
+}
+
+/// Three flags from a JSON array (missing = false).
+fn bools(v: &Value) -> [bool; 3] {
+    let mut o = [false; 3];
+    if let Some(a) = v.as_array() {
+        for (i, x) in a.iter().take(3).enumerate() {
+            o[i] = x.as_bool().unwrap_or(false);
+        }
+    }
+    o
 }
 
 impl Default for Prefs {
@@ -77,6 +91,8 @@ impl Default for Prefs {
             pane: 1,
             group: true,
             sec_open: [false; 3],
+            st_all: [false; 3],
+            st_fold: [false; 3],
             nav_open: true,
             desktop: false,
             strength: 1,
@@ -131,6 +147,8 @@ impl Prefs {
             desktop: flag("accent_desktop", d.desktop),
             // the old "Neutral" window colour becomes Subtle
             strength: v["colour_strength"].as_u64().filter(|x| *x <= 2).map(|x| x as u8).unwrap_or(if v["window_color"].as_u64() == Some(2) { 0 } else { d.strength }),
+            st_all: bools(&v["startup_all"]),
+            st_fold: bools(&v["startup_collapsed"]),
             sec_open: {
                 let mut o = d.sec_open;
                 if let Some(a) = v["sections_open"].as_array() {
@@ -150,7 +168,7 @@ impl Prefs {
             "accent": self.accent.map(|a| format!("#{a:06X}")), "density": self.density, "text_size": self.font,
             "corners": self.corners, "col_type": self.col_type, "col_disk": self.col_disk, "col_network": self.col_net,
             "col_gpu": self.col_gpu, "summary": self.tiles, "chips": self.chips, "sort": self.sort, "pane_width": self.pane,
-            "group": self.group, "sections_open": self.sec_open, "nav_open": self.nav_open,
+            "group": self.group, "sections_open": self.sec_open, "startup_all": self.st_all, "startup_collapsed": self.st_fold, "nav_open": self.nav_open,
             "accent_desktop": self.desktop, "colour_strength": self.strength,
         })
     }
