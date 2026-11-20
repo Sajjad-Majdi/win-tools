@@ -153,21 +153,67 @@ pub fn scheduled_tasks() -> Vec<Entry> {
     out
 }
 
-/// Auto-start services whose program is outside C:\Windows (third-party background services).
+/// Auto-start services whose program is outside C:\Windows (third-party background services), plus the ones
+/// Rust Task Manager switched to Manual (shown off, so they can be switched back).
 pub fn auto_services() -> Vec<Entry> {
+    let off = switched_off();
     let mut out = vec![];
     for s in crate::services::list() {
         let Some((start, bin, _)) = crate::services::details(&s.name) else { continue };
-        if start != "auto" {
+        let ours_off = start == "manual" && off.contains_key(&s.name.to_lowercase());
+        if start != "auto" && !ours_off {
             continue;
         }
         let b = bin.to_lowercase();
         if b.contains(r"c:\windows\") || b.contains(r"%systemroot%") || b.starts_with(r"\systemroot") || b.contains(r"\windows defender\") {
             continue;
         }
-        out.push(Entry { name: s.display.clone(), command: bin, source: "Service", enabled: true });
+        out.push(Entry { name: s.display.clone(), command: bin, source: "Service", enabled: !ours_off });
     }
     out
+}
+
+/// Services this app switched off: service name (lower case) -> it was a delayed auto-start one.
+/// %LOCALAPPDATA%\WinTools\startup-services.json, written by the window (not by the elevated helper).
+fn switched_off_path() -> std::path::PathBuf {
+    crate::ai::config_dir().join("startup-services.json")
+}
+
+pub fn switched_off() -> std::collections::HashMap<String, bool> {
+    std::fs::read_to_string(switched_off_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn remember_switch(name: &str, off: bool, delayed: bool) {
+    let mut m = switched_off();
+    if off {
+        m.insert(name.to_lowercase(), delayed);
+    } else {
+        m.remove(&name.to_lowercase());
+    }
+    let _ = std::fs::create_dir_all(crate::ai::config_dir());
+    let _ = std::fs::write(switched_off_path(), serde_json::to_string_pretty(&m).unwrap_or_default());
+}
+
+/// The service behind a startup row (rows show the display name).
+pub fn service_name(display: &str) -> Option<String> {
+    crate::services::list().into_iter().find(|s| s.display == display).map(|s| s.name)
+}
+
+/// What switching a service changes, as words (the dry run prints it; the window uses it for its question).
+pub fn service_plan(name: &str, on: bool) -> String {
+    if on {
+        let delayed = switched_off().get(&name.to_lowercase()).copied().unwrap_or(false);
+        format!("set service {name} to {} (from its next start)", if delayed { "Automatic (Delayed Start)" } else { "Automatic" })
+    } else {
+        format!("set service {name} to Manual: Windows no longer starts it at sign-in; it keeps running now")
+    }
+}
+
+/// Switch a service at startup (needs administrator rights): off = Manual, on = Automatic again (delayed if it was).
+/// The running service is not stopped.
+pub fn set_service(name: &str, on: bool) -> Result<(), String> {
+    let delayed = if on { switched_off().get(&name.to_lowercase()).copied().unwrap_or(false) } else { false };
+    crate::services::set_start(name, on, delayed)
 }
 
 fn set_task_enabled(path: &str, on: bool) -> Result<(), String> {
@@ -213,7 +259,12 @@ pub fn set_enabled_in(name: &str, source: Option<&str>, on: bool) -> Result<Entr
         return Ok(Entry { enabled: on, ..e.clone() });
     }
     if e.source == "Service" {
-        return Err("services are changed with admin rights: sc config <name> start= demand".into());
+        // run as administrator (the window asks once with UAC and runs `RustTaskManager.exe --service-start`)
+        let svc = service_name(&e.name).ok_or_else(|| format!("service '{}' not found", e.name))?;
+        let delayed = !on && crate::services::is_delayed(&svc);
+        set_service(&svc, on)?;
+        remember_switch(&svc, !on, delayed);
+        return Ok(Entry { enabled: on, ..e.clone() });
     }
     let src = sources().into_iter().find(|s| s.label == e.source).unwrap();
     let mut data = vec![if on { 2u8 } else { 3u8 }, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];

@@ -17,6 +17,9 @@ fn main() {
     if args.iter().any(|a| a == "--restore-default") {
         std::process::exit(wt::gui::prefs::run_helper(false));
     }
+    if args.iter().any(|a| a == "--service-start") {
+        std::process::exit(wt::gui::prefs::run_service_helper(&args));
+    }
     let software = args.iter().any(|a| a == "--software") || std::env::var("WT_SOFTWARE").is_ok();
     let code = wt::gui::app::run(software);
     if code != 0 {

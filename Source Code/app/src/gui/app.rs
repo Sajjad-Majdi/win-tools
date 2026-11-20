@@ -1453,7 +1453,8 @@ impl App {
             None => 0,
         };
         self.sel = Some(Sel::Startup(order[n]));
-        let (y, view) = (n as f32 * 48.0, self.view_h[1]);
+        let y = self.startup_rows().iter().find(|r| r.1 == Some(order[n])).map(|r| r.0).unwrap_or(0.0);
+        let view = self.view_h[1];
         if y < self.scroll[1] {
             self.scroll_smooth(1, y);
         } else if y + 56.0 > self.scroll[1] + view {
@@ -1898,13 +1899,12 @@ impl App {
 
     pub fn toggle_startup(&mut self, i: usize) {
         let Some(e) = self.startup.get(i).cloned() else { return };
-        if e.source == "Service" {
-            return;
-        }
         let res = if self.test {
             // test mode: only this window's copy changes (the switch and the row move can be seen), never Windows
             self.last_action = format!("startup toggle in test mode (not written): {}", e.name);
             Ok(e.clone())
+        } else if e.source == "Service" {
+            self.toggle_service(&e)
         } else {
             crate::startup::set_enabled_in(&e.name, Some(e.source), !e.enabled)
         };
@@ -1923,6 +1923,32 @@ impl App {
             Err(err) => self.toast_msg(&format!("Could not change {}: {err}", e.name), false),
         }
         self.invalidate();
+    }
+
+    /// A service at startup: one UAC prompt runs `RustTaskManager.exe --service-start <name> manual|auto[-delayed]`.
+    /// Off = Manual (it keeps running now), on = Automatic again (delayed if it was).
+    fn toggle_service(&mut self, e: &crate::startup::Entry) -> Result<crate::startup::Entry, String> {
+        let svc = crate::startup::service_name(&e.name).ok_or_else(|| "the service is gone".to_string())?;
+        let on = !e.enabled;
+        let delayed_now = !on && crate::services::is_delayed(&svc);
+        let mode = if !on {
+            "manual"
+        } else if crate::startup::switched_off().get(&svc.to_lowercase()).copied().unwrap_or(false) {
+            "auto-delayed"
+        } else {
+            "auto"
+        };
+        match super::prefs::run_elevated_wait(self.hwnd, &format!("--service-start \"{svc}\" {mode}")) {
+            Ok(0) => {
+                crate::startup::remember_switch(&svc, !on, delayed_now);
+                self.toast_msg(&if on { format!("{} starts with Windows again (from its next start)", e.name) } else { format!("{} will not start with Windows any more. It keeps running now.", e.name) }, true);
+                Ok(crate::startup::Entry { enabled: on, ..e.clone() })
+            }
+            Ok(3) => Err("administrator rights were not granted".into()),
+            Ok(c) => Err(format!("the administrator helper failed (code {c})")),
+            Err(x) if x == "cancelled" => Err("the administrator prompt was cancelled; nothing changed".into()),
+            Err(x) => Err(x),
+        }
     }
 
     pub fn service_action(&mut self, i: usize) {

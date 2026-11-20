@@ -224,6 +224,61 @@ pub fn launch_helper(hwnd: windows::Win32::Foundation::HWND, set: bool) -> bool 
     r.0 as isize > 32
 }
 
+/// Run this exe elevated with `args` (one UAC prompt) and wait for it. Ok(exit code); Err("cancelled") when the
+/// user said No to the prompt; Err(text) when it could not start.
+pub fn run_elevated_wait(hwnd: windows::Win32::Foundation::HWND, args: &str) -> Result<u32, String> {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = wide(&exe.display().to_string());
+    let a = wide(args);
+    let verb = wide("runas");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(exe.as_ptr()),
+        lpParameters: PCWSTR(a.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        if ShellExecuteExW(&mut info).is_err() {
+            // 1223 = ERROR_CANCELLED: the user answered No in the UAC prompt
+            return Err(if GetLastError().0 == 1223 { "cancelled".into() } else { format!("could not start the administrator helper ({})", GetLastError().0) });
+        }
+        if info.hProcess.is_invalid() {
+            return Err("the administrator helper did not start".into());
+        }
+        let _ = WaitForSingleObject(info.hProcess, 30_000);
+        let mut code = 0u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        Ok(code)
+    }
+}
+
+/// The elevated service helper (`RustTaskManager.exe --service-start <name> auto|auto-delayed|manual`): 0 = done,
+/// 3 = access denied, 4 = other failure, 2 = bad arguments.
+pub fn run_service_helper(args: &[String]) -> i32 {
+    let Some(i) = args.iter().position(|a| a == "--service-start") else { return 2 };
+    let (Some(name), Some(mode)) = (args.get(i + 1), args.get(i + 2)) else { return 2 };
+    let (auto, delayed) = match mode.as_str() {
+        "auto" => (true, false),
+        "auto-delayed" => (true, true),
+        "manual" => (false, false),
+        _ => return 2,
+    };
+    match crate::services::set_start(name, auto, delayed) {
+        Ok(()) => 0,
+        Err(e) if e.contains("access denied") => 3,
+        Err(_) => 4,
+    }
+}
+
 /// The elevated helper itself (`RustTaskManager.exe --set-default | --restore-default`). Returns the exit code.
 pub fn run_helper(set: bool) -> i32 {
     let key = wide(IFEO);

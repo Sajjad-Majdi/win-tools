@@ -131,3 +131,45 @@ pub fn control(name: &str, action: &str) -> Result<(), String> {
         r
     }
 }
+
+/// Is this auto-start service a delayed one ("Automatic (Delayed Start)")?
+pub fn is_delayed(name: &str) -> bool {
+    unsafe {
+        let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else { return false };
+        let n = wide(name);
+        let mut out = false;
+        if let Ok(svc) = OpenServiceW(scm, PCWSTR(n.as_ptr()), SERVICE_QUERY_CONFIG) {
+            let mut info = SERVICE_DELAYED_AUTO_START_INFO::default();
+            let mut needed = 0u32;
+            let buf = std::slice::from_raw_parts_mut(&mut info as *mut _ as *mut u8, std::mem::size_of::<SERVICE_DELAYED_AUTO_START_INFO>());
+            if QueryServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, Some(buf), &mut needed).is_ok() {
+                out = info.fDelayedAutostart.as_bool();
+            }
+            let _ = CloseServiceHandle(svc);
+        }
+        let _ = CloseServiceHandle(scm);
+        out
+    }
+}
+
+/// Set when Windows starts a service: Automatic (optionally delayed) or Manual. A running service keeps running;
+/// the change applies from the next start. Needs administrator rights.
+pub fn set_start(name: &str, auto: bool, delayed: bool) -> Result<(), String> {
+    unsafe {
+        let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).map_err(|e| e.message())?;
+        let n = wide(name);
+        let svc = OpenServiceW(scm, PCWSTR(n.as_ptr()), SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG).map_err(|e| {
+            let _ = CloseServiceHandle(scm);
+            if e.code().0 as u32 == 0x80070005 { "access denied (needs administrator rights)".to_string() } else { e.message() }
+        })?;
+        let start = if auto { SERVICE_AUTO_START } else { SERVICE_DEMAND_START };
+        let mut r = ChangeServiceConfigW(svc, ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE), start, SERVICE_ERROR(SERVICE_NO_CHANGE), PCWSTR::null(), PCWSTR::null(), None, PCWSTR::null(), PCWSTR::null(), PCWSTR::null(), PCWSTR::null()).map_err(|e| e.message());
+        if r.is_ok() && auto {
+            let mut info = SERVICE_DELAYED_AUTO_START_INFO { fDelayedAutostart: delayed.into() };
+            r = ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, Some(&mut info as *mut _ as *const std::ffi::c_void)).map_err(|e| e.message());
+        }
+        let _ = CloseServiceHandle(svc);
+        let _ = CloseServiceHandle(scm);
+        r
+    }
+}

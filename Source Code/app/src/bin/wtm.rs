@@ -204,7 +204,7 @@ fn run(args: &[String]) -> R {
         "perf" => cmd_perf(args),
         "services" => cmd_services(args, &pos[1..]),
         "service" => cmd_service(pos.get(1), pos.get(2)),
-        "startup" => cmd_startup(pos.get(1), pos.get(2)),
+        "startup" => cmd_startup(pos.get(1), pos.get(2), args.iter().any(|a| a == "--dry-run")),
         "default" => cmd_default(),
         "gui" => cmd_gui(&pos[1..]),
         "why" => cmd_why(pos.get(1)),
@@ -541,7 +541,7 @@ fn cmd_service(action: Option<&String>, name: Option<&String>) -> R {
     Ok(Out { v: json!({"ok": true, "service": name, "action": action}), text: format!("{action}: {name} done\n") })
 }
 
-fn cmd_startup(action: Option<&String>, name: Option<&String>) -> R {
+fn cmd_startup(action: Option<&String>, name: Option<&String>, dry: bool) -> R {
     match action.map(|s| s.as_str()) {
         None | Some("list") => {
             let l = startup::list_all();
@@ -553,6 +553,18 @@ fn cmd_startup(action: Option<&String>, name: Option<&String>) -> R {
         }
         Some(a @ ("enable" | "disable")) => {
             let name = name.ok_or_else(|| usage("startup enable/disable needs a name"))?;
+            if dry {
+                // --dry-run: say what would change, change nothing (services: no admin needed for this)
+                let all = startup::list_all();
+                let e = all.iter().find(|e| e.name.eq_ignore_ascii_case(name)).ok_or_else(|| (1, format!("no startup entry named '{name}'")))?;
+                let plan = if e.source == "Service" {
+                    startup::service_name(&e.name).map(|s| startup::service_plan(&s, a == "enable")).unwrap_or_else(|| "service not found".into())
+                } else {
+                    format!("{} {} at startup ({})", e.name, if a == "enable" { "on" } else { "off" }, e.source)
+                };
+                return Ok(Out { v: json!({"ok": true, "dry_run": true, "name": e.name, "source": e.source, "would": plan}), text: format!("dry run: would {plan}
+") });
+            }
             let e = startup::set_enabled(name, a == "enable").map_err(|e| (1, e))?;
             Ok(Out { v: json!({"ok": true, "name": e.name, "enabled": e.enabled, "source": e.source}), text: format!("{} {}d\n", e.name, a) })
         }

@@ -63,7 +63,21 @@ pub fn startup_info(e: &crate::startup::Entry) -> StInfo {
     StInfo { what, maker, off, service: false, path }
 }
 
-pub const STARTUP_SORT: [&str; 3] = ["On first", "Name", "Starts from"];
+pub const STARTUP_SORT: [&str; 3] = ["Default", "Name", "Starts from"];
+
+/// Startup page sections, in this order; each has on items first, then off items.
+pub const ST_SECTIONS: [&str; 3] = ["Apps", "Scheduled tasks", "Services"];
+pub const ST_HEAD_H: f32 = 36.0;
+pub const ST_ROW_H: f32 = 48.0;
+
+/// 0 = Apps (registry and Startup folders), 1 = scheduled tasks, 2 = services.
+pub fn startup_section(e: &crate::startup::Entry) -> u8 {
+    match e.source {
+        "Scheduled task" => 1,
+        "Service" => 2,
+        _ => 0,
+    }
+}
 
 thread_local! {
     /// startup entry name -> (generation, what it runs now)
@@ -162,19 +176,36 @@ impl App {
         let toks = model::tokens(&self.query);
         let mut v: Vec<usize> = (0..self.startup.len()).filter(|&i| toks.is_empty() || model::startup_matches(&self.startup[i], &toks)).collect();
         let s = &self.startup;
+        // a just-switched row keeps its place until its switch has moved
+        let held = |i: usize| match self.startup_hold {
+            Some((h, was, at)) if h == i && at.elapsed() < STARTUP_HOLD => was,
+            _ => s[i].enabled,
+        };
+        // section, then on before off, then the order picked in the Sort menu
         match self.startup_sort {
-            1 => v.sort_by_key(|&i| s[i].name.to_lowercase()),
-            2 => v.sort_by_key(|&i| (source_label(s[i].source), s[i].name.to_lowercase())),
-            // on, then off, then services (no switch); a just-switched row keeps its place until its switch has moved
-            _ => {
-                let held = |i: usize| match self.startup_hold {
-                    Some((h, was, at)) if h == i && at.elapsed() < STARTUP_HOLD => was,
-                    _ => s[i].enabled,
-                };
-                v.sort_by_key(|&i| (s[i].source == "Service", !held(i), s[i].source == "Scheduled task"))
-            }
+            1 => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i), s[i].name.to_lowercase())),
+            2 => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i), source_label(s[i].source), s[i].name.to_lowercase())),
+            _ => v.sort_by_key(|&i| (startup_section(&s[i]), !held(i))),
         }
         v
+    }
+
+    /// The startup list as drawn: (y from the top, Some(entry) or None for the header of `section`, section).
+    pub fn startup_rows(&self) -> Vec<(f32, Option<usize>, u8)> {
+        let mut out = vec![];
+        let mut y = 0.0;
+        let mut last = None;
+        for i in self.startup_order() {
+            let sec = startup_section(&self.startup[i]);
+            if last != Some(sec) {
+                out.push((y, None, sec));
+                y += ST_HEAD_H;
+                last = Some(sec);
+            }
+            out.push((y, Some(i), sec));
+            y += ST_ROW_H;
+        }
+        out
     }
 
     pub fn open_st_pane(&mut self, i: usize) {
@@ -220,7 +251,7 @@ impl App {
             y += h + 14.0;
         }
         if info.service {
-            self.gfx.para("No switch here: changing when a service starts needs administrator rights.", Rect::new(x, y, w, 60.0), Font::Ui, 12.5, 400, Align::Left, t.t2, 18.0);
+            self.gfx.para("Switching it off sets it to Manual: Windows no longer starts it at sign-in. It keeps running now; the change applies from its next start. Windows asks once for administrator approval.", Rect::new(x, y, w, 60.0), Font::Ui, 12.5, 400, Align::Left, t.t2, 18.0);
         }
         self.gfx.unclip();
     }
@@ -266,18 +297,30 @@ impl App {
         // rows
         let view = Rect::new(layer.x, hy + 32.0, layer.w, layer.b() - hy - 32.0);
         let order = self.startup_order();
-        self.content_h[1] = order.len() as f32 * 48.0 + 8.0;
+        let rows = self.startup_rows();
+        self.content_h[1] = rows.last().map(|r| r.0 + if r.1.is_some() { ST_ROW_H } else { ST_HEAD_H }).unwrap_or(0.0) + 8.0;
         self.view_h[1] = view.h;
         self.clamp_scroll();
         self.gfx.clip(view);
-        if let Some(n) = order.iter().position(|&i| self.sel == Some(Sel::Startup(i))) {
-            self.sel_highlight(Rect::new(layer.x + 4.0, view.y + 4.0 - self.scroll[1], layer.w - 8.0, 48.0), (2 << 56) | order[n] as u64, n as f32 * 48.0, 0x6200);
+        if let Some(&(sy, Some(i), _)) = rows.iter().find(|r| r.1.is_some() && self.sel == r.1.map(Sel::Startup)) {
+            self.sel_highlight(Rect::new(layer.x + 4.0, view.y + 4.0 - self.scroll[1], layer.w - 8.0, 48.0), (2 << 56) | i as u64, sy, 0x6200);
         }
-        for (n, &i) in order.iter().enumerate() {
-            let y = view.y + 4.0 + n as f32 * 48.0 - self.scroll[1];
+        for &(ry, item, sec) in &rows {
+            let y = view.y + 4.0 + ry - self.scroll[1];
             if y + 48.0 < view.y || y > view.b() {
                 continue;
             }
+            let Some(i) = item else {
+                // section header: name (count), and how many are on
+                let members: Vec<&crate::startup::Entry> = order.iter().map(|&k| &self.startup[k]).filter(|e| startup_section(e) == sec).collect();
+                let on = members.iter().filter(|e| e.enabled).count();
+                let hx = layer.x + 20.0;
+                let w = self.gfx.text_at(ST_SECTIONS[sec as usize], hx, y + 6.0, ST_HEAD_H - 6.0, 300.0, Font::Ui, 13.0, 600, t.t1);
+                self.gfx.text_at(&format!("({})", members.len()), hx + w + 6.0, y + 6.0, ST_HEAD_H - 6.0, 80.0, Font::Ui, 13.0, 400, t.t2);
+                self.gfx.text(&format!("{on} on · {} off", members.len() - on), Rect::new(layer.x, y + 6.0, layer.w - 24.0, ST_HEAD_H - 6.0), Font::Ui, 12.5, 400, Align::Right, t.t2);
+                self.gfx.hline(layer.x + 12.0, layer.r() - 12.0, y + ST_HEAD_H - 1.0, t.line);
+                continue;
+            };
             let e = self.startup[i].clone();
             let r = Rect::new(layer.x + 4.0, y, layer.w - 8.0, 48.0);
             let h = Hit::StRow(i);
@@ -320,11 +363,7 @@ impl App {
                 self.gfx.text_at(level, imp_x, r.y, 48.0, 100.0, Font::Ui, 12.5, if level == "High" { 600 } else { 400 }, c);
                 self.tip(Rect::new(imp_x, r.y, 96.0, r.h), detail);
             }
-            if e.source == "Service" {
-                self.gfx.text("Service", Rect::new(tog_x, r.y, 96.0, 48.0), Font::Ui, 12.5, 400, Align::Right, t.t3);
-            } else {
-                self.toggle(x1, r.cy(), e.enabled, Hit::StToggle(i), true);
-            }
+            self.toggle(x1, r.cy(), e.enabled, Hit::StToggle(i), true);
         }
         if self.startup.is_empty() {
             self.gfx.text("Reading startup entries…", Rect::new(view.x, view.y + 30.0, view.w, 24.0), Font::Ui, 13.0, 400, Align::Center, t.t2);
