@@ -809,18 +809,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::impact_level;
-    use crate::gui::app::{App, Hit};
+    use crate::gui::app::Hit;
 
     #[test]
-    fn a_menu_button_toggles_its_menu() {
-        // open menu + a click on the button that opened it: the click only closes the menu
-        assert!(!App::menu_click_passes(true, Some(Hit::StSort), Hit::StSort));
-        // open menu + a click on something else: closes the menu and the click goes on
-        assert!(App::menu_click_passes(true, Some(Hit::StSort), Hit::Sort));
-        // a click outside on nothing just closes it
-        assert!(!App::menu_click_passes(true, Some(Hit::StSort), Hit::None));
-        // closed menu: the button opens it
-        assert!(App::menu_click_passes(false, None, Hit::StSort));
+    fn a_dropdown_button_toggles_its_dropdown() {
+        use crate::gui::app::drop_toggle_click;
+        use crate::gui::gfx::Rect;
+        let r = Rect::new(10.0, 20.0, 120.0, 32.0);
+        // the button that opened it: close only
+        assert!(drop_toggle_click(Hit::Sort, Some(Hit::Sort), Some(r), Some(Rect::new(0.0, 0.0, 1.0, 1.0))));
+        // a hit drawn at the anchor rectangle: close only
+        assert!(drop_toggle_click(Hit::StSort, Some(Hit::None), Some(r), Some(r)));
+        // another button elsewhere: the click goes on
+        assert!(!drop_toggle_click(Hit::StSort, Some(Hit::Sort), Some(r), Some(Rect::new(300.0, 20.0, 80.0, 32.0))));
+        // empty space never counts as the button
+        assert!(!drop_toggle_click(Hit::None, Some(Hit::None), Some(r), None));
     }
 
     #[test]

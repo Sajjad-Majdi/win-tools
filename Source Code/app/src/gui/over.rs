@@ -409,7 +409,7 @@ impl App {
     fn paint_menu(&mut self, closed: Option<Instant>) {
         let t = self.t;
         let Some(m) = &self.menu else { return };
-        let (kind, mx, my, at) = (m.kind, m.x, m.y, m.at);
+        let (kind, mx, my, at, anchor) = (m.kind, m.x, m.y, m.at, m.anchor);
         // (glyph, label, shortcut, separator before)
         let items: Vec<(u32, String, String, bool, bool)> = match kind {
             MenuKind::Row => {
@@ -442,16 +442,35 @@ impl App {
             _ => 180.0,
         };
         let mh = 8.0 + items.iter().map(|i| if i.3 { 9.0 + 32.0 } else { 32.0 }).sum::<f32>();
-        let x = mx.min(self.w - mw - 8.0).max(8.0);
-        let y = if my + mh > self.h - 8.0 { (my - mh).max(8.0) } else { my };
+        // a dropdown opens under the button that opened it (File Explorer's drop_rect); a context menu at the pointer
+        let (x, y, up) = match anchor {
+            Some(a) => {
+                let x = a.x.min(self.w - mw - 4.0).max(4.0);
+                let below = a.b() + 4.0;
+                if below + mh > self.h - 4.0 { (x, (a.y - 4.0 - mh).max(4.0), true) } else { (x, below, false) }
+            }
+            None => {
+                let up = my + mh > self.h - 8.0;
+                (mx.min(self.w - mw - 8.0).max(8.0), if up { (my - mh).max(8.0) } else { my }, up)
+            }
+        };
         let Some((alpha, dy)) = self.pop_motion(at, closed) else {
             self.mo.borrow_mut().ghost_menu = None;
             return;
         };
         let old = self.gfx.push_alpha(alpha);
         // menus grow from the point they were opened at
-        let up = my + mh > self.h - 8.0;
         let r = Rect::new(x, y + if up { -dy } else { dy }, mw, mh);
+        if closed.is_none() {
+            self.menu_r = Some(Rect::new(x, y, mw, mh));
+        }
+        // File Explorer's pop: it scales from the button's centre (0.96 -> 1 opening, 1 -> 0.98 closing)
+        let (ax, ay) = match anchor {
+            Some(a) => (a.cx().clamp(r.x, r.r()), if up { r.b() } else { r.y }),
+            None => (mx.clamp(r.x, r.r()), if up { r.b() } else { r.y }),
+        };
+        let sc = if closed.is_none() { 0.96 + 0.04 * alpha } else { 0.98 + 0.02 * alpha };
+        self.gfx.push_scale(ax, ay, sc);
         self.fly_card(r);
         // the menu blocks what is under it; its items (added after this) take the clicks
         self.hit(r, Hit::Block);
@@ -478,6 +497,7 @@ impl App {
             }
             iy += 32.0;
         }
+        self.gfx.pop_xf();
         self.gfx.pop_alpha(old);
     }
 

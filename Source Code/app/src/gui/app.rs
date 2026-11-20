@@ -257,6 +257,10 @@ pub struct Menu {
     pub x: f32,
     pub y: f32,
     pub at: Instant,
+    /// the rectangle of the button that opened it (a dropdown opens under it); None = at the pointer
+    pub anchor: Option<Rect>,
+    /// the button that opened it: a click on that button while it is open only closes it
+    pub by: Hit,
 }
 
 #[derive(Clone)]
@@ -340,8 +344,8 @@ pub struct App {
     pub startup_hold: Option<(usize, bool, Instant)>,
     /// the details pane of a startup entry (index, what is known about it)
     pub st_pane: Option<(usize, super::pages::StInfo)>,
-    /// the button that opened the open menu: clicking it again closes the menu (never reopens it)
-    pub menu_anchor: Option<Hit>,
+    /// where the open menu was drawn last (a click on its padding stays in it)
+    pub menu_r: Option<Rect>,
     pub query: String,
     pub search_focus: bool,
     /// caret in the search text (chars; usize::MAX = at the end) and "all selected" (Ctrl+A)
@@ -1416,7 +1420,7 @@ impl App {
         self.scroll_to(i);
         let r = self.rows[i];
         let y = (self.list_rect.y + r.y - self.scroll[0] + r.h / 2.0).clamp(self.list_rect.y, self.list_rect.b());
-        self.open_menu(Menu { kind: MenuKind::Row, x: self.list_rect.x + 80.0, y, at: Instant::now() }, None);
+        self.open_menu(Menu { kind: MenuKind::Row, x: self.list_rect.x + 80.0, y, at: Instant::now(), anchor: None, by: Hit::None }, None);
         self.animate(180);
     }
 
@@ -2176,6 +2180,20 @@ impl App {
             self.invalidate();
             return;
         }
+        // clicks outside a popup close it (same as File Explorer)
+        let in_menu = matches!(h, Hit::MenuItem(_)) || (matches!(h, Hit::Block) && self.menu_r.map(|r| r.has(x, y)).unwrap_or(false));
+        if !in_menu && self.menu.is_some() {
+            let anchor_was = self.menu.as_ref().and_then(|m| m.anchor);
+            let by_was = self.menu.as_ref().map(|m| m.by);
+            self.menu = None;
+            self.invalidate();
+            // a click on the same dropdown button just closes it: the button that opened it, or any hit drawn at
+            // exactly the dropdown's anchor rectangle
+            let hit_rect = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0);
+            if drop_toggle_click(h, by_was, anchor_was, hit_rect) {
+                return;
+            }
+        }
         self.pressed = h;
         self.animate(motion::FAST as u64);
         self.key_focus = h == Hit::KeyField || (self.key_focus && matches!(h, Hit::KeySave | Hit::KeyTest));
@@ -2263,31 +2281,25 @@ impl App {
         }
     }
 
-    /// The one way a menu opens. `anchor` = the button that opened it: a second click on it closes the menu.
-    pub fn open_menu(&mut self, m: Menu, anchor: Option<Hit>) {
+    /// The one way a dropdown opens (same as File Explorer's `open_drop`). It remembers the button that was pressed to
+    /// open it (and its rectangle), so a second click on that button closes it instead of opening it again (see
+    /// `drop_toggle_click`), and the menu opens under that button.
+    pub fn open_menu(&mut self, mut m: Menu, by: Option<Hit>) {
+        if let Some(h) = by {
+            m.by = h;
+            m.anchor = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0);
+        }
         self.menu = Some(m);
-        self.menu_anchor = anchor;
-    }
-
-    /// What a click does to an open menu: None = the click is used up (it closed the menu: outside on nothing, or on
-    /// the menu's own button), Some = closed it and the click goes on to its target.
-    pub fn menu_click_passes(menu_open: bool, anchor: Option<Hit>, h: Hit) -> bool {
-        !(menu_open && (matches!(h, Hit::Block | Hit::None) || anchor == Some(h)))
     }
 
     pub fn click(&mut self, h: Hit, x: f32, y: f32) {
-        // an open menu takes the click
+        // an open menu takes the click (the mouse already closed it on mouse-down when the click was outside it)
         if self.menu.is_some() {
             if let Hit::MenuItem(i) = h {
                 self.menu_action(i);
                 return;
             }
             self.menu = None;
-            // the button that opened this menu closes it (a toggle), it never opens it again
-            let anchor = self.menu_anchor.take();
-            if !Self::menu_click_passes(true, anchor, h) {
-                return;
-            }
         }
         if self.dialog.is_some() {
             match h {
@@ -2327,7 +2339,7 @@ impl App {
                     }
                 }
             }
-            Hit::ChipMore => self.open_menu(Menu { kind: MenuKind::Chips, x, y: y + 8.0, at: Instant::now() }, Some(h)),
+            Hit::ChipMore => self.open_menu(Menu { kind: MenuKind::Chips, x, y: y + 8.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(h)),
             Hit::EndTask => self.end_selected(self.shift),
             Hit::Restart => self.restart_selected(),
             Hit::Details => {
@@ -2339,13 +2351,13 @@ impl App {
             }
             Hit::More | Hit::PaneMore => {
                 if self.sel_group().is_some() {
-                    self.open_menu(Menu { kind: MenuKind::Row, x, y: y + 10.0, at: Instant::now() }, Some(h));
+                    self.open_menu(Menu { kind: MenuKind::Row, x, y: y + 10.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(h));
                     self.animate(180);
                 }
             }
             Hit::Free | Hit::FlyFree => self.open_free(),
             Hit::Sort => {
-                self.open_menu(Menu { kind: MenuKind::Sort, x: x - 40.0, y: y + 14.0, at: Instant::now() }, Some(h));
+                self.open_menu(Menu { kind: MenuKind::Sort, x: x - 40.0, y: y + 14.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(h));
                 self.animate(180);
             }
             Hit::Header(c) => {
@@ -2416,7 +2428,7 @@ impl App {
                     self.test_or_spawn(&c, &d, 0);
                 }
             }
-            Hit::StSort => self.open_menu(Menu { kind: MenuKind::StartupSort, x: x - 60.0, y: y + 14.0, at: Instant::now() }, Some(h)),
+            Hit::StSort => self.open_menu(Menu { kind: MenuKind::StartupSort, x: x - 60.0, y: y + 14.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(h)),
             Hit::SetDefault => self.set_default(true),
             Hit::RestoreDefault => self.set_default(false),
             Hit::Seg(g, i) => match g {
@@ -2509,7 +2521,7 @@ impl App {
                 }
             }
             Hit::DefSort => {
-                self.open_menu(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now() }, Some(h));
+                self.open_menu(Menu { kind: MenuKind::DefSort, x: x - 60.0, y: y + 14.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(h));
             }
             _ => {}
         }
@@ -3141,8 +3153,8 @@ impl App {
                 "menu" => {
                     let (x, y) = (parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(330.0), parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(322.0));
                     match a1 {
-                        "row" => self.menu = Some(Menu { kind: MenuKind::Row, x, y, at: Instant::now() }),
-                        "sort" => self.open_menu(Menu { kind: MenuKind::Sort, x: self.w - 190.0, y: TITLE_H + TILES_H + 70.0, at: Instant::now() }, Some(Hit::Sort)),
+                        "row" => self.menu = Some(Menu { kind: MenuKind::Row, x, y, at: Instant::now(), anchor: None, by: Hit::None }),
+                        "sort" => self.open_menu(Menu { kind: MenuKind::Sort, x: self.w - 190.0, y: TITLE_H + TILES_H + 70.0, at: Instant::now(), anchor: None, by: Hit::None }, Some(Hit::Sort)),
                         "close" => self.menu = None,
                         _ => return err("menu row [x y]|sort|close"),
                     }
@@ -3925,7 +3937,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     && matches!(app.rows.get(i).map(|r| r.k), Some(RowK::Group(_)) | Some(RowK::Child(..)))
                 {
                     app.select_row(i);
-                    app.menu = Some(Menu { kind: MenuKind::Row, x, y, at: Instant::now() });
+                    app.menu = Some(Menu { kind: MenuKind::Row, x, y, at: Instant::now(), anchor: None, by: Hit::None });
                     app.animate(180);
                 }
                 app.invalidate();
@@ -4251,7 +4263,7 @@ pub fn run(software: bool) -> i32 {
             startup_sort: 0,
             startup_hold: None,
             st_pane: None,
-            menu_anchor: None,
+            menu_r: None,
             query: String::new(),
             search_focus: false,
             caret: usize::MAX,
@@ -4368,5 +4380,20 @@ pub fn run(software: bool) -> i32 {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         drop(Box::from_raw(ptr));
         0
+    }
+}
+
+/// Is this mouse-down on the button of the dropdown that is open (so it must only close it)? `by` = the hit that
+/// opened it, `anchor` = its rectangle, `hit_rect` = where the clicked hit is drawn. (Copied from File Explorer.)
+pub fn drop_toggle_click(h: Hit, by: Option<Hit>, anchor: Option<Rect>, hit_rect: Option<Rect>) -> bool {
+    if matches!(h, Hit::None | Hit::Block) {
+        return false;
+    }
+    if by == Some(h) {
+        return true;
+    }
+    match (anchor, hit_rect) {
+        (Some(a), Some(r)) => (a.x - r.x).abs() < 1.0 && (a.y - r.y).abs() < 1.0 && (a.w - r.w).abs() < 1.0,
+        _ => false,
     }
 }
