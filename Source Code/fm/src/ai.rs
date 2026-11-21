@@ -9,7 +9,7 @@
 //! - Model fixed: gemini-3.5-flash-lite (free tier, ~1.7 s per answer; Sajjad 2026-11-19: fast + free plan), thinking
 //!   "minimal", through generateContent (model id and thinking levels checked in the Gemini API docs 2026-11-19).
 //! Settings file %LOCALAPPDATA%\WinTools\ai.json: { "enabled": false, "lang": "en" | "fa" }.
-use fmcore::util::wide;
+use crate::util::wide;
 use serde_json::{Value, json};
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::PCWSTR;
@@ -18,10 +18,10 @@ pub const MODEL: &str = "gemini-3.5-flash-lite";
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
 pub const GET_KEY_URL: &str = "https://aistudio.google.com/apikey";
 /// shown next to the switch in Settings
-pub const SENT_NOTE: &str = "Search in your own words, in any language: type what you need and press Shift+Enter (or AI Search). It sends your search words and the names, folders and dates of up to 60 files it finds to Google Gemini with your own key. Nothing is sent while it is off.";
+pub const SENT_NOTE: &str = "AI Search sends your search words and the names, folders and dates of up to 60 matches. AI Review sends the names, folders, sizes and dates of Cleanup items when you start a review. Both use your own Gemini key. Nothing is sent while AI features are off.";
 
 pub fn config_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("WinTools")
+    crate::util::data_dir()
 }
 
 fn env(name: &str) -> Option<String> {
@@ -50,7 +50,21 @@ pub fn switch_on() -> bool {
 
 /// AI usable: switch on and a key saved. Gate every AI button, spinner and call on this.
 pub fn enabled() -> bool {
-    switch_on() && has_key()
+    features_ready(switch_on(), has_key)
+}
+
+fn features_ready(on: bool, has_key: impl FnOnce() -> bool) -> bool {
+    on && has_key()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn search_and_review_share_the_switch_and_key_gate() {
+        assert!(!super::features_ready(false, || panic!("AI is off")));
+        assert!(!super::features_ready(true, || false));
+        assert!(super::features_ready(true, || true));
+    }
 }
 
 pub fn available() -> bool {
@@ -299,11 +313,15 @@ pub fn test_key(key: Option<&str>) -> Result<(), String> {
 
 /// One completion (JSON asked for in `system`). Fails when AI is off or there is no key.
 pub fn complete(system: &str, prompt: &str) -> Result<String, String> {
+    complete_with_limit(system, prompt, 400)
+}
+
+pub(crate) fn complete_with_limit(system: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
     if !enabled() {
         return Err("AI features are off (Settings > AI features)".into());
     }
     let key = load_key().ok_or("no API key saved")?;
-    gemini(&key, system, prompt, 400)
+    gemini(&key, system, prompt, max_tokens)
 }
 
 // ------------------------------------------------------------------------------------------------ file cache
@@ -339,7 +357,7 @@ fn facts(path: &std::path::Path) -> Value {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let md = std::fs::metadata(path).ok();
     let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let mut f = json!({"name": name, "path": path.display().to_string(), "type": fmcore::info::type_name(path, is_dir),
+    let mut f = json!({"name": name, "path": path.display().to_string(), "type": crate::info::type_name(path, is_dir),
         "size_bytes": md.as_ref().map(|m| m.len()).unwrap_or(0)});
     if is_dir {
         return f;

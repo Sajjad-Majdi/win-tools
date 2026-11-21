@@ -4,7 +4,7 @@
 use fmcore::list::SortKey;
 use fmcore::ops::{self, Conflict, Control, Progress};
 use fmcore::util::*;
-use fmcore::{dialog, info, journal, list, menu, namespace, pins, recycle, search, shell, thumb, watch, zip};
+use fmcore::{cleanup, dialog, info, journal, list, menu, namespace, pins, recycle, search, shell, thumb, watch, zip};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ Browse
   bin [--top N]                           the Recycle Bin: id, original path, deleted, size
   bin restore <id or original path>       put an item back (undo: wfm undo)
   bin empty --yes                         empty the Recycle Bin for good (needs --yes)
+  cleanup --scan                          read-only cleanup groups and sizes (uses Everything)
   devices                                 phones and cameras (MTP, no drive letter)
   shell-ls <parsing name or path>         browse a phone folder (or any shell folder)
   shell-copy <parsing name...> <dest>     copy from (or to) a phone through the shell
@@ -218,6 +219,7 @@ fn run(a: &Args) -> R {
         "thumb" => cmd_thumb(a),
         "dialog" => cmd_dialog(a),
         "bin" | "recycle-bin" => cmd_bin(a),
+        "cleanup" => cmd_cleanup(a),
         "devices" => cmd_devices(),
         "shell-ls" => cmd_shell_ls(a),
         "shell-copy" => cmd_shell_copy(a),
@@ -227,6 +229,24 @@ fn run(a: &Args) -> R {
         "eject" => cmd_eject(a),
         other => Err(usage(&format!("unknown command '{other}'"))),
     }
+}
+
+fn cmd_cleanup(a: &Args) -> R {
+    if !a.flag("--scan") || a.pos.len() != 1 {
+        return Err(usage("use: wfm cleanup --scan"));
+    }
+    let start = Instant::now();
+    let groups = cleanup::scan(&Default::default(), &|_| {}).map_err(fail)?;
+    let ms = start.elapsed().as_millis();
+    let mut text = format!("Cleanup scan ({ms} ms)\n");
+    let rows: Vec<_> = groups.iter().map(|g| {
+        let count = if g.id == cleanup::GroupId::RecycleBin { None } else { Some(g.items.len()) };
+        let suffix = if g.limited { " [partial]" } else { "" };
+        let items = count.map(|n| format!("  {n} items")).unwrap_or_default();
+        text += &format!("{:<18} {:>10}{items}{suffix}\n", g.title, fmt_bytes(g.total_size));
+        json!({"id": g.id.as_str(), "title": g.title, "reason": g.reason, "size": g.total_size, "count": count, "limited": g.limited})
+    }).collect();
+    Ok(Out { v: json!({"ok": true, "ms": ms, "groups": rows}), text })
 }
 
 fn trunc(s: &str, n: usize) -> String {

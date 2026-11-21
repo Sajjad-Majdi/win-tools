@@ -108,8 +108,6 @@ pub enum P {
     L(f32, f32),
     /// cubic bezier: c1, c2, end
     B(f32, f32, f32, f32, f32, f32),
-    /// quadratic: control, end
-    Q(f32, f32, f32, f32),
     Z,
 }
 
@@ -572,7 +570,6 @@ impl Gfx {
                     }
                     P::L(x, y) => sink.AddLine(v(x, y)),
                     P::B(a, b, c2, d, e, f) => sink.AddBezier(&D2D1_BEZIER_SEGMENT { point1: v(a, b), point2: v(c2, d), point3: v(e, f) }),
-                    P::Q(a, b, e, f) => sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: v(a, b), point2: v(e, f) }),
                     P::Z => {
                         sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                         open = false;

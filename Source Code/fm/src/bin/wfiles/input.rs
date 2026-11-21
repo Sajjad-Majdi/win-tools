@@ -79,6 +79,9 @@ impl App {
 
     /// The tooltip of a target: names and keys of icon-only buttons, the full text of a cut name.
     pub fn tip_text(&mut self, h: Hit) -> Option<String> {
+        if let Hit::Cleanup(target) = h {
+            return self.cleanup_tip(target);
+        }
         let s = match h {
             Hit::Back => "Back (Alt+Left)".to_string(),
             Hit::Fwd => "Forward (Alt+Right)".to_string(),
@@ -320,6 +323,8 @@ impl App {
         let paths: Vec<PathBuf> = sel.iter().map(|i| i.path.clone()).collect();
         let dir = self.the_dir();
         match a {
+            Act::Cleanup(crate::cleanup_page::Command::SideDrive) => self.side_act(a),
+            Act::Cleanup(cmd) => self.cleanup_action(cmd, paths.first().cloned()),
             Act::Open => self.open_selection(false),
             Act::OpenNewTab => self.open_selection(true),
             Act::Preview => self.preview_open(),
@@ -578,6 +583,10 @@ impl App {
             }
             Act::TabDuplicate => {
                 let loc = self.tabs[i].pane().loc.clone();
+                if loc == Loc::Cleanup {
+                    self.cur = i;
+                    return;
+                }
                 let view = self.tabs[i].view;
                 self.new_tab(loc);
                 // the copy sits right after its tab and keeps its view
@@ -589,15 +598,23 @@ impl App {
             }
             Act::TabClose => self.close_tab(i),
             Act::TabCloseOthers => {
+                if self.cleanup.moving() && self.tabs[i].pane().loc != Loc::Cleanup {
+                    return;
+                }
                 let keep = self.tabs.remove(i);
                 self.tabs = vec![keep];
                 self.cur = 0;
                 self.whatis = None;
+                self.cleanup_tabs_changed();
             }
             Act::TabCloseRight => {
+                if self.cleanup.moving() && self.tabs[i + 1..].iter().any(|t| t.pane().loc == Loc::Cleanup) {
+                    return;
+                }
                 self.tabs.truncate(i + 1);
                 self.cur = self.cur.min(i);
                 self.whatis = None;
+                self.cleanup_tabs_changed();
             }
             _ => {}
         }
@@ -639,7 +656,12 @@ impl App {
                     items.push(MItem::new("Unpin from sidebar", 0xE77A, Act::SideUnpin).sep());
                 }
                 items.push(MItem::new("Copy path", 0xE71B, Act::SideCopyPath).sep());
-                items.push(MItem::new("Properties", 0xE946, Act::SideProps));
+                if is_drive {
+                    items.push(MItem::new("Clean up", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::SideDrive)).sep());
+                }
+                let mut props = MItem::new("Properties", 0xE946, Act::SideProps);
+                props.sep = is_drive;
+                items.push(props);
             }
             _ => {}
         }
@@ -652,6 +674,7 @@ impl App {
         let path = loc.path().map(|p| p.to_path_buf());
         match a {
             Act::SideOpen => self.go(loc),
+            Act::Cleanup(cmd) => self.cleanup_action(cmd, path),
             Act::SideNewTab => self.new_tab(loc),
             Act::SideEmptyBin => self.confirm = Some(("Empty the Recycle Bin? Everything in it is deleted for good.".into(), Act::EmptyBin)),
             Act::SideUnpin => {
@@ -1155,6 +1178,9 @@ impl App {
         if self.menu.is_some() || self.drop.is_some() {
             return;
         }
+        if self.pane().loc == Loc::Cleanup && self.cleanup_wheel(x, y, d) {
+            return;
+        }
         if let Some(pv) = self.pv.as_mut() {
             pv.scroll = (pv.scroll - d / 120.0 * 63.0).max(0.0);
             self.invalidate();
@@ -1188,6 +1214,7 @@ impl App {
             return;
         }
         match self.hit_at(x, y) {
+            Hit::Cleanup(crate::cleanup_page::Target::Row(i)) => self.cleanup_menu(i, x, y),
             Hit::Row(p, i) => {
                 let path = self.tab().panes[p].rows().get(i).map(|x| x.path.clone());
                 if let Some(path) = path
@@ -1249,6 +1276,13 @@ impl App {
         if self.palette.is_some() && !matches!(h, Hit::Pal(_) | Hit::Block) {
             self.palette = None;
         }
+        if self.cleanup.modal() {
+            if let Hit::Cleanup(target) = h {
+                self.cleanup_click(target, Rect::default(), dbl);
+            }
+            self.invalidate();
+            return;
+        }
         if let Some(c) = &self.confirm {
             let act = c.1;
             match h {
@@ -1294,6 +1328,10 @@ impl App {
             self.search_focus = false;
         }
         match h {
+            Hit::Cleanup(target) => {
+                let r = self.hits.iter().rev().find(|(_, hit)| *hit == h).map_or(Rect::default(), |(r, _)| *r);
+                self.cleanup_click(target, r, dbl);
+            }
             Hit::Tab(i) => {
                 self.cur = i;
                 self.path_edit = None;
@@ -1339,7 +1377,7 @@ impl App {
             Hit::OmniClear => self.end_search(),
             Hit::New if self.pane().loc.path().is_some() => self.act(Act::NewMenu),
             Hit::Sug(i) => self.sug_take(i, true),
-            Hit::ViewBtn if self.pane().loc != Loc::Settings => self.act(Act::ViewMenu),
+            Hit::ViewBtn if !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) => self.act(Act::ViewMenu),
             Hit::Side(i) => self.side_click(i),
             Hit::SideThisPc => self.go(Loc::ThisPc),
             Hit::SideSettings => self.open_settings(),
@@ -1702,6 +1740,9 @@ impl App {
 
     // ------------------------------------------------------------------ omnibox
     pub fn edit_path(&mut self) {
+        if self.pane().loc == Loc::Cleanup {
+            return;
+        }
         let mut f = Field::new(&self.pane().loc.display());
         f.select_all();
         self.path_edit = Some(f);
@@ -1710,7 +1751,7 @@ impl App {
 
     pub fn search_mode(&mut self, first: &str) {
         // Settings has nothing to search
-        if self.pane().loc == Loc::Settings {
+        if matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) {
             return;
         }
         let pc = self.ui.scope_pc;
@@ -1867,7 +1908,7 @@ impl App {
         }
         let s = c.to_string();
         // a confirm box or an open menu owns the keys: letters never reach the list behind it
-        if self.confirm.is_some() || self.menu.is_some() || self.drop.is_some() {
+        if self.confirm.is_some() || self.cleanup.modal() || self.menu.is_some() || self.drop.is_some() {
             return;
         }
         if self.key_focus {
@@ -1910,7 +1951,7 @@ impl App {
         } else if let Some(f) = self.path_edit.as_mut() {
             f.insert(&s);
             self.path_suggest();
-        } else if self.pv.is_some() || self.pane().loc == Loc::Settings {
+        } else if self.pv.is_some() || matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) {
         } else if self.search_focus && self.pane().search.is_some() {
             if let Some(se) = self.pane_mut().search.as_mut() {
                 se.field.insert(&s);
@@ -1955,6 +1996,10 @@ impl App {
 
     /// Menu key / Shift+F10: the context menu of the focused item (or of the folder) at that row.
     pub fn keyboard_menu(&mut self) {
+        if self.pane().loc == Loc::Cleanup {
+            self.cleanup_keyboard_menu();
+            return;
+        }
         let (t, p) = (self.cur, self.tab().active);
         if self.pane().loc == Loc::Settings {
             return;
@@ -2034,6 +2079,8 @@ impl App {
         if self.menu.is_some() || self.drop.is_some() {
             if vk == ESC {
                 self.close_popups();
+            } else if self.cleanup_menu_key(vk, ctrl, shift, alt) {
+                return true;
             }
             // an open menu owns the keys: Delete, Space, letters ... never reach the list behind it
             return true;
@@ -2279,6 +2326,9 @@ impl App {
             }
         }
         // window keys
+        if self.pane().loc == Loc::Cleanup && self.cleanup_key(vk, ctrl, shift, alt) {
+            return true;
+        }
         match (vk, ctrl, shift, alt) {
             (ESC, ..) => {
                 if self.xfer_open {
@@ -2415,6 +2465,7 @@ impl App {
             if removable {
                 items.push(MItem::new("Eject", 0xE7E7, Act::Eject).sep());
             }
+            items.push(MItem::new("Clean up", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::Drive)).sep());
             items.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
             self.menu = Some(CtxMenu { x, y, items, paths, bg: true, seq, loading: false, shell: vec![], apps: vec![], at: Instant::now() });
             return;
@@ -2522,6 +2573,7 @@ impl App {
     fn drop_items(&self, kind: DropKind) -> Vec<MItem> {
         let mut v = vec![];
         match kind {
+            DropKind::CleanupScope | DropKind::CleanupAi | DropKind::CleanupHidden => return self.cleanup_drop_items(kind),
             DropKind::New => {
                 v.push(MItem::new("Folder", 0xE8F4, Act::NewFolder).keys("Ctrl+Shift+N"));
                 v.push(MItem::new("Text document", 0xE8A5, Act::NewText));
@@ -2688,6 +2740,10 @@ impl App {
             });
             return;
         }
+        if let Act::Cleanup(cmd) = it.act && cmd != crate::cleanup_page::Command::SideDrive {
+            self.cleanup_action(cmd, paths.first().cloned());
+            return;
+        }
         self.act(it.act);
     }
 
@@ -2716,6 +2772,7 @@ impl App {
             return;
         }
         match kind {
+            DropKind::CleanupScope | DropKind::CleanupAi | DropKind::CleanupHidden => self.cleanup_apply_drop(kind, it),
             DropKind::New => self.act(it.act),
             DropKind::View => {
                 if it.act == Act::None {
@@ -3388,6 +3445,7 @@ impl App {
             ("Show hidden files", 0xE7B3, Act::ToggleHidden, vec![], String::new()),
             ("Undo", 0xE7A7, Act::Undo, vec!["Ctrl", "Z"], String::new()),
             ("Settings", 0xE713, Act::Settings, vec!["Ctrl", ","], String::new()),
+            ("Cleanup", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::Open), vec![], String::new()),
             ("Pin to sidebar", 0xE718, Act::Pin, vec![], String::new()),
             ("Properties", 0xE946, Act::Properties, vec!["Alt", "Enter"], sel_name),
         ];

@@ -105,8 +105,25 @@ pub fn record(mut op: Op) -> Res<u64> {
 
 /// Reverse the newest operation. On a partial failure the parts that could not be undone stay in the journal.
 pub fn undo_last() -> Res<Op> {
+    undo_at(None)
+}
+
+/// Restore exactly the Cleanup batch, even if another operation has since been recorded.
+pub fn undo_cleanup(id: u64, batch: &[Recycled]) -> Res<Op> {
+    let records = batch.iter().map(|r| r.record.as_path()).collect();
+    undo_at(Some((id, records)))
+}
+
+fn undo_at(cleanup: Option<(u64, std::collections::HashSet<&Path>)>) -> Res<Op> {
     let mut ops = load();
-    let op = ops.pop().ok_or("nothing to undo")?;
+    let at = match cleanup {
+        Some((id, records)) => ops.iter().rposition(|o| {
+            o.id == id && o.kind == "cleanup" && !o.recycled.is_empty()
+                && o.recycled.iter().all(|r| records.contains(r.record.as_path()))
+        }),
+        None => ops.len().checked_sub(1),
+    }.ok_or("nothing to undo")?;
+    let op = ops.remove(at);
     let mut left = Op { id: op.id, time: op.time, kind: op.kind.clone(), ..Default::default() };
     let mut errors: Vec<String> = vec![];
 
@@ -143,7 +160,7 @@ pub fn undo_last() -> Res<Op> {
     for r in op.recycled.iter().rev() {
         // The recorded $R may be gone when the item was restored and recycled again later (e.g. `bin restore`
         // then undo); then the newest Recycle Bin record of the same original path is the one to bring back.
-        let cur = if r.data.exists() {
+        let cur = if r.data.exists() || op.kind == "cleanup" {
             r.clone()
         } else {
             crate::recycle::list_bin(&r.original).into_iter().find(|x| path_eq(&x.original, &r.original)).unwrap_or_else(|| r.clone())
@@ -154,7 +171,7 @@ pub fn undo_last() -> Res<Op> {
         }
     }
     if !left.is_empty() {
-        ops.push(left);
+        ops.insert(at, left);
     }
     save(&ops)?;
     if errors.is_empty() { Ok(op) } else { Err(format!("undo was only partly done: {}", errors.join("; "))) }

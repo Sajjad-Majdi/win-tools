@@ -57,6 +57,7 @@ pub const T_TRIM: usize = 11;
 
 /// Results of background work, applied on the UI thread.
 pub enum Msg {
+    Cleanup(u64, crate::cleanup_page::Update),
     Listed { tab: u64, pane: usize, seq: u64, res: Result<Vec<Item>, String>, ms: f64 },
     Sizes { dir: PathBuf, sizes: HashMap<String, u64>, done: bool },
     /// search results: Everything's matches and (ranked off the UI thread) the rows to show
@@ -89,6 +90,7 @@ pub enum Msg {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
+    Cleanup(crate::cleanup_page::Target),
     /// the search strip's "AI Search" button
     Ask,
     /// "Turn on AI Search" under empty results (AI features off)
@@ -150,6 +152,7 @@ pub enum Hit {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
+    Cleanup(crate::cleanup_page::Command),
     Open,
     OpenNewTab,
     OpenWith,
@@ -248,6 +251,9 @@ impl MItem {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropKind {
+    CleanupScope,
+    CleanupAi,
+    CleanupHidden,
     New,
     View,
     Sort,
@@ -385,6 +391,7 @@ pub struct SetState {
 }
 
 pub struct App {
+    pub cleanup: crate::cleanup_page::Page,
     pub hwnd: HWND,
     pub gfx: Gfx,
     pub t: Theme,
@@ -829,6 +836,11 @@ impl App {
 
     // ------------------------------------------------------------------ navigation
     pub fn new_tab(&mut self, loc: Loc) {
+        if loc == Loc::Cleanup && let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::Cleanup) {
+            self.cur = i;
+            self.invalidate();
+            return;
+        }
         self.next_id += 1;
         let view = self.tabs.get(self.cur).map(|t| t.view).unwrap_or(View::Details);
         let tab = Tab { id: self.next_id, panes: vec![Pane::new(loc.clone())], active: 0, view, split_at: Instant::now() };
@@ -840,6 +852,12 @@ impl App {
     }
 
     pub fn close_tab(&mut self, i: usize) {
+        if self.tabs.get(i).is_some_and(|t| t.pane().loc == Loc::Cleanup) {
+            if self.cleanup.moving() {
+                return;
+            }
+            self.close_cleanup();
+        }
         if self.tabs.len() <= 1 {
             unsafe {
                 let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -874,6 +892,15 @@ impl App {
     }
 
     pub fn go(&mut self, loc: Loc) {
+        if self.pane().loc == Loc::Cleanup || loc == Loc::Cleanup {
+            if loc == Loc::ThisPc && let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::ThisPc) {
+                self.cur = i;
+                self.invalidate();
+            } else if self.pane().loc != loc {
+                self.new_tab(loc);
+            }
+            return;
+        }
         self.tip = None;
         self.side_reveal = true;
         self.trim_caches();
@@ -900,6 +927,11 @@ impl App {
     }
 
     pub fn back(&mut self) {
+        if let Some(i) = self.cleanup_back_tab() {
+            self.cur = i;
+            self.invalidate();
+            return;
+        }
         let (t, p) = (self.cur, self.tabs[self.cur].active);
         let pane = &mut self.tabs[t].panes[p];
         if let Some(l) = pane.back.pop() {
@@ -936,6 +968,7 @@ impl App {
                 self.pane_mut().back_anim = true;
             }
             Loc::RecycleBin | Loc::Settings => self.go(Loc::ThisPc),
+            Loc::Cleanup => {}
             Loc::ThisPc => {}
         }
     }
@@ -1067,11 +1100,13 @@ impl App {
                 pane.loading = false;
                 self.refresh_settings();
             }
+            Loc::Cleanup => pane.loading = false,
         }
         self.invalidate();
     }
 
     pub fn refresh_settings(&mut self) {
+        self.refresh_cleanup_hidden();
         self.spawn(|| {
             let running = fmcore::evipc::available();
             let total = if running { fmcore::evipc::query("", 0, app_req(), 1, false, Duration::from_secs(2)).map(|r| r.total).unwrap_or(0) } else { 0 };
@@ -1335,6 +1370,7 @@ impl App {
 
     fn apply(&mut self, m: Msg) {
         match m {
+            Msg::Cleanup(id, update) => self.cleanup_updated(id, update),
             Msg::Listed { tab, pane, seq, res, ms } => {
                 let Some((t, p)) = self.find_pane(tab, pane) else { return };
                 if self.tabs[t].panes[p].seq != seq {
@@ -1443,6 +1479,7 @@ impl App {
             }
             Msg::Drives(d) => {
                 self.drives = d;
+                self.cleanup_drives_ready();
                 for t in 0..self.tabs.len() {
                     for p in 0..self.tabs[t].panes.len() {
                         if self.tabs[t].panes[p].loc == Loc::ThisPc {
@@ -1554,6 +1591,9 @@ impl App {
 
     pub fn refresh_ai_flags(&mut self) {
         self.ai_on = crate::ai::enabled();
+        if !self.ai_on {
+            self.stop_cleanup_review();
+        }
     }
 
     pub fn refresh_all(&mut self) {
@@ -1740,6 +1780,7 @@ impl App {
             "size": [self.w, self.h], "rail": self.rail(),
             "drives": self.drives.len(), "sidebar": self.side.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
             "ai_buttons": self.ai_on,
+            "cleanup": self.cleanup_status(),
             "first_paint_ms": self.first_paint_ms, "first_list_ms": self.first_list_ms,
             "last_error": self.last_error,
         })
@@ -2110,6 +2151,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // the Windows theme or accent may have changed: the whole palette follows it live (and a new
                 // wallpaper when the accent follows the desktop)
                 app.apply_theme();
+                app.cleanup_motion_changed();
                 app.refresh_desk();
                 LRESULT(0)
             }
@@ -2154,7 +2196,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_CLOSE => {
-                let _ = DestroyWindow(hwnd);
+                if !app.cleanup.moving() {
+                    let _ = DestroyWindow(hwnd);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -2176,6 +2220,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         Loc::Folder(p) => Some(p.display().to_string()),
                         Loc::ThisPc => Some("::thispc".to_string()),
                         Loc::RecycleBin => Some("::bin".to_string()),
+                        Loc::Cleanup => Some("::cleanup".to_string()),
                         _ => None,
                     })
                     .collect();
@@ -2315,6 +2360,7 @@ pub fn run(o: Opts) -> i32 {
             mx: -1.0,
             my: -1.0,
             drives: vec![],
+            cleanup: crate::cleanup_page::Page::default(),
             recent: vec![],
             side: vec![],
             menu_tab: None,
@@ -2424,7 +2470,7 @@ pub fn run(o: Opts) -> i32 {
         app.build_side();
         app.new_tab(loc);
         // start page "Last session": the other tabs of the last session come back too
-        if o.path.is_none() && app.look.start == "last" && app.look.tabs.len() > 1 {
+        if o.path.is_none() && app.look.start == "last" && (app.look.tabs.len() > 1 || app.look.tabs.first().is_some_and(|s| s == "::cleanup")) {
             let saved = app.look.tabs.clone();
             let cur = app.look.tab_cur.min(saved.len() - 1);
             let locs: Vec<Loc> = saved
@@ -2432,6 +2478,7 @@ pub fn run(o: Opts) -> i32 {
                 .map(|s| match s.as_str() {
                     "::thispc" => Some(Loc::ThisPc),
                     "::bin" => Some(Loc::RecycleBin),
+                    "::cleanup" => Some(Loc::Cleanup),
                     p => Some(PathBuf::from(p)).filter(|p| p.is_dir()).map(Loc::Folder),
                 })
                 .collect::<Option<Vec<_>>>()

@@ -229,7 +229,7 @@ impl App {
         Hit::None
     }
 
-    fn hov(&self, h: Hit) -> bool {
+    pub(crate) fn hov(&self, h: Hit) -> bool {
         self.hover == h && !self.shooting
     }
 
@@ -334,7 +334,7 @@ impl App {
 
     // ------------------------------------------------------------------ small parts
     /// Press-scale around the centre of `r` while `h` is pressed (springs back on release). Pair with `unpress`.
-    fn press_in(&self, r: Rect, h: Hit) -> bool {
+    pub(crate) fn press_in(&self, r: Rect, h: Hit) -> bool {
         let k = self.pk(h);
         if k > 0.001 {
             self.gfx.push_scale(r.cx(), r.cy(), 1.0 - (1.0 - crate::motion::PRESS_SCALE) * k, 0.0, 0.0);
@@ -344,31 +344,35 @@ impl App {
     }
 
     pub fn button(&mut self, r: Rect, label: &str, glyph: u32, style: Btn, h: Hit, t: &Theme) {
+        self.round_button(r, label, glyph, style, h, R_CTRL, t);
+    }
+
+    pub(crate) fn round_button(&mut self, r: Rect, label: &str, glyph: u32, style: Btn, h: Hit, radius: f32, t: &Theme) {
         let hk = if style == Btn::Disabled { 0.0 } else { self.hk(h) };
         let pk = if style == Btn::Disabled { 0.0 } else { self.pk(h) };
         let scaled = style != Btn::Disabled && self.press_in(r, h);
         match style {
             Btn::Std => {
-                self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), R_CTRL, t.field_border);
-                self.gfx.fill_round(r, R_CTRL, t.card.mix(t.layer2, pk));
-                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
-                self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk * (1.0 - pk)));
+                self.gfx.fill_round(Rect::new(r.x, r.y + 1.0, r.w, r.h), radius, t.field_border);
+                self.gfx.fill_round(r, radius, t.card.mix(t.layer2, pk));
+                self.gfx.stroke_round(r, radius, t.stroke, 1.0);
+                self.gfx.fill_round(r, radius, t.hover.a(t.hover.3 * hk * (1.0 - pk)));
             }
             Btn::Accent => {
-                self.gfx.fill_round(r, R_CTRL, t.accent.mix(t.accent2, hk).mix(t.accent, pk * 0.6).a(1.0 - 0.12 * pk));
+                self.gfx.fill_round(r, radius, t.accent.mix(t.accent2, hk).mix(t.accent, pk * 0.6).a(1.0 - 0.12 * pk));
                 self.gfx.fill(Rect::new(r.x + 4.0, r.b() - 1.0, r.w - 8.0, 1.0), C(0.0, 0.0, 0.0, 0.18));
             }
             Btn::Danger => {
                 let red = if t.dark { C::hex(0xD13438) } else { C::hex(0xC42B1C) };
-                self.gfx.fill_round(r, R_CTRL, red.mix(C::hex(0xFFFFFF), 0.10 * hk).a(1.0 - 0.12 * pk));
+                self.gfx.fill_round(r, radius, red.mix(C::hex(0xFFFFFF), 0.10 * hk).a(1.0 - 0.12 * pk));
             }
             Btn::Ghost => {
-                self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk));
-                self.gfx.fill_round(r, R_CTRL, t.press.a(t.press.3 * pk * 0.6));
+                self.gfx.fill_round(r, radius, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(r, radius, t.press.a(t.press.3 * pk * 0.6));
             }
             Btn::Disabled => {
-                self.gfx.fill_round(r, R_CTRL, t.layer2);
-                self.gfx.stroke_round(r, R_CTRL, t.stroke, 1.0);
+                self.gfx.fill_round(r, radius, t.layer2);
+                self.gfx.stroke_round(r, radius, t.stroke, 1.0);
             }
         }
         let fg = match style {
@@ -390,7 +394,7 @@ impl App {
         self.hit(r, h);
     }
 
-    fn icon_btn(&mut self, r: Rect, glyph: u32, size: f32, color: C, h: Hit, rad: f32, t: &Theme) {
+    pub(crate) fn icon_btn(&mut self, r: Rect, glyph: u32, size: f32, color: C, h: Hit, rad: f32, t: &Theme) {
         let (hk, pk) = (self.hk(h), self.pk(h));
         let scaled = self.press_in(r, h);
         self.gfx.fill_round(r, rad, t.hover.a(t.hover.3 * hk));
@@ -522,6 +526,7 @@ impl App {
             let ir = Rect::new(ix, cy - 8.0, 16.0, 16.0);
             match loc {
                 Loc::Settings => self.gfx.glyph(0xE713, ir, 15.0, t.text2),
+                Loc::Cleanup => self.gfx.glyph(crate::cleanup_page::BROOM, ir, 15.0, t.text2),
                 Loc::RecycleBin => self.gfx.glyph(0xE74D, ir, 15.0, t.text2),
                 Loc::ThisPc => self.gfx.glyph(0xE7F8, ir, 15.0, t.text2),
                 Loc::Folder(ref p) if p.parent().is_none() => ficons::draw(&self.gfx, t, Kind::Drive, ir),
@@ -636,7 +641,8 @@ impl App {
         self.gfx.fill(bar, t.bar.a(self.panel_alpha()));
         self.gfx.fill(Rect::new(0.0, TOP - 1.0, self.w, 1.0), t.divider);
         let pane = self.pane();
-        let (can_back, can_fwd, can_up) = (!pane.back.is_empty(), !pane.fwd.is_empty(), !matches!(pane.loc, Loc::ThisPc | Loc::Settings));
+        let cleanup = pane.loc == Loc::Cleanup;
+        let (can_back, can_fwd, can_up) = (!pane.back.is_empty() || self.cleanup_back_tab().is_some(), !pane.fwd.is_empty(), !matches!(pane.loc, Loc::ThisPc | Loc::Settings | Loc::Cleanup));
         let y = TITLE_H + 8.0;
         let tiny = self.w < 560.0;
         if self.side_hidden() {
@@ -656,13 +662,13 @@ impl App {
         if tiny {
             vx = nx;
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
+            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
         } else if narrow {
             let c = if self.pane().loc.path().is_some() { t.text } else { t.text_dis };
             self.icon_btn(Rect::new(nx, y, 34.0, 32.0), 0xE710, 14.0, c, Hit::New, R_CTRL, t);
             vx = nx + 34.0 + 4.0;
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
+            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
         } else {
             let nw = 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0;
             let r = Rect::new(nx, y, nw, 32.0);
@@ -673,7 +679,7 @@ impl App {
             let open = self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false);
             self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            let off = self.pane().loc == Loc::Settings;
+            let off = cleanup || self.pane().loc == Loc::Settings;
             self.gfx.glyph(g, Rect::new(vr.x + 12.0, vr.y, 14.0, 32.0), 14.0, if off { t.text_dis } else { t.text });
             self.gfx.glyph(0xE70D, Rect::new(vr.x + 32.0, vr.y, 9.0, 32.0), 9.0, if off { t.text_dis } else { t.text2 });
             self.hit(vr, Hit::ViewBtn);
@@ -712,7 +718,7 @@ impl App {
             self.icon_btn(cr, 0xE711, 10.0, t.text2, Hit::OmniClear, R_SMALL, t);
         } else {
             // Settings has nothing to search: no Search button there
-            let settings = self.pane().loc == Loc::Settings;
+            let settings = cleanup || self.pane().loc == Loc::Settings;
             // the full "Search" button stays until the address box is really short (only the icon then)
             let sw = if settings { 4.0 } else if o.w < 230.0 { 34.0 } else { 86.0 };
             let sr = Rect::new(o.r() - sw, o.y + 4.0, sw - 4.0, 26.0);
@@ -732,6 +738,7 @@ impl App {
             let ir = Rect::new(o.x + 9.0, o.cy() - 8.0, 16.0, 16.0);
             match loc {
                 Loc::Settings => self.gfx.glyph(0xE713, Rect::new(ir.x, o.y, 16.0, o.h), 15.0, t.text2),
+                Loc::Cleanup => self.gfx.glyph(crate::cleanup_page::BROOM, Rect::new(ir.x, o.y, 16.0, o.h), 15.0, t.text2),
                 Loc::RecycleBin => self.gfx.glyph(0xE74D, Rect::new(ir.x, o.y, 16.0, o.h), 15.0, t.text2),
                 Loc::ThisPc => self.gfx.glyph(0xE7F8, Rect::new(ir.x, o.y, 16.0, o.h), 15.0, t.text2),
                 _ => ficons::draw(&self.gfx, t, Kind::Folder, ir),
@@ -1041,6 +1048,8 @@ impl App {
         let cur = self.cur;
         if self.pane().loc == Loc::Settings {
             self.paint_settings(t);
+        } else if self.pane().loc == Loc::Cleanup {
+            self.paint_cleanup(content_rect(self), t);
         } else {
             let geoms = pane_geoms(self, cur);
             let split = self.tabs[cur].split();
@@ -1392,6 +1401,9 @@ impl App {
             // section titles of the This PC page
             let hy = list.y + l.head_d - scroll + dy;
             self.gfx.text("Drives", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
+            if hy >= list.y && hy + 30.0 <= list.b() {
+                self.button(Rect::new(list.r() - 118.0, hy, 98.0, 30.0), "Clean up", crate::cleanup_page::BROOM, Btn::Std, Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
+            }
             if l.n_d < n {
                 let hy = list.y + l.head_p - scroll + dy;
                 self.gfx.text("Pinned", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
@@ -1531,9 +1543,22 @@ impl App {
     fn paint_drive_tile(&mut self, r: Rect, it: &Item, t: &Theme) {
         let root = it.path.to_string_lossy().to_string();
         let d = self.drives.iter().find(|d| d.root.eq_ignore_ascii_case(&root)).cloned();
-        // drive image: a slab with a lighter top face and a status light
-        let ix = r.x + 12.0;
-        let iy = r.cy() - 14.0;
+        self.drive_slab(r.x + 12.0, r.cy() - 14.0, &root, d.as_ref().map_or("fixed", |d| d.kind), t);
+        let tx = r.x + 64.0;
+        let tw = r.w - 64.0 - 14.0;
+        self.gfx.text(&it.name, Rect::new(tx, r.y + 8.0, tw, 20.0), Font::Ui, self.look.text(), 400, Align::Left, t.text);
+        if let Some(d) = d.filter(|d| d.total > 0) {
+            let used = 1.0 - d.free as f32 / d.total as f32;
+            let bar = Rect::new(tx, r.y + 31.0, tw, 6.0);
+            self.gfx.fill_round(bar, 3.0, t.track);
+            self.gfx.fill_round(Rect::new(bar.x, bar.y, (bar.w * used).max(6.0), 6.0), 3.0, if used > 0.9 { t.danger } else { t.accent });
+            let s = format!("{} free of {}", fmt::size(d.free), fmt::size(d.total));
+            self.gfx.text(&s, Rect::new(tx, r.y + 41.0, tw, 18.0), Font::Ui, self.look.small_text(), 400, Align::Left, t.text2);
+        }
+    }
+
+    /// Drive image: a slab with a lighter top face and a status light.
+    pub(crate) fn drive_slab(&mut self, ix: f32, iy: f32, root: &str, kind: &str, t: &Theme) {
         let body = Rect::new(ix, iy + 10.0, 40.0, 16.0);
         self.gfx.fill_round(Rect::new(ix + 2.0, iy + 4.0, 36.0, 12.0), 3.0, t.page_stroke.mix(t.page, 0.55));
         self.gfx.fill_round(body, 3.5, t.page_stroke.mix(t.text2, 0.25));
@@ -1541,7 +1566,6 @@ impl App {
         self.gfx.ellipse(body.x + 7.0, body.cy(), 1.6, t.ok, true, 1.0);
         // each drive type has its own mark: Windows logo on the system drive, a plug on USB drives, a disc on
         // CD / DVD drives, the network glyph on mapped shares
-        let kind = d.as_ref().map(|d| d.kind).unwrap_or("fixed");
         let sys = std::env::var("SystemDrive").map(|s| root.to_lowercase().starts_with(&s.to_lowercase())).unwrap_or(false);
         if sys {
             let (lx, ly) = (body.r() - 12.0, iy - 1.0);
@@ -1562,17 +1586,6 @@ impl App {
                 self.gfx.ellipse(body.r() - 10.0, iy + 2.0, 1.8, t.page_stroke, true, 1.0);
             }
             _ => {}
-        }
-        let tx = r.x + 64.0;
-        let tw = r.w - 64.0 - 14.0;
-        self.gfx.text(&it.name, Rect::new(tx, r.y + 8.0, tw, 20.0), Font::Ui, self.look.text(), 400, Align::Left, t.text);
-        if let Some(d) = d.filter(|d| d.total > 0) {
-            let used = 1.0 - d.free as f32 / d.total as f32;
-            let bar = Rect::new(tx, r.y + 31.0, tw, 6.0);
-            self.gfx.fill_round(bar, 3.0, t.track);
-            self.gfx.fill_round(Rect::new(bar.x, bar.y, (bar.w * used).max(6.0), 6.0), 3.0, if used > 0.9 { t.danger } else { t.accent });
-            let s = format!("{} free of {}", fmt::size(d.free), fmt::size(d.total));
-            self.gfx.text(&s, Rect::new(tx, r.y + 41.0, tw, 18.0), Font::Ui, self.look.small_text(), 400, Align::Left, t.text2);
         }
     }
 
@@ -1597,7 +1610,7 @@ impl App {
         self.gfx.fill(Rect::new(r.x, y, r.w, 1.0), t.divider);
         let pane = self.pane();
         let mut x = r.x + 18.0;
-        if pane.loc != Loc::Settings {
+        if !matches!(pane.loc, Loc::Settings | Loc::Cleanup) {
             let n = pane.rows().len();
             let items = if pane.searching() { String::new() } else { format!("{} item{}", fmt::thousands(n as u64), if n == 1 { "" } else { "s" }) };
             let sel = pane.selected();
@@ -2084,7 +2097,7 @@ impl App {
         // AI Search: switch + what it does and exactly what is sent
         self.gfx.fill(Rect::new(r.x, ry, r.w, 1.0), t.divider);
         self.gfx.glyph(0xF4A5, Rect::new(r.x + 16.0, ry + 8.0, 18.0, 20.0), 16.0, t.text2);
-        self.gfx.text("AI Search", Rect::new(r.x + 46.0, ry + 8.0, r.w - 120.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
+        self.gfx.text("AI features", Rect::new(r.x + 46.0, ry + 8.0, r.w - 120.0, 20.0), Font::Ui, 13.0, 400, Align::Left, t.text);
         self.gfx.para(crate::ai::SENT_NOTE, Rect::new(r.x + 46.0, ry + 30.0, r.w - 46.0 - 72.0, note_h + 2.0), Font::Ui, 12.0, 400, Align::Left, t.text2, 16.0, false, 0);
         self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry + 4.0, 40.0, 28.0), ai_switch, Hit::Set(9), t);
         ry += ai_h;
@@ -2162,7 +2175,7 @@ impl App {
             (0xE7B3, "Show hidden files", "", self.ui.hidden, 6),
             (0xE74D, "Ask before delete", "Delete goes to the Recycle Bin and can be undone", self.ui.ask_delete, 7),
         ];
-        let r = Rect::new(rx, y, colw, 38.0 + 3.0 * 48.0 + 52.0 + 4.0);
+        let r = Rect::new(rx, y, colw, 38.0 + 4.0 * 48.0 + 52.0 + 4.0);
         self.set_card(r, t);
         self.gfx.text("Files and folders", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
         let mut ry = r.y + 38.0;
@@ -2172,6 +2185,7 @@ impl App {
             self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, h), *on, Hit::Set(*id), t);
             ry += h;
         }
+        self.paint_cleanup_hidden(Rect::new(r.x, ry, r.w, 48.0), t);
         // the longer column decides how far Settings scrolls
         self.settings_h = r.b().max(left_end - 12.0) + 16.0 + scroll - c.y;
         self.gfx.unclip();
@@ -2203,7 +2217,7 @@ impl App {
     fn paint_tip(&mut self, t: &Theme) {
         let Some((_, text, x, y)) = self.tip.clone() else { return };
         // never over a menu, dialog, palette or preview
-        if self.menu.is_some() || self.drop.is_some() || self.sub.is_some() || self.palette.is_some() || self.confirm.is_some() || self.pv.is_some() || self.rename.is_some() {
+        if self.menu.is_some() || self.drop.is_some() || self.sub.is_some() || self.palette.is_some() || self.confirm.is_some() || self.cleanup.modal() || self.pv.is_some() || self.rename.is_some() {
             self.tip = None;
             return;
         }
@@ -2251,6 +2265,9 @@ impl App {
         }
         if self.confirm.is_some() {
             self.paint_confirm(t);
+        }
+        if self.cleanup.modal() {
+            self.paint_cleanup_confirm(t);
         }
         if self.drag_in.is_some() {
             self.paint_ghost(t);

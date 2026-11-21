@@ -11,6 +11,7 @@ pub enum Loc {
     ThisPc,
     RecycleBin,
     Settings,
+    Cleanup,
 }
 
 impl Loc {
@@ -20,6 +21,7 @@ impl Loc {
             Loc::ThisPc => "This PC".into(),
             Loc::RecycleBin => "Recycle Bin".into(),
             Loc::Settings => "Settings".into(),
+            Loc::Cleanup => "Cleanup".into(),
         }
     }
     pub fn path(&self) -> Option<&Path> {

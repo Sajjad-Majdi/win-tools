@@ -6,9 +6,10 @@
 //! activated; `wfm gui shot-real` then captures it as Windows composes it (caption buttons, backdrop).
 //! A second start sends its folder to the open window as a new tab (unless --new-window).
 //! A crash writes %TEMP%\wfiles-crash.log (there is no console to print to).
-mod ai;
+use fmcore::{ai, models};
 mod app;
 mod ask;
+mod cleanup_page;
 mod dnd;
 mod ficons;
 mod fmt;
@@ -20,7 +21,6 @@ mod look;
 mod model;
 mod motion;
 mod outproc;
-mod models;
 mod paint;
 mod preview;
 mod rank;

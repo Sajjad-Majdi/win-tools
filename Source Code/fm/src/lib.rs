@@ -9,6 +9,7 @@
 //! | List a folder, sort it | [`list::list_dir`], [`list::sort_entries`], [`list::SortKey`] |
 //! | Details, version info, shortcut target, folder size | [`info::info`], [`info::folder_size`] |
 //! | Instant search (Everything) | [`search::search`], [`search::Query`] |
+//! | Cleanup candidates, optional AI review, and recycling | [`cleanup`] |
 //! | Copy / move with progress, cancel, pause, conflicts | [`ops::copy`], [`ops::move_items`], [`ops::Control`], [`ops::Conflict`] |
 //! | Rename, batch rename with preview, new folder / file, delete | [`ops::rename`], [`ops::batch_plan`] + [`ops::batch_apply`], [`ops::mkdir`], [`ops::new_file`], [`ops::delete`] |
 //! | Undo (Ctrl+Z) | [`journal::undo_last`], [`journal::load`] |
@@ -33,6 +34,8 @@
 //!
 //! Settings and the undo journal live in `%LOCALAPPDATA%\WinTools\` (`fm.json`, `fm-journal.json`); set the
 //! `WFM_DATA_DIR` environment variable to use another folder (the tests do).
+pub mod ai;
+pub mod cleanup;
 pub mod defaultfm;
 pub mod dialog;
 pub mod dnd;
@@ -41,6 +44,7 @@ pub mod info;
 pub mod journal;
 pub mod list;
 pub mod menu;
+pub mod models;
 pub mod namespace;
 pub mod ops;
 pub mod pins;
