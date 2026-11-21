@@ -7,7 +7,7 @@ use crate::gfx::Rect;
 use crate::model::Loc;
 use crate::motion::Follow;
 use fmcore::cleanup::{self, BinInfo, Classification, Group, GroupId, Item, MoveReport, Skip, Verdict};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::Instant;
@@ -16,8 +16,8 @@ pub const BROOM: u32 = 0xEA99;
 const GROUPS: [(&str, &str, u32); 6] = [
     ("Temporary files", "In temp folders, unchanged for 7 days or more", 0xE823),
     ("App caches and crash dumps", "Caches the apps rebuild, and old crash reports", 0xE8F1),
-    ("Build caches in old projects", "Build output in projects unchanged for 90 days", 0xE943),
-    ("Empty folders", "Nothing inside", 0xE8B7),
+    ("Developer caches", cleanup::DEVELOPER_CACHE_REASON, 0xE943),
+    ("Duplicate files", "Extra copies of files 10 MB or larger", 0xE8C8),
     ("Old installers in Downloads", "Setup files unchanged for more than 30 days", 0xE7B8),
     ("Large old files", "Over 500 MB, unchanged for 180 days", 0xE7C3),
 ];
@@ -73,6 +73,7 @@ struct TileData {
     rows: Vec<RowData>,
     total: Total,
     selected: Total,
+    drives: BTreeMap<char, Total>,
     verdicts: [usize; 3],
     parts: u8,
     at: Option<Instant>,
@@ -85,12 +86,15 @@ impl TileData {
         let previous = self.selected;
         self.total = Total::default();
         self.selected = Total::default();
+        self.drives.clear();
         self.verdicts = [0; 3];
         for r in &self.rows {
             let total = Total { bytes: r.item.size, count: 1 };
             self.total.add(total);
+            let drive = drive_letter(&r.item.path).map(|d| self.drives.entry(d).or_default());
             if r.on {
                 self.selected.add(total);
+                if let Some(drive) = drive { drive.add(total); }
             }
             if let Some(a) = &r.advice {
                 self.verdicts[verdict_rank(a.verdict) as usize] += 1;
@@ -112,12 +116,19 @@ fn group_index(id: GroupId) -> Option<usize> {
     use GroupId::*;
     Some(match id {
         Temp => 0, AppCaches | CrashDumps => 1, BuildCaches => 2,
-        EmptyFolders => 3, Installers => 4, LargeFiles => 5, RecycleBin => return None,
+        DuplicateFiles => 3, Installers => 4, LargeFiles => 5, RecycleBin => return None,
     })
 }
 
-fn picked_by_default(group: usize) -> bool {
-    group < 4
+fn drive_letter(path: &Path) -> Option<char> {
+    use std::path::{Component, Prefix};
+    match path.components().next()? {
+        Component::Prefix(p) => match p.kind() {
+            Prefix::Disk(letter) => Some(char::from(letter.to_ascii_uppercase())),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 type CacheKey = (PathBuf, u64, u64);
@@ -130,6 +141,7 @@ struct ConfirmData {
     items: Vec<Item>,
     limits: Option<Vec<(PathBuf, Skip)>>,
     by_group: [Total; 6],
+    by_drive: BTreeMap<char, Total>,
     flagged: [Vec<String>; 2],
     on_cancel: bool,
     at: Instant,
@@ -160,6 +172,9 @@ pub struct Page {
     scan_worker: Option<mpsc::Sender<ScanTask>>,
     waiting_for_drives: bool,
     scope: Option<Vec<String>>,
+    scope_draft: Option<Vec<String>>,
+    pub scope_focus: Option<usize>,
+    review_after_scan: bool,
     return_tab: Option<u64>,
     tiles: [TileData; 6],
     bin: BinInfo,
@@ -178,10 +193,10 @@ pub struct Page {
     scroll: Follow,
     panel_scroll: Follow,
     scroll_max: f32,
+    list_height: f32,
     panel_max: f32,
     columns: usize,
     review_done: usize,
-    has_notes: bool,
     show_notes: bool,
     cache: HashMap<CacheKey, Classification>,
     dialog: Option<Dialog>,
@@ -217,6 +232,16 @@ impl Page {
         total
     }
 
+    fn by_drive(&self) -> BTreeMap<char, Total> {
+        let mut drives = BTreeMap::<char, Total>::new();
+        for tile in &self.tiles {
+            for (&drive, &total) in &tile.drives {
+                drives.entry(drive).or_default().add(total);
+            }
+        }
+        drives
+    }
+
     fn update_totals(&mut self) {
         let found = self.totals(false);
         let selected = self.totals(true);
@@ -231,7 +256,9 @@ impl Page {
     fn receive_group(&mut self, group: Group) {
         let Some(i) = group_index(group.id) else { return };
         let tile = &mut self.tiles[i];
-        tile.rows.extend(group.items.into_iter().map(|item| RowData { item, on: picked_by_default(i), advice: None, advice_at: None }));
+        tile.rows.extend(group.items.into_iter().map(|item| RowData {
+            on: i < 3 && !item.is_package_download(), item, advice: None, advice_at: None,
+        }));
         tile.parts += 1;
         if i != 1 || tile.parts == 2 {
             tile.at = Some(Instant::now());
@@ -240,6 +267,10 @@ impl Page {
         tile.recalc();
         self.update_totals();
         self.progress.to(self.tiles.iter().filter(|g| g.at.is_some()).count() as f32 / 6.0);
+    }
+
+    fn has_notes(&self) -> bool {
+        self.tiles.iter().any(|tile| tile.verdicts != [0; 3])
     }
 
     fn visible(&self) -> Vec<usize> {
@@ -269,7 +300,6 @@ impl Page {
 
     fn rate(&mut self, rows: Vec<(usize, usize, Classification)>) {
         self.review_done += rows.len();
-        self.has_notes |= !rows.is_empty();
         self.offsets.clear();
         let mut updated = [false; 6];
         for (g, i, advice) in rows {
@@ -308,7 +338,9 @@ impl Page {
     }
 
     fn selected_snapshot(&self) -> ConfirmData {
-        let mut snapshot = ConfirmData { items: vec![], limits: None, by_group: [Total::default(); 6], flagged: Default::default(), on_cancel: false, at: Instant::now() };
+        let mut by_drive = self.by_drive();
+        by_drive.retain(|_, total| total.count > 0);
+        let mut snapshot = ConfirmData { items: vec![], limits: None, by_group: [Total::default(); 6], by_drive, flagged: Default::default(), on_cancel: false, at: Instant::now() };
         for (i, tile) in self.tiles.iter().enumerate() {
             snapshot.by_group[i] = tile.selected;
             for row in tile.rows.iter().filter(|r| r.on) {
@@ -344,7 +376,6 @@ fn item_name(item: &Item) -> std::borrow::Cow<'_, str> {
 
 pub enum Update {
     Group(Group),
-    Bin(BinInfo),
     Scanned(Result<(BinInfo, bool), String>),
     Rated(Vec<(usize, usize, Classification)>),
     Reviewed(Result<(), String>),
@@ -369,7 +400,6 @@ fn scan_worker() -> mpsc::Sender<ScanTask> {
                 continue;
             }
             let bin = cleanup::bin_info(&scope);
-            report(Update::Bin(bin));
             let result = cleanup::scan_in(Some(&scope), &cancel, &|_| {}, &mut |g| report(Update::Group(g.clone())))
                 .map(|groups| (bin, groups.iter().any(|g| g.limited)));
             if !cancel.load(Ordering::Relaxed) {
@@ -412,7 +442,7 @@ impl App {
             if self.drives.is_empty() {
                 self.toast_err("No drives are available to scan");
             } else {
-                self.start_cleanup_scan();
+                self.start_cleanup_scan(false);
             }
         }
     }
@@ -457,9 +487,9 @@ impl App {
         }
         if let Some(drive) = drive {
             self.cleanup.scope = fmcore::recycle::drive_root(drive).map(|r| vec![r]);
-            self.start_cleanup_scan();
+            self.start_cleanup_scan(false);
         } else if was_open.is_none() || self.cleanup.phase == Phase::Idle {
-            self.start_cleanup_scan();
+            self.start_cleanup_scan(false);
         }
     }
 
@@ -469,7 +499,7 @@ impl App {
         self.tabs.iter().position(|t| t.id == id)
     }
 
-    fn start_cleanup_scan(&mut self) {
+    fn start_cleanup_scan(&mut self, review: bool) {
         if self.cleanup.moving() {
             return;
         }
@@ -483,6 +513,7 @@ impl App {
             return;
         }
         self.cleanup.scope = Some(scope.clone());
+        self.cleanup.review_after_scan = review;
         let id = self.cleanup.next();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cleanup.cancel = Some(cancel.clone());
@@ -500,7 +531,6 @@ impl App {
         self.cleanup.selected_count.set(0.0);
         self.cleanup.pill_at = None;
         self.cleanup.scroll.set(0.0);
-        self.cleanup.has_notes = false;
         self.cleanup.show_notes = false;
         self.cleanup_panel(None);
         let report = Box::new(self.cleanup_post(id));
@@ -519,6 +549,8 @@ impl App {
         self.cleanup.waiting_for_drives = false;
         self.cleanup.dialog = None;
         self.cleanup.scope = None;
+        self.cleanup.scope_draft = None;
+        self.cleanup.scope_focus = None;
         self.cleanup.return_tab = None;
         self.cleanup.tiles = Default::default();
         self.cleanup.done = None;
@@ -560,6 +592,15 @@ impl App {
         self.cleanup.sort_panel();
     }
 
+    fn cleanup_review_click(&mut self) {
+        if self.ai_on && self.cleanup.phase == Phase::Results && self.cleanup.has_notes() {
+            self.cleanup.cache.clear();
+            self.start_cleanup_scan(true);
+        } else {
+            self.start_cleanup_review();
+        }
+    }
+
     fn start_cleanup_review(&mut self) {
         if !self.ai_on || !matches!(self.cleanup.phase, Phase::Results | Phase::Done) {
             return;
@@ -588,7 +629,6 @@ impl App {
             }
             tile.recalc();
         }
-        self.cleanup.has_notes = false;
         self.cleanup.sort_panel();
         let post = self.cleanup_post(id);
         std::thread::spawn(move || {
@@ -687,7 +727,6 @@ impl App {
         }
         match m {
             Update::Group(g) => self.cleanup.receive_group(g),
-            Update::Bin(bin) => self.cleanup.bin = bin,
             Update::Scanned(res) => match res {
                 Ok((bin, limited)) => {
                     self.cleanup.bin = bin;
@@ -697,6 +736,9 @@ impl App {
                     self.cleanup.progress_at = Some(Instant::now());
                     self.cleanup.pill_at = Some(Instant::now());
                     self.cleanup.focus = self.cleanup.visible().first().copied().unwrap_or(0);
+                    if std::mem::take(&mut self.cleanup.review_after_scan) {
+                        self.start_cleanup_review();
+                    }
                 }
                 Err(e) => {
                     self.cleanup.phase = Phase::Idle;
@@ -725,7 +767,7 @@ impl App {
                     self.cleanup.phase = Phase::Results;
                     self.toast("Cleanup undone", "", false);
                     self.refresh_all();
-                    self.start_cleanup_scan();
+                    self.start_cleanup_scan(false);
                 }
                 Err(e) => {
                     self.cleanup.phase = Phase::Done;
@@ -801,11 +843,14 @@ impl App {
         match target {
             Entry => self.open_cleanup(None),
             Drive(i) if self.cleanup.phase == Phase::Idle => self.cleanup_pick_drive(i),
-            Scan | Rescan => self.start_cleanup_scan(),
+            Scan | Rescan => self.start_cleanup_scan(false),
             Stop => self.cleanup_stop(),
-            Scope => self.open_drop(DropKind::CleanupScope, r, 240.0),
-            Ai if self.cleanup.has_notes => self.open_drop(DropKind::CleanupAi, r, 220.0),
-            Ai => self.start_cleanup_review(),
+            Scope => {
+                self.cleanup.scope_draft = Some(self.cleanup.scope(&self.drives));
+                self.cleanup.scope_focus = None;
+                self.open_drop(DropKind::CleanupScope, r, 240.0);
+            }
+            Ai => self.cleanup_review_click(),
             Tile(g) if double => self.cleanup_panel(Some(g)),
             Tile(g) if self.cleanup.can_select() => {
                 self.cleanup.focus = g;
@@ -931,24 +976,19 @@ impl App {
     pub fn cleanup_drop_items(&self, kind: DropKind) -> Vec<MItem> {
         match kind {
             DropKind::CleanupScope => {
-                let scope = self.cleanup.scope(&self.drives);
+                let scope = self.cleanup.scope_draft.as_deref().unwrap_or_default();
                 let mut all = MItem::new("All drives", 0, Act::None);
-                all.value = -1;
                 all.checked = self.drives.iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
                 let mut items = vec![all];
                 for (i, d) in self.drives.iter().enumerate() {
                     let mut item = MItem::new(&drive_name(d), 0xEDA2, Act::None);
-                    item.value = i as i64;
                     item.checked = scope.contains(&d.root);
+                    item.value = (i + 1) as i64;
                     item.sep = i == 0;
                     items.push(item);
                 }
                 items
             }
-            DropKind::CleanupAi => vec![
-                MItem::new(if self.cleanup.show_notes { "Hide AI notes" } else { "Show AI notes" }, 0xF4A5, Act::None),
-                MItem { value: 1, ..MItem::new("Review again", 0xE72C, Act::None).keys("Shift+Enter") },
-            ],
             DropKind::CleanupHidden => self.cleanup.hidden.iter().enumerate().map(|(i, p)| MItem {
                 value: i as i64,
                 ..MItem::new(&p.to_string_lossy(), 0xE7A7, Act::Cleanup(Command::Unhide)).keys("Show again")
@@ -957,31 +997,62 @@ impl App {
         }
     }
 
-    pub fn cleanup_apply_drop(&mut self, kind: DropKind, item: &MItem) {
-        match kind {
-            DropKind::CleanupScope => {
-                if item.value == -1 {
-                    self.cleanup.scope = None;
+    pub fn cleanup_toggle_scope(&mut self, row: usize) {
+        let Some(scope) = &mut self.cleanup.scope_draft else { return };
+        if row == 0 {
+            let all: Vec<_> = self.drives.iter().filter(|d| d.kind == "fixed").map(|d| d.root.clone()).collect();
+            if !all.is_empty() {
+                if all.len() == scope.len() && all.iter().all(|d| scope.contains(d)) {
+                    scope.truncate(1);
                 } else {
-                    let before = self.cleanup.scope(&self.drives);
-                    self.cleanup_pick_drive(item.value as usize);
-                    if self.cleanup.scope(&self.drives).is_empty() {
-                        self.cleanup.scope = Some(before);
-                        return;
-                    }
+                    *scope = all;
                 }
-                self.start_cleanup_scan();
             }
-            DropKind::CleanupAi if item.value == 1 => self.start_cleanup_review(),
-            DropKind::CleanupAi => {
-                self.cleanup.show_notes = !self.cleanup.show_notes;
-                self.cleanup.sort_panel();
+        } else if let Some(d) = self.drives.get(row - 1) {
+            if let Some(i) = scope.iter().position(|r| r == &d.root) {
+                if scope.len() > 1 {
+                    scope.remove(i);
+                }
+            } else {
+                scope.push(d.root.clone());
             }
-            DropKind::CleanupHidden => {
-                self.cleanup_action(Command::Unhide, self.cleanup.hidden.get(item.value as usize).cloned());
+        }
+        let items = self.cleanup_drop_items(DropKind::CleanupScope);
+        if let Some(drop) = &mut self.drop {
+            drop.items = items;
+        }
+        self.invalidate();
+    }
+
+    pub fn cleanup_finish_scope(&mut self) -> bool {
+        self.cleanup.scope_focus = None;
+        let Some(scope) = self.cleanup.scope_draft.take() else { return false };
+        let before = self.cleanup.scope(&self.drives);
+        if scope.len() != before.len() || !scope.iter().all(|d| before.contains(d)) {
+            self.cleanup.scope = Some(scope);
+            self.start_cleanup_scan(false);
+            return true;
+        }
+        false
+    }
+
+    pub fn cleanup_scope_key(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool) {
+        if ctrl || shift || alt { return; }
+        let Some(drop) = &self.drop else { return };
+        let n = drop.items.len();
+        match vk {
+            0x26 => self.cleanup.scope_focus = Some(self.cleanup.scope_focus.map_or(n - 1, |i| (i + n - 1) % n)),
+            0x28 => self.cleanup.scope_focus = Some(self.cleanup.scope_focus.map_or(0, |i| (i + 1) % n)),
+            0x0D | 0x20 => {
+                let i = *self.cleanup.scope_focus.get_or_insert(0);
+                self.cleanup_toggle_scope(i);
             }
             _ => {}
         }
+    }
+
+    pub fn cleanup_apply_drop(&mut self, item: &MItem) {
+        self.cleanup_action(Command::Unhide, self.cleanup.hidden.get(item.value as usize).cloned());
     }
 
     pub fn cleanup_tip(&self, h: Target) -> Option<String> {
@@ -998,6 +1069,11 @@ impl App {
             Move if self.cleanup.phase == Phase::Review => "Stop AI Review first".into(),
             Segment(g) | Tile(g) => format!("{} · {}", GROUPS[g].0, crate::fmt::size(self.cleanup.tiles[g].total.bytes)),
             Items(_) => "Show the items in this group".into(),
+            Row(i) => {
+                let group = self.cleanup.panel?;
+                let kept = self.cleanup.tiles[group].rows.get(i)?.item.copy_of.as_ref()?;
+                format!("Copy of {}", kept.display())
+            }
             PanelClose => "Close Items (Esc)".into(),
             Scan => "Scan the selected drives".into(),
             Hidden => "Show hidden items and add them back to Cleanup".into(),
@@ -1042,10 +1118,10 @@ impl App {
                 self.cleanup.keyboard = true;
                 self.cleanup_panel(None);
             }
-            (0x74, false, false, false) => self.start_cleanup_scan(),
+            (0x74, false, false, false) => self.start_cleanup_scan(false),
             (0x79, false, true, _) | (0x5D, false, false, false) => self.cleanup_keyboard_menu(),
-            (ENTER, false, true, false) => self.start_cleanup_review(),
-            (ENTER, false, false, false) if self.cleanup.phase == Phase::Idle => self.start_cleanup_scan(),
+            (ENTER, false, true, false) => self.cleanup_review_click(),
+            (ENTER, false, false, false) if self.cleanup.phase == Phase::Idle => self.start_cleanup_scan(false),
             (0x5A, true, false, false) => self.cleanup_undo(),
             (0x2E, false, false, false) => self.cleanup_confirm(),
             _ if !self.cleanup.can_select() => {}
@@ -1138,26 +1214,40 @@ mod tests {
 
     fn candidate(id: GroupId, rows: &[(u64, &str)]) -> Group {
         Group { id, title: "", reason: "", limited: false, total_size: rows.iter().map(|r| r.0).sum(),
-            items: rows.iter().map(|(size, path)| Item { path: (*path).into(), size: *size, modified: 0, reason: "" }).collect() }
+            items: rows.iter().map(|(size, path)| Item { path: (*path).into(), size: *size, modified: 0, reason: "", copy_of: None }).collect() }
     }
 
     #[test]
-    fn defaults_and_selection_totals_include_zero_byte_folders() {
+    fn duplicates_start_unselected() {
         let mut page = Page::default();
         for (g, size) in [(GroupId::Temp, 10), (GroupId::AppCaches, 20), (GroupId::CrashDumps, 3),
-            (GroupId::BuildCaches, 40), (GroupId::EmptyFolders, 0), (GroupId::Installers, 100), (GroupId::LargeFiles, 300)]
+            (GroupId::BuildCaches, 40), (GroupId::DuplicateFiles, 50), (GroupId::Installers, 100), (GroupId::LargeFiles, 300)]
         {
             page.receive_group(candidate(g, &[(size, g.as_str())]));
         }
-        assert_eq!(page.totals(false), Total { bytes: 473, count: 7 });
-        assert_eq!(page.totals(true), Total { bytes: 73, count: 5 });
+        assert_eq!(page.totals(false), Total { bytes: 523, count: 7 });
+        assert_eq!(page.totals(true), Total { bytes: 73, count: 4 });
         assert_eq!(page.tiles[1].total.count, 2);
         page.panel = Some(1);
         page.toggle_row(0);
-        assert_eq!(page.totals(true), Total { bytes: 53, count: 4 });
+        assert_eq!(page.totals(true), Total { bytes: 53, count: 3 });
         page.toggle_group(4);
-        assert_eq!(page.selected_snapshot().items.len(), 5);
-        assert_eq!(page.totals(true), Total { bytes: 153, count: 5 });
+        assert_eq!(page.selected_snapshot().items.len(), 4);
+        assert_eq!(page.totals(true), Total { bytes: 153, count: 4 });
+        page.toggle_group(3);
+        assert_eq!(page.totals(true), Total { bytes: 203, count: 5 });
+    }
+
+    #[test]
+    fn developer_cache_defaults_select_only_build_output() {
+        let mut page = Page::default();
+        let mut group = candidate(GroupId::BuildCaches, &[(8, r"C:\project\target"), (9, r"D:\uv\package.whl")]);
+        group.items[1].reason = "Downloaded package; fetched again when needed";
+        page.receive_group(group);
+        assert!(page.tiles[2].rows[0].on);
+        assert!(!page.tiles[2].rows[1].on);
+        assert_eq!(page.tiles[2].selected, Total { bytes: 8, count: 1 });
+        assert_eq!(page.by_drive().get(&'D'), Some(&Total::default()));
     }
 
     #[test]
@@ -1175,7 +1265,8 @@ mod tests {
     #[test]
     fn review_ticks_safe_rows_and_manual_ticks_carry_warnings() {
         let mut page = Page::default();
-        page.receive_group(candidate(GroupId::LargeFiles, &[(8, "large.zip"), (9, "backup.zip"), (6, "old video.mp4")]));
+        page.receive_group(candidate(GroupId::LargeFiles, &[(8, r"C:\large.zip"), (9, r"D:\backup.zip"), (6, r"D:\old video.mp4")]));
+        assert_eq!(page.by_drive(), BTreeMap::from([('C', Total::default()), ('D', Total::default())]));
         let advice = |verdict| Classification { verdict, reason: "Test reason".into() };
         page.rate(vec![(5, 0, advice(Verdict::Safe)), (5, 1, advice(Verdict::Keep)), (5, 2, advice(Verdict::CheckFirst))]);
         assert_eq!(page.totals(true), Total { bytes: 8, count: 1 });
@@ -1189,6 +1280,9 @@ mod tests {
         assert_eq!(picked.flagged[0], ["old video.mp4"]);
         assert!(picked.flagged[1].is_empty());
         assert_eq!(picked.by_group[5], Total { bytes: 14, count: 2 });
+        assert_eq!(picked.by_drive, BTreeMap::from([
+            ('C', Total { bytes: 8, count: 1 }), ('D', Total { bytes: 6, count: 1 }),
+        ]));
     }
 
     #[test]

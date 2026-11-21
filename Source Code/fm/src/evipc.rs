@@ -23,6 +23,7 @@ pub const REQ_ACCESSED: u32 = 0x80;
 pub const REQ_ATTRS: u32 = 0x100;
 
 pub const SORT_NAME: u32 = 1;
+pub const SORT_SIZE_ASC: u32 = 5;
 pub const SORT_SIZE_DESC: u32 = 6;
 pub const SORT_DATE_MODIFIED_DESC: u32 = 14;
 

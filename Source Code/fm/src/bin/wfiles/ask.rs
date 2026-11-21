@@ -23,8 +23,7 @@ impl App {
         if words.is_empty() {
             return;
         }
-        s.seq += 1;
-        let seq = s.seq;
+        let seq = s.next_request();
         s.busy = true;
         s.note = "Asking AI\u{2026}".into();
         // the scope, rules and filters of this search, without its words

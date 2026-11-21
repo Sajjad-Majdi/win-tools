@@ -38,7 +38,7 @@ fn cleanup_move_reports_in_use_and_undo_restores_its_own_batch() {
     write(&locked, b"locked");
     let entry = |path: &Path| {
         let md = path.metadata().unwrap();
-        cleanup::Item { path: path.to_path_buf(), size: md.len(), modified: md.last_write_time(), reason: "Fixture" }
+        cleanup::Item { path: path.to_path_buf(), size: md.len(), modified: md.last_write_time(), reason: "Fixture", copy_of: None }
     };
     // Each integration-test binary has its own journal.
     unsafe { std::env::set_var("WFM_DATA_DIR", dir.join("data")) };

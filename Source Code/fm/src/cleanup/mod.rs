@@ -1,5 +1,7 @@
 //! Cleanup candidates from Everything. Run these synchronous calls on a worker thread.
 mod classify;
+mod duplicates;
+mod packages;
 mod protect;
 
 pub use classify::{Classification, REVIEW_BATCH, Verdict, classify, review};
@@ -20,6 +22,8 @@ pub const INSTALLER_AGE_DAYS: u64 = 30;
 pub const LARGE_FILE_AGE_DAYS: u64 = 180;
 pub const LARGE_FILE_MIN_BYTES: u64 = 500 * 1024 * 1024;
 pub const PROJECT_IDLE_DAYS: u64 = 90;
+pub const DEVELOPER_CACHE_REASON: &str = "Old build output, and package downloads that tools fetch again";
+const PACKAGE_DOWNLOAD_REASON: &str = "Downloaded package; fetched again when needed";
 const TEMP_IDLE_DAYS: u64 = 7;
 
 const DAY: u64 = 24 * 60 * 60 * 10_000_000;
@@ -41,7 +45,7 @@ pub enum GroupId {
     Installers,
     LargeFiles,
     BuildCaches,
-    EmptyFolders,
+    DuplicateFiles,
     RecycleBin,
 }
 
@@ -54,7 +58,7 @@ impl GroupId {
             Self::Installers => "installers",
             Self::LargeFiles => "large-files",
             Self::BuildCaches => "build-caches",
-            Self::EmptyFolders => "empty-folders",
+            Self::DuplicateFiles => "duplicate-files",
             Self::RecycleBin => "recycle-bin",
         }
     }
@@ -71,6 +75,13 @@ pub struct Item {
     /// Last modified, as a Windows FILETIME.
     pub modified: u64,
     pub reason: &'static str,
+    pub copy_of: Option<PathBuf>,
+}
+
+impl Item {
+    pub fn is_package_download(&self) -> bool {
+        self.reason == PACKAGE_DOWNLOAD_REASON
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,11 +106,13 @@ struct Scan {
     rules: Rules,
     temps: Vec<String>,
     app_data: Vec<String>,
+    packages: Vec<String>,
     downloads: Option<String>,
     now: u64,
     parents: HashMap<PathBuf, bool>,
     seen: HashSet<String>,
     trees: HashSet<String>,
+    duplicate_parents: HashSet<String>,
     projects: HashMap<PathBuf, bool>,
     ignore: HashSet<String>,
 }
@@ -115,10 +128,13 @@ impl Scan {
             temps.push(dir);
         }
         let folder = |id| known(id).and_then(|p| key(&p));
+        let local = folder(&FOLDERID_LocalAppData);
+        let roaming = folder(&FOLDERID_RoamingAppData);
+        let packages = packages::roots(&rules.profile, local.as_deref(), roaming.as_deref());
         Ok(Self {
-            rules, temps, app_data: [FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_RoamingAppData].iter().filter_map(folder).collect(),
+            rules, temps, app_data: local.into_iter().chain(folder(&FOLDERID_LocalAppDataLow)).chain(roaming).collect(), packages,
             downloads: folder(&FOLDERID_Downloads), now: now_ft(), parents: HashMap::new(),
-            seen: HashSet::new(), trees: HashSet::new(), projects: HashMap::new(), ignore: HashSet::new(),
+            seen: HashSet::new(), trees: HashSet::new(), duplicate_parents: HashSet::new(), projects: HashMap::new(), ignore: HashSet::new(),
         })
     }
 
@@ -135,9 +151,18 @@ impl Scan {
                 let names = BUILD_NAMES.iter().map(|name| format!("wfn:{name}")).collect::<Vec<_>>().join("|");
                 format!("folder: <{names}> {} !{}", date_query(self.now, PROJECT_IDLE_DAYS), in_named_dirs(BUILD_NAMES))
             }
-            EmptyFolders => "folder: empty:".into(),
+            DuplicateFiles => format!("file: size:>={} sizedupe:", duplicates::MIN_BYTES),
             RecycleBin => return None,
         };
+        let term = if self.packages.is_empty() {
+            term
+        } else {
+            format!("{term} !{}", within(&self.packages))
+        };
+        self.scoped_query(term)
+    }
+
+    fn scoped_query(&self, term: String) -> Option<String> {
         if self.rules.fixed.is_empty() {
             return None;
         }
@@ -152,26 +177,44 @@ impl Scan {
     }
 
     fn collect(&mut self, group: &mut Group, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> Res<()> {
-        let Some(query) = self.query(group.id) else {
+        self.collect_matches(group, false, cancel, progress)?;
+        if group.id == GroupId::BuildCaches && !self.packages.is_empty() {
+            self.collect_matches(group, true, cancel, progress)?;
+        }
+        Ok(())
+    }
+
+    fn collect_matches(&mut self, group: &mut Group, downloads: bool, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> Res<()> {
+        let query = if downloads {
+            self.scoped_query(format!("file: {}", within(&self.packages)))
+        } else {
+            self.query(group.id)
+        };
+        let Some(query) = query else {
             group.limited = true;
             return Ok(());
         };
-        let folders = matches!(group.id, GroupId::BuildCaches | GroupId::EmptyFolders);
+        let folders = group.id == GroupId::BuildCaches && !downloads;
+        let duplicates = group.id == GroupId::DuplicateFiles;
         let max = if folders { FOLDER_CANDIDATES } else { FILE_CANDIDATES };
-        let sort = if folders { evipc::SORT_DATE_MODIFIED_DESC } else { evipc::SORT_SIZE_DESC };
+        let sort = if folders { evipc::SORT_DATE_MODIFIED_DESC } else if duplicates { evipc::SORT_SIZE_ASC } else { evipc::SORT_SIZE_DESC };
+        let fields = evipc::REQ_NAME | evipc::REQ_PATH | if duplicates { evipc::REQ_SIZE } else { 0 };
         progress(Progress { group: group.id, checked: 0, candidates: 0 });
         check_cancel(cancel)?;
         let reply = evipc::query(
-            &query, max, evipc::REQ_NAME | evipc::REQ_PATH, sort, false, QUERY_TIMEOUT,
+            &query, max, fields, sort, false, QUERY_TIMEOUT,
         ).map_err(|e| format!("{}: {e}", group.title))?;
         let budget = match group.id {
             GroupId::BuildCaches => BUILD_GROUP_BUDGET,
-            GroupId::Temp | GroupId::AppCaches | GroupId::EmptyFolders => LARGE_GROUP_BUDGET,
+            GroupId::Temp | GroupId::AppCaches | GroupId::DuplicateFiles => LARGE_GROUP_BUDGET,
             _ => SMALL_GROUP_BUDGET,
         };
         let deadline = Instant::now() + budget;
         let candidates = reply.items.len();
-        group.limited = reply.total as usize > candidates;
+        group.limited |= reply.total as usize > candidates;
+        if duplicates {
+            return duplicates::collect(self, group, reply.items, cancel, deadline, progress);
+        }
         let mut checked = 0;
         for hit in reply.items {
             check_cancel(cancel)?;
@@ -189,9 +232,11 @@ impl Scan {
                 continue;
             }
             let Some(facts) = self.rules.check(&path, &name, &mut self.parents) else { continue };
-            let size = match group.id {
-                GroupId::BuildCaches if facts.is_dir() => {
-                    if self.ignore.iter().any(|p| under(p, &name)) {
+            let (size, reason) = match facts.is_dir() {
+                true if folders => {
+                    if self.duplicate_parents.contains(&name) || self.ignore.iter().any(|p| under(p, &name))
+                        || packages::contains(&self.packages, &name) || self.packages.iter().any(|p| under(p, &name))
+                    {
                         continue;
                     }
                     let cutoff = self.now.saturating_sub(PROJECT_IDLE_DAYS * DAY);
@@ -209,25 +254,32 @@ impl Scan {
                     }
                     let (total, status) = tree_size(&self.rules, &path, &mut self.parents, cancel, Some(deadline));
                     group.limited |= matches!(status, Walk::Limit);
-                    if !matches!(status, Walk::Done) {
+                    if !matches!(status, Walk::Done) || total == 0 && is_empty(&path) {
                         continue;
                     }
                     self.trees.insert(name.clone());
-                    total
+                    (total, "Generated folder in a project untouched for at least 90 days")
                 }
-                GroupId::EmptyFolders if facts.is_dir() && is_empty(&path) => 0,
-                _ if !facts.is_dir() && self.file_matches(group.id, &path, &name, &facts) => facts.size,
+                false if facts.links == 1 && downloads && packages::contains(&self.packages, &name) => {
+                    (facts.size, PACKAGE_DOWNLOAD_REASON)
+                }
+                false if facts.links == 1 && !downloads && self.file_matches(group.id, &path, &name, &facts) => {
+                    (facts.size, group.reason)
+                }
                 _ => continue,
             };
             self.seen.insert(name);
             group.total_size += size;
-            group.items.push(Item { path, size, modified: facts.modified, reason: group.reason });
+            group.items.push(Item { path, size, modified: facts.modified, reason, copy_of: None });
         }
         progress(Progress { group: group.id, checked, candidates });
         check_cancel(cancel)
     }
 
     fn file_matches(&self, group: GroupId, path: &Path, name: &str, facts: &Facts) -> bool {
+        if packages::contains(&self.packages, name) {
+            return false;
+        }
         match group {
             GroupId::Temp => self.temps.iter().any(|p| under(name, p))
                 && at_or_before(facts.modified, self.now.saturating_sub(TEMP_IDLE_DAYS * DAY)),
@@ -264,12 +316,12 @@ pub fn scan_in(scope: Option<&[String]>, cancel: &AtomicBool, progress: &dyn Fn(
         CrashDumps.group("Crash dumps", "Crash dump file or file in a CrashDumps folder"),
         Installers.group("Old installers", "EXE, MSI or ZIP in Downloads, modified more than 30 days ago"),
         LargeFiles.group("Large old files", "Larger than 500 MB and unchanged for at least 180 days"),
-        BuildCaches.group("Build caches", "Generated folder in a project untouched for at least 90 days"),
-        EmptyFolders.group("Empty folders", "Folder has no entries"),
+        BuildCaches.group("Developer caches", DEVELOPER_CACHE_REASON),
+        DuplicateFiles.group("Duplicate files", "Same size and content as an older copy; at least 10 MB"),
         RecycleBin.group("Recycle Bin", "Files already in the Recycle Bin"),
     ];
-    // A file belongs to one group. Check whole build-cache trees and more specific file types first.
-    for i in [5, 2, 0, 1, 6, 3, 4] {
+    // Reserve both copies and keepers before other checks can select them.
+    for i in [6, 5, 2, 0, 1, 3, 4] {
         check_cancel(cancel)?;
         scan.collect(&mut groups[i], cancel, progress)?;
         if i == 1 {
@@ -440,7 +492,7 @@ fn tree_size(rules: &Rules, root: &Path, parents: &mut HashMap<PathBuf, bool>, c
         if facts.is_dir() != md.is_dir() {
             return false;
         }
-        if !facts.is_dir() {
+        if !facts.is_dir() && facts.links == 1 {
             size += facts.size;
         }
         true
@@ -455,14 +507,14 @@ pub struct RecycleResult {
 }
 
 /// Recheck each item immediately before asking the Shell to send it to the Recycle Bin.
-/// A folder must still be empty or meet the build-cache checks. One result is returned per path.
+/// A folder must still meet the build-cache checks. One result is returned per path.
 pub fn recycle(paths: &[PathBuf]) -> Vec<RecycleResult> {
     let rules = Rules::load();
     let _com = com();
     paths.iter().map(|path| {
         let result = match &rules {
             Ok(rules) if let Some(size) = can_recycle(rules, path) => {
-                let item = Item { path: path.clone(), size, modified: 0, reason: "" };
+                let item = Item { path: path.clone(), size, modified: 0, reason: "", copy_of: None };
                 if bin_limits(&[item]).is_empty() {
                     recycle_one(path).map_err(|e| win_err("cannot move to the Recycle Bin", &e))
                 } else {
@@ -481,11 +533,9 @@ fn can_recycle(rules: &Rules, path: &Path) -> Option<u64> {
     let name = key(path)?;
     let facts = rules.check(path, &name, &mut parents)?;
     if !facts.is_dir() {
-        return Some(facts.size);
+        return (facts.links == 1).then_some(facts.size);
     }
-    if is_empty(path) {
-        return Some(0);
-    }
+    if is_empty(path) { return None; }
     let cutoff = now_ft().saturating_sub(PROJECT_IDLE_DAYS * DAY);
     let project = project_root(path, cutoff)?;
     let cancel = AtomicBool::new(false);
@@ -525,11 +575,13 @@ mod tests {
             },
             temps: vec![r"c:\windows\temp".into(), r"c:\users\me\temp".into()],
             app_data: vec![r"c:\users\me\appdata\local".into()],
+            packages: vec![r"c:\users\me\appdata\local\uv\cache".into()],
             downloads: Some(r"e:\my downloads".into()),
             now: unix_ft(1_800_000_000),
             parents: HashMap::new(),
             seen: HashSet::new(),
             trees: HashSet::new(),
+            duplicate_parents: HashSet::new(),
             projects: HashMap::new(),
             ignore: HashSet::new(),
         }
@@ -539,7 +591,7 @@ mod tests {
     fn file_group_rules_and_thresholds() {
         use GroupId::*;
         let scan = scan_rules();
-        let mut facts = Facts { attrs: 0, size: LARGE_FILE_MIN_BYTES, modified: scan.now - INSTALLER_AGE_DAYS * DAY };
+        let mut facts = Facts { attrs: 0, size: LARGE_FILE_MIN_BYTES, modified: scan.now - INSTALLER_AGE_DAYS * DAY, created: 0, links: 1 };
         let installer = Path::new(r"E:\My Downloads\Sub\setup.MSI");
         let name = key(installer).unwrap();
         assert!(!scan.file_matches(Installers, installer, &name, &facts));
@@ -558,12 +610,36 @@ mod tests {
             (Temp, r"c:\windows\temp\nested\anything.txt", true),
             (Temp, r"c:\users\me\temp2\anything.txt", false),
             (AppCaches, r"c:\users\me\appdata\local\browser\gpucache\a", true),
+            (AppCaches, r"c:\users\me\appdata\local\uv\cache\archive-v0\a", false),
             (AppCaches, r"c:\users\me\appdata\local\browser\cached data\a", false),
             (CrashDumps, r"c:\work\file.dmp", true),
             (CrashDumps, r"c:\work\crashdumps\file", true),
         ] {
             assert_eq!(scan.file_matches(group, Path::new(path), path, &facts), matches, "{path}");
         }
+    }
+
+    #[test]
+    fn hard_links_contribute_no_reclaimable_bytes() {
+        let base = std::env::var_os("WFM_DATA_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("cleanup-hard-links-{}", std::process::id()));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let shared = root.join("shared.dll");
+        let linked = target.join("linked.dll");
+        let single = target.join("single.dll");
+        std::fs::write(&shared, b"shared bytes").unwrap();
+        std::fs::hard_link(&shared, &linked).unwrap();
+        std::fs::write(&single, b"single").unwrap();
+        let rules = Rules::load().unwrap();
+        let (size, status) = tree_size(&rules, &target, &mut HashMap::new(), &AtomicBool::new(false), None);
+        let shared_size = can_recycle(&rules, &linked);
+        let single_size = can_recycle(&rules, &single);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(status, Walk::Done));
+        assert_eq!(size, 6);
+        assert_eq!(shared_size, None);
+        assert_eq!(single_size, Some(6));
     }
 
     #[test]
@@ -577,7 +653,7 @@ mod tests {
         assert!(installers.starts_with(r#"file: ext:exe;msi;zip <"e:\my downloads\"> dm:<"#), "{installers}");
         assert!(scan.query(GroupId::LargeFiles).unwrap().starts_with(&format!("file: size:>{LARGE_FILE_MIN_BYTES} dm:<")));
         assert!(scan.query(GroupId::BuildCaches).unwrap().starts_with("folder: <wfn:node_modules|wfn:target|wfn:__pycache__|wfn:.gradle|wfn:build> dm:<"));
-        assert!(scan.query(GroupId::EmptyFolders).unwrap().starts_with("folder: empty:"));
+        assert!(scan.query(GroupId::DuplicateFiles).unwrap().starts_with("file: size:>=10485760 sizedupe:"));
         assert!(scan.query(GroupId::RecycleBin).is_none());
     }
 

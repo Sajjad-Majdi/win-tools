@@ -384,6 +384,90 @@ fn reg_string(key: &str, value: &str) -> Option<String> {
     (!s.trim().is_empty()).then_some(s)
 }
 
+/// The supported ways Explorer initializes a new document from its ShellNew registration.
+pub enum ShellNew {
+    Empty,
+    Template(PathBuf),
+    Data(Vec<u8>),
+}
+
+impl ShellNew {
+    pub fn create(&self, path: &Path) -> Res<PathBuf> {
+        use crate::ops::{new_file, new_file_with_data, unique_file_name};
+        let numbered;
+        let path = if path.exists() {
+            numbered = unique_file_name(path);
+            &numbered
+        } else {
+            path
+        };
+        match self {
+            Self::Empty => new_file(path),
+            Self::Data(bytes) => new_file_with_data(path, bytes),
+            Self::Template(template) => {
+                let bytes = std::fs::read(template).map_err(|e| format!("cannot read {}: {e}", template.display()))?;
+                new_file_with_data(path, &bytes)
+            }
+        }
+    }
+}
+
+pub fn shell_new(extension: &str) -> Option<ShellNew> {
+    if extension == ".zip" {
+        // End of central directory with zero entries and no comment.
+        let mut bytes = vec![0; 22];
+        bytes[..4].copy_from_slice(b"PK\x05\x06");
+        return Some(ShellNew::Data(bytes));
+    }
+    let direct = format!(r"{extension}\ShellNew");
+    if let Some(entry) = shell_new_entry(&direct) {
+        return Some(entry);
+    }
+    let registered = reg_string(extension, "").and_then(|prog| {
+        shell_new_entry(&format!(r"{extension}\{prog}\ShellNew")).or_else(|| shell_new_entry(&format!(r"{prog}\ShellNew")))
+    });
+    // a text file needs no template: an empty file, even where Windows registers none
+    registered.or_else(|| (extension == ".txt").then_some(ShellNew::Empty))
+}
+
+fn shell_new_entry(key: &str) -> Option<ShellNew> {
+    use windows::Win32::System::Registry::{RRF_RT_ANY, RRF_RT_REG_BINARY};
+    if registry_bytes(key, "NullFile", RRF_RT_ANY).is_some() {
+        return Some(ShellNew::Empty);
+    }
+    if let Some(file) = reg_string(key, "FileName") {
+        let path = PathBuf::from(expand(file.trim().trim_matches('"')));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            [("APPDATA", r"Microsoft\Windows\Templates"), ("ProgramData", r"Microsoft\Windows\Templates"), ("WINDIR", "ShellNew")]
+                .into_iter().filter_map(|(var, sub)| std::env::var_os(var).map(|dir| PathBuf::from(dir).join(sub).join(&path)))
+                .find(|p| p.is_file()).unwrap_or(path)
+        };
+        return path.is_file().then_some(ShellNew::Template(path));
+    }
+    registry_bytes(key, "Data", RRF_RT_REG_BINARY).map(ShellNew::Data)
+}
+
+fn registry_bytes(key: &str, value: &str, flags: windows::Win32::System::Registry::REG_ROUTINE_FLAGS) -> Option<Vec<u8>> {
+    use windows::Win32::System::Registry::{HKEY_CLASSES_ROOT, RegGetValueW};
+    let key = wide(key);
+    let value = wide(value);
+    let read = |data, size| unsafe {
+        RegGetValueW(HKEY_CLASSES_ROOT, PCWSTR(key.as_ptr()), PCWSTR(value.as_ptr()), flags, None, data, Some(size))
+    };
+    let mut size = 0;
+    if read(None, &mut size).0 != 0 {
+        return None;
+    }
+    let mut bytes = vec![0u8; size as usize];
+    if size != 0 && read(Some(bytes.as_mut_ptr().cast()), &mut size).0 != 0 {
+        return None;
+    }
+    bytes.truncate(size as usize);
+    Some(bytes)
+}
+
 /// %VAR% -> its value.
 fn expand(s: &str) -> String {
     let mut out = String::new();
@@ -554,14 +638,26 @@ pub fn shell_icon(path: &Path, px: u32) -> Option<Icon> {
 
 /// What SHGetFileInfo gives for a file (small icon at 16 px or less, else large), for comparisons.
 pub fn shgetfileinfo_icon(path: &Path, px: u32) -> Option<Icon> {
-    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON, SHGetFileInfoW};
+    shfile_icon(path, px, None)
+}
+
+/// Shell icon for a type before the file or folder is created.
+pub fn shgetfileinfo_type_icon(path: &Path, px: u32, folder: bool) -> Option<Icon> {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+    shfile_icon(path, px, Some(if folder { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL }))
+}
+
+fn shfile_icon(path: &Path, px: u32, attrs: Option<windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES>) -> Option<Icon> {
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW};
     use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx};
     let _c = com();
     let w = wide(path.as_os_str());
     let mut sfi = SHFILEINFOW::default();
-    let flags = SHGFI_ICON | if px <= 16 { SHGFI_SMALLICON } else { SHGFI_LARGEICON };
-    let r = unsafe { SHGetFileInfoW(PCWSTR(w.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut sfi), size_of::<SHFILEINFOW>() as u32, flags) };
+    let mut flags = SHGFI_ICON | if px <= 16 { SHGFI_SMALLICON } else { SHGFI_LARGEICON };
+    if attrs.is_some() {
+        flags |= SHGFI_USEFILEATTRIBUTES;
+    }
+    let r = unsafe { SHGetFileInfoW(PCWSTR(w.as_ptr()), attrs.unwrap_or_default(), Some(&mut sfi), size_of::<SHFILEINFOW>() as u32, flags) };
     if r == 0 || sfi.hIcon.is_invalid() {
         return None;
     }

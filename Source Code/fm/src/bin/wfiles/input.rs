@@ -18,7 +18,7 @@ const VK_F: u16 = 0x46;
 
 impl App {
     // ------------------------------------------------------------------ helpers
-    pub fn close_popups(&mut self) {
+    pub fn close_popups(&mut self) -> bool {
         let any = self.menu.is_some() || self.drop.is_some() || self.sub.is_some();
         self.retire_menu();
         // the menu's app list and icons are not needed once it is gone
@@ -26,13 +26,16 @@ impl App {
         if let Some(d) = self.sub.take() {
             self.drop_out = Some((d, true, Instant::now()));
         }
+        let mut changed_scope = false;
         if let Some(d) = self.drop.take() {
+            changed_scope = d.kind == DropKind::CleanupScope && self.cleanup_finish_scope();
             self.drop_out = Some((d, false, Instant::now()));
         }
         if any {
             self.anim();
             self.invalidate();
         }
+        changed_scope
     }
 
     /// Close the context menu with its short fade-out.
@@ -425,13 +428,11 @@ impl App {
                     Err(e) => self.toast_err(&e),
                 }
             }
-            Act::NewText => {
+            Act::NewDocument(ext, file) => {
                 let Some(d) = dir else { return self.toast("New items can only be made inside a folder", "", false) };
-                let mut p = d.join("New Text Document.txt");
-                if p.exists() {
-                    p = fmcore::ops::unique_name(&p);
-                }
-                match fmcore::ops::new_file(&p) {
+                let created = fmcore::menu::shell_new(ext).ok_or_else(|| format!("ShellNew is no longer available for {ext}"))
+                    .and_then(|entry| entry.create(&d.join(file)));
+                match created {
                     Ok(p) => {
                         self.pending_rename = Some(p.clone());
                         self.pane_mut().want = Some(p);
@@ -443,7 +444,7 @@ impl App {
             }
             Act::NewMenu => {
                 let r = self.hits.iter().find(|h| h.1 == Hit::New).map(|h| h.0).unwrap_or(Rect::new(self.w - 140.0, TITLE_H + 8.0, 70.0, 32.0));
-                self.open_drop(DropKind::New, r, 220.0);
+                self.open_drop(DropKind::New, r, 250.0);
             }
             Act::Properties => {
                 let p = paths.first().cloned().or(dir);
@@ -1208,7 +1209,9 @@ impl App {
 
     pub fn right_click(&mut self, x: f32, y: f32) {
         self.tip = None;
-        self.drop = None;
+        if self.drop.take().is_some_and(|d| d.kind == DropKind::CleanupScope) {
+            self.cleanup_finish_scope();
+        }
         self.sub = None;
         if self.pv.is_some() || self.rename.is_some() || self.palette.is_some() {
             return;
@@ -1262,7 +1265,10 @@ impl App {
             let drop_was = self.drop.as_ref().map(|d| d.kind);
             let anchor_was = self.drop.as_ref().map(|d| d.anchor);
             let by_was = self.drop.as_ref().map(|d| d.by);
-            self.close_popups();
+            let changed_scope = self.close_popups();
+            if changed_scope && matches!(h, Hit::Cleanup(_)) {
+                return;
+            }
             // a click on the same dropdown button just closes it: the button that opened it, or any hit drawn at
             // exactly the dropdown's anchor rectangle
             let hit_rect = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0);
@@ -2079,6 +2085,8 @@ impl App {
         if self.menu.is_some() || self.drop.is_some() {
             if vk == ESC {
                 self.close_popups();
+            } else if self.drop.as_ref().is_some_and(|d| d.kind == DropKind::CleanupScope) {
+                self.cleanup_scope_key(vk, ctrl, shift, alt);
             } else if self.cleanup_menu_key(vk, ctrl, shift, alt) {
                 return true;
             }
@@ -2564,6 +2572,7 @@ impl App {
         }
         let width = match kind {
             DropKind::Shell => 260.0,
+            DropKind::New => 250.0,
             DropKind::OpenWith => 300.0,
             _ => 240.0,
         };
@@ -2573,10 +2582,26 @@ impl App {
     fn drop_items(&self, kind: DropKind) -> Vec<MItem> {
         let mut v = vec![];
         match kind {
-            DropKind::CleanupScope | DropKind::CleanupAi | DropKind::CleanupHidden => return self.cleanup_drop_items(kind),
+            DropKind::CleanupScope | DropKind::CleanupHidden => return self.cleanup_drop_items(kind),
             DropKind::New => {
+                let px = crate::sicons::bucket(16.0 * self.gfx.scale());
+                // built in: always there, with the app's own glyphs
                 v.push(MItem::new("Folder", 0xE8F4, Act::NewFolder).keys("Ctrl+Shift+N"));
-                v.push(MItem::new("Text document", 0xE8A5, Act::NewText));
+                v.push(MItem::new("Text document", 0xE8A5, Act::NewDocument(".txt", "New Text Document.txt")));
+                // an app's file type: only when Windows can create it, with that app's own icon
+                for (label, ext, file) in [
+                    ("Word document", ".docx", "New Microsoft Word Document.docx"),
+                    ("Excel workbook", ".xlsx", "New Microsoft Excel Worksheet.xlsx"),
+                    ("PowerPoint presentation", ".pptx", "New Microsoft PowerPoint Presentation.pptx"),
+                    ("Compressed (zipped) folder", ".zip", "New Compressed (zipped) Folder.zip"),
+                ] {
+                    if fmcore::menu::shell_new(ext).is_some() {
+                        let icon = crate::sicons::new_item_icon(file, px, false);
+                        let mut row = MItem::new(label, if icon.is_some() { 0 } else { 0xE8A5 }, Act::NewDocument(ext, file));
+                        row.icon = icon;
+                        v.push(row);
+                    }
+                }
             }
             DropKind::View => {
                 let view = self.tab().view;
@@ -2758,10 +2783,16 @@ impl App {
     }
 
     fn drop_click(&mut self, i: usize) {
-        let Some(d) = self.drop.take() else { return };
+        let Some(d) = &self.drop else { return };
         let Some(it) = d.items.get(i).cloned() else { return };
-        let paths = self.sel_paths();
         let kind = d.kind;
+        if kind == DropKind::CleanupScope {
+            self.cleanup.scope_focus = None;
+            self.apply_drop(kind, &it, vec![]);
+            return;
+        }
+        let d = self.drop.take().unwrap();
+        let paths = self.sel_paths();
         self.drop_out = Some((d, false, Instant::now()));
         self.anim();
         self.apply_drop(kind, &it, paths);
@@ -2772,7 +2803,8 @@ impl App {
             return;
         }
         match kind {
-            DropKind::CleanupScope | DropKind::CleanupAi | DropKind::CleanupHidden => self.cleanup_apply_drop(kind, it),
+            DropKind::CleanupScope => self.cleanup_toggle_scope(it.value as usize),
+            DropKind::CleanupHidden => self.cleanup_apply_drop(it),
             DropKind::New => self.act(it.act),
             DropKind::View => {
                 if it.act == Act::None {
@@ -3399,7 +3431,7 @@ impl App {
                 if let Loc::Folder(p) = &pn.loc {
                     folders.push((folder_title(p), p.clone()));
                     for b in pn.back.iter().rev().take(5) {
-                        if let Loc::Folder(p) = b {
+                        if let Loc::Folder(p) = &b.loc {
                             folders.push((folder_title(p), p.clone()));
                         }
                     }

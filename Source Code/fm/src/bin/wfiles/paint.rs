@@ -588,13 +588,22 @@ impl App {
         if self.side_hidden() { 48.0 } else { 10.0 }
     }
 
+    fn cleanup_toolbar_width(&mut self) -> f32 {
+        if self.pane().loc == Loc::ThisPc {
+            46.0 + self.gfx.measure("Clean up", Font::Ui, 13.0, 400)
+        } else {
+            0.0
+        }
+    }
+
     pub fn omni_rect(&mut self) -> Rect {
         let narrow = self.w < 1000.0;
         let tiny = self.w < 560.0;
         let vw = if narrow { 34.0 } else { 53.0 };
-        let nw = if tiny { 0.0 } else if narrow { 34.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0 };
+        let nw = if tiny && self.pane().loc != Loc::ThisPc { 0.0 } else if narrow { 34.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0 };
         let vx = self.w - 10.0 - vw;
-        let nx = vx - 4.0 - nw;
+        let cw = self.cleanup_toolbar_width();
+        let nx = vx - 4.0 - nw - if cw > 0.0 { cw + 4.0 } else { 0.0 };
         // very narrow: no forward button
         let x0 = self.nav_x() + if tiny { 82.0 } else { 120.0 };
         Rect::new(x0, TITLE_H + 7.0, (nx - 4.0 - 6.0 - x0).max(60.0), 34.0)
@@ -656,10 +665,16 @@ impl App {
         self.icon_btn(Rect::new(nx0 + if tiny { 38.0 } else { 76.0 }, y, 34.0, 32.0), 0xE74A, 16.0, if can_up { t.text } else { t.text_dis }, Hit::Up, R_CTRL, t);
         let o = self.omni_rect();
         let narrow = self.w < 1000.0;
-        // New + view buttons
-        let nx = o.r() + 6.0 + 4.0;
+        // Cleanup, New and View buttons.
+        let mut nx = o.r() + 10.0;
+        let cw = self.cleanup_toolbar_width();
+        if cw > 0.0 {
+            self.button(Rect::new(nx, y, cw, 32.0), "Clean up", crate::cleanup_page::BROOM, Btn::Ghost,
+                Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
+            nx += cw + 4.0;
+        }
         let vx;
-        if tiny {
+        if tiny && cw == 0.0 {
             vx = nx;
             let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
             self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
@@ -1401,9 +1416,6 @@ impl App {
             // section titles of the This PC page
             let hy = list.y + l.head_d - scroll + dy;
             self.gfx.text("Drives", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
-            if hy >= list.y && hy + 30.0 <= list.b() {
-                self.button(Rect::new(list.r() - 118.0, hy, 98.0, 30.0), "Clean up", crate::cleanup_page::BROOM, Btn::Std, Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
-            }
             if l.n_d < n {
                 let hy = list.y + l.head_p - scroll + dy;
                 self.gfx.text("Pinned", Rect::new(list.x + 22.0, hy, 300.0, 30.0), Font::Ui, 14.0, 600, Align::Left, t.text);
@@ -2383,9 +2395,14 @@ impl App {
             let h = hit_of(i);
             let open_sub = it.sub && self.sub.as_ref().map(|s| s.anchor.y == ir.y && s.child).unwrap_or(false);
             if it.enabled {
+                let focused = h == Hit::Drop(i) && self.drop.as_ref().is_some_and(|d| d.kind == DropKind::CleanupScope)
+                    && self.cleanup.scope_focus == Some(i);
                 let hk = if open_sub { 1.0 } else { self.hk(h) };
                 self.gfx.fill_round(ir, R_CTRL, t.hover.a(t.hover.3 * hk));
                 self.gfx.fill_round(ir, R_CTRL, t.press.a(t.press.3 * self.pk(h) * 0.8));
+                if focused {
+                    self.gfx.stroke_round(ir.inset(1.0, 1.0), R_CTRL, t.sel_stroke, 1.0);
+                }
             }
             let fg = if it.enabled { t.text } else { t.text_dis };
             let ib = Rect::new(ir.x + 10.0, ir.cy() - 8.0, 16.0, 16.0);

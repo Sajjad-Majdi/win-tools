@@ -343,9 +343,16 @@ pub fn is_inside(p: &Path, dir: &Path) -> bool {
 
 /// "name (2).ext", "name (3).ext", ... : the first free name next to `p`.
 pub fn unique_name(p: &Path) -> PathBuf {
+    numbered_name(p, p.is_dir())
+}
+
+pub(crate) fn unique_file_name(p: &Path) -> PathBuf {
+    numbered_name(p, false)
+}
+
+fn numbered_name(p: &Path, is_dir: bool) -> PathBuf {
     let parent = p.parent().unwrap_or(Path::new(""));
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let is_dir = p.is_dir();
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 && !is_dir => (name[..i].to_string(), name[i..].to_string()),
         _ => (name.clone(), String::new()),
@@ -751,13 +758,24 @@ pub fn mkdir(path: &Path) -> Res<PathBuf> {
 
 /// New empty file (fails when the name is taken). Recorded for undo.
 pub fn new_file(path: &Path) -> Res<PathBuf> {
+    new_file_with_data(path, &[])
+}
+
+pub(crate) fn new_file_with_data(path: &Path, bytes: &[u8]) -> Res<PathBuf> {
+    use std::io::Write;
     let path = abs(path);
     if let Some(n) = path.file_name() {
         check_name(&n.to_string_lossy())?;
     }
-    std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists { format!("already exists: {}", path.display()) } else { format!("cannot create {}: {e}", path.display()) }
     })?;
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("cannot write {}: {e}", path.display()));
+    }
+    drop(file);
     let mut op = Op::new("new-file");
     op.created.push(path.clone());
     journal::record_quiet(op);

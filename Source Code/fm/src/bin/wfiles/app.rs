@@ -173,7 +173,7 @@ pub enum Act {
     DeleteForGood,
     Zip,
     NewFolder,
-    NewText,
+    NewDocument(&'static str, &'static str),
     NewMenu,
     Properties,
     SelectAll,
@@ -252,7 +252,6 @@ impl MItem {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropKind {
     CleanupScope,
-    CleanupAi,
     CleanupHidden,
     New,
     View,
@@ -909,21 +908,14 @@ impl App {
     }
 
     pub fn go_in(&mut self, t: usize, p: usize, loc: Loc, history: bool) {
-        let pane = &mut self.tabs[t].panes[p];
         if let Loc::Folder(dir) = &loc
             && !dir.is_dir()
         {
             self.toast(&format!("Not found: {}", dir.display()), "", false);
             return;
         }
-        if history && pane.loc != loc {
-            let old = pane.loc.clone();
-            pane.back.push(old);
-            pane.fwd.clear();
-        }
-        pane.back_anim = false;
-        pane.loc = loc;
-        self.after_move(t, p);
+        self.tabs[t].visit(p, loc, history);
+        self.after_move(t, p, None);
     }
 
     pub fn back(&mut self) {
@@ -933,24 +925,15 @@ impl App {
             return;
         }
         let (t, p) = (self.cur, self.tabs[self.cur].active);
-        let pane = &mut self.tabs[t].panes[p];
-        if let Some(l) = pane.back.pop() {
-            let old = std::mem::replace(&mut pane.loc, l);
-            pane.want = old.path().map(|x| x.to_path_buf());
-            pane.fwd.push(old);
-            pane.back_anim = true;
-            self.after_move(t, p);
+        if let Some(entry) = self.tabs[t].step(p, true) {
+            self.after_move(t, p, entry.into_search());
         }
     }
 
     pub fn forward(&mut self) {
         let (t, p) = (self.cur, self.tabs[self.cur].active);
-        let pane = &mut self.tabs[t].panes[p];
-        if let Some(l) = pane.fwd.pop() {
-            let old = std::mem::replace(&mut pane.loc, l);
-            pane.back.push(old);
-            pane.back_anim = false;
-            self.after_move(t, p);
+        if let Some(entry) = self.tabs[t].step(p, false) {
+            self.after_move(t, p, entry.into_search());
         }
     }
 
@@ -973,7 +956,8 @@ impl App {
         }
     }
 
-    fn after_move(&mut self, t: usize, p: usize) {
+    fn after_move(&mut self, t: usize, p: usize, search: Option<Box<SearchView>>) {
+        let restored = search.is_some();
         {
             let pane = &mut self.tabs[t].panes[p];
             pane.search = None;
@@ -981,8 +965,13 @@ impl App {
             pane.focus = None;
             pane.anchor = None;
             pane.scroll = 0.0;
+            pane.sf.set(0.0);
+            pane.sf_written = 0.0;
             pane.error = None;
             pane.watch.clear();
+            if let Some(search) = search {
+                pane.restore_search(*search);
+            }
         }
         if t == self.cur {
             self.path_edit = None;
@@ -994,7 +983,7 @@ impl App {
                 self.whatis = None;
             }
         }
-        self.load(t, p, false);
+        self.load(t, p, restored);
     }
 
     /// (Re)list a pane. `keep` = refresh in place (watch), keeps selection and scroll.
@@ -1216,8 +1205,7 @@ impl App {
         let tab_id = self.tab().id;
         let p = self.tab().active;
         let Some(s) = self.pane_mut().search.as_mut() else { return };
-        s.seq += 1;
-        let seq = s.seq;
+        let seq = s.next_request();
         let words = s.field.text.trim().to_string();
         if words.is_empty() {
             s.items.clear();
@@ -1392,23 +1380,26 @@ impl App {
                         pn.items = items;
                         pn.sort_items();
                         pn.error = None;
-                        let names: HashSet<PathBuf> = pn.items.iter().map(|i| i.path.clone()).collect();
-                        pn.sel.retain(|s| names.contains(s));
-                        if let Some(w) = pn.want.take()
-                            && let Some(i) = pn.items.iter().position(|it| fmcore::util::path_eq(&it.path, &w))
-                        {
-                            pn.sel.clear();
-                            pn.sel.insert(pn.items[i].path.clone());
-                            pn.focus = Some(i);
-                            pn.anchor = Some(i);
-                            pn.kb = true;
-                            self.scroll_to(t, p, i);
+                        let searching = pn.searching();
+                        if !searching {
+                            let names: HashSet<PathBuf> = pn.items.iter().map(|i| i.path.clone()).collect();
+                            pn.sel.retain(|s| names.contains(s));
+                            if let Some(w) = pn.want.take()
+                                && let Some(i) = pn.items.iter().position(|it| fmcore::util::path_eq(&it.path, &w))
+                            {
+                                pn.sel.clear();
+                                pn.sel.insert(pn.items[i].path.clone());
+                                pn.focus = Some(i);
+                                pn.anchor = Some(i);
+                                pn.kb = true;
+                                self.scroll_to(t, p, i);
+                            }
                         }
                         if self.first_list_ms.is_none() {
                             self.first_list_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
                             trace(&format!("first list {:.1} ms (list itself {ms:.1} ms)", self.first_list_ms.unwrap()));
                         }
-                        if let Some(d) = dir {
+                        if !searching && let Some(d) = dir {
                             self.ask_sizes(&d);
                         }
                         if let Some(pr) = self.pending_rename.take() {

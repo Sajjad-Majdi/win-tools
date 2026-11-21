@@ -129,6 +129,8 @@ pub(super) struct Facts {
     pub attrs: u32,
     pub size: u64,
     pub modified: u64,
+    pub created: u64,
+    pub links: u32,
 }
 
 impl Facts {
@@ -166,6 +168,8 @@ fn probe(path: &Path, normalized: &str) -> Option<Facts> {
                 attrs: info.dwFileAttributes,
                 size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
                 modified: ft_u64(info.ftLastWriteTime),
+                created: ft_u64(info.ftCreationTime),
+                links: info.nNumberOfLinks,
             })
         });
         let _ = CloseHandle(h);

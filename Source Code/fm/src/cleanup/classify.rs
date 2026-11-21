@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn ai_sends_only_metadata_and_handles_batch_failure() {
-        let item = Item { path: r"C:\Temp\example.txt".into(), size: 4, modified: 0, reason: "local reason" };
+        let item = Item { path: r"C:\Temp\example.txt".into(), size: 4, modified: 0, reason: "local reason", copy_of: None };
         let rows: Value = serde_json::from_str(&prompt(std::slice::from_ref(&item))).unwrap();
         assert_eq!(rows[0], json!({"folder": r"C:\Temp", "name": "example.txt", "size_bytes": 4, "modified_unix": 0}));
         let mut sizes = vec![];

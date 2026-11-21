@@ -107,7 +107,7 @@ impl App {
                 self.gfx.line(r.cx() - 1.5, r.cy() + 5.0, r.cx() + 1.5, r.cy() - 5.0, color, 1.3);
                 self.gfx.glyph(0xE76C, Rect::new(r.cx(), r.y, 10.0, r.h), 9.0, color);
             }
-            3 => self.gfx.glyph(0xE8B7, r, 16.0, color),
+            3 => self.gfx.glyph(GROUPS[group].2, r, 16.0, color),
             4 => self.gfx.glyph(0xF158, r, 16.0, color),
             _ => {
                 self.gfx.glyph(0xE8A5, r, 16.0, color);
@@ -183,16 +183,18 @@ impl App {
         self.cleanup.columns = cols;
         self.paint_cleanup_header(left, done, t);
         self.paint_cleanup_progress(left, t);
-        if !done {
+        let top = if !done {
             self.paint_cleanup_segments(left, t);
-        }
-        let top = if done && left.w >= 650.0 { 100.0 } else { 108.0 };
+            self.paint_cleanup_drive_chips(left, t)
+        } else if left.w >= 650.0 { 100.0 } else { 108.0 };
         let list = Rect::new(left.x, left.y + top, left.w, (left.h - top).max(0.0));
+        self.cleanup.list_height = list.h;
         let visible = self.cleanup.visible();
         let rows = visible.len().div_ceil(cols);
-        let show_bin = !panel || push;
-        let bin_h = if done { self.cleanup_done_height() } else if show_bin { 56.0 } else { 0.0 };
-        let height = 4.0 + rows as f32 * TILE_STEP + bin_h + SCROLL_PAD;
+        let tiles_h = if rows == 0 && !done { 48.0 } else { rows as f32 * TILE_STEP };
+        let show_bin = (!panel || push) && self.cleanup.phase != Phase::Scan;
+        let bin_h = if done { self.cleanup_done_height() } else if show_bin { 32.0 } else { 0.0 };
+        let height = 4.0 + tiles_h + bin_h + SCROLL_PAD;
         self.cleanup.scroll_max = (height - list.h).max(0.0);
         if std::mem::take(&mut self.cleanup.reveal_panel_tile) && push
             && let Some(i) = visible.iter().position(|&group| Some(group) == self.cleanup.panel)
@@ -219,8 +221,8 @@ impl App {
         if visible.is_empty() && !done {
             self.cleanup_label("No cleanup items found", Rect::new(x, y + 12.0, w, 32.0), 13.0, 400, t.text2);
         }
-        if !done && show_bin && (self.cleanup.phase != Phase::Scan || self.cleanup.bin.count > 0) {
-            self.paint_cleanup_bin(Rect::new(x, y + rows as f32 * TILE_STEP, w, bin_h), list, false, t);
+        if !done && show_bin {
+            self.paint_cleanup_bin(Rect::new(x, y + tiles_h, w, bin_h), list, t);
         }
         self.gfx.unclip();
         let selected = self.cleanup.totals(true);
@@ -237,11 +239,10 @@ impl App {
     }
 
     pub(super) fn cleanup_reveal_tile(&mut self, i: usize) {
-        let c = crate::paint::content_rect(self);
         let done = self.cleanup.done.is_some();
         let head = if done { self.cleanup_done_height() } else { 0.0 };
         let y = head + 4.0 + (i / self.cleanup.columns.max(1)) as f32 * TILE_STEP;
-        let height = (c.h - 108.0 - 80.0).max(0.0);
+        let height = (self.cleanup.list_height - 80.0).max(0.0);
         let from = self.cleanup.scroll.target;
         self.cleanup.scroll.to(reveal(from, height, y, y + TILE_H).clamp(0.0, self.cleanup.scroll_max));
     }
@@ -285,16 +286,19 @@ impl App {
                 right - x - 120.0
             }
             _ => {
+                let review_again = self.ai_on && self.cleanup.has_notes();
                 if self.ai_on && totals.count > 0 {
-                    let notes = self.cleanup.has_notes;
-                    let width = if notes { 122.0 } else { 105.0 };
+                    let label = if review_again { "Review again" } else { "AI Review" };
+                    let width = 48.0 + self.gfx.measure(label, Font::Ui, 13.0, 400);
                     let r = Rect::new(right - width, y, width, 32.0);
-                    self.paint_cleanup_ai(r, t);
+                    self.paint_cleanup_ai(r, label, t);
                     right = r.x - 8.0;
                 }
-                let r = Rect::new(right - 32.0, y, 32.0, 32.0);
-                self.icon_btn(r, 0xE72C, 14.0, t.text2, hit(Rescan), R_CTRL, t);
-                right = r.x - 8.0;
+                if !review_again {
+                    let r = Rect::new(right - 32.0, y, 32.0, 32.0);
+                    self.icon_btn(r, 0xE72C, 14.0, t.text2, hit(Rescan), R_CTRL, t);
+                    right = r.x - 8.0;
+                }
                 if self.cleanup.panel.is_none() && right - x > 220.0 {
                     let all = self.drives.iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
                     let value = if all { "All".into() } else { scope.iter().map(|r| r.trim_end_matches('\\')).collect::<Vec<_>>().join(" ") };
@@ -314,7 +318,7 @@ impl App {
             Rect::new(x, c.y + 16.0, width.max(90.0), 36.0), 30.0, if scanning { t.text2 } else { t.text }, t);
         let sub_w = self.gfx.measure(&sub, Font::Ui, 12.0, 400);
         self.cleanup_label(&sub, Rect::new(x, c.y + 54.0, (c.w - 40.0).max(0.0), 17.0), 12.0, 400, t.text3);
-        if self.cleanup.show_notes && self.cleanup.has_notes && self.cleanup.phase != Phase::Review && c.w >= 400.0 {
+        if self.cleanup.show_notes && self.cleanup.has_notes() && self.cleanup.phase != Phase::Review && c.w >= 400.0 {
             let checks = self.cleanup.tiles.iter().map(|g| g.verdicts[0]).sum();
             let keeps = self.cleanup.tiles.iter().map(|g| g.verdicts[1]).sum();
             self.cleanup_verdicts(Rect::new(x + sub_w + 12.0, c.y + 54.0, c.w - sub_w - 55.0, 17.0), checks, keeps, false, t);
@@ -332,18 +336,15 @@ impl App {
         if !self.cleanup_instant() { self.anim(); }
     }
 
-    fn paint_cleanup_ai(&mut self, r: Rect, t: &Theme) {
-        let on = self.cleanup.has_notes && self.cleanup.show_notes;
+    fn paint_cleanup_ai(&mut self, r: Rect, label: &str, t: &Theme) {
+        let on = self.cleanup.has_notes() && self.cleanup.show_notes;
         let h = hit(Ai);
         let scaled = self.press_in(r, h);
         self.gfx.fill_round(r, R_CTRL, if on { t.sel } else { t.card });
         self.gfx.stroke_round(r, R_CTRL, if on { t.sel_stroke } else { t.stroke }, 1.0);
         self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * self.hk(h)));
         self.gfx.glyph(0xF4A5, Rect::new(r.x + 13.0, r.y, 14.0, r.h), 13.0, t.accent_text);
-        self.cleanup_label("AI Review", Rect::new(r.x + 35.0, r.y, 62.0, r.h), 13.0, 400, t.text);
-        if self.cleanup.has_notes {
-            self.gfx.glyph(0xE70D, Rect::new(r.r() - 18.0, r.y, 9.0, r.h), 8.0, t.text2);
-        }
+        self.cleanup_label(label, Rect::new(r.x + 35.0, r.y, r.w - 43.0, r.h), 13.0, 400, t.text);
         if scaled { self.gfx.pop_xf(); }
         self.hit(r, h);
     }
@@ -406,6 +407,55 @@ impl App {
         if moving { self.anim(); }
     }
 
+    fn paint_cleanup_drive_chips(&mut self, c: Rect, t: &Theme) -> f32 {
+        let drives = self.cleanup.by_drive();
+        if drives.is_empty() { return 108.0; }
+        let left = c.x + 22.0;
+        let right = c.r() - 20.0;
+        let mut x = left;
+        let mut y = c.y + 102.0;
+        self.gfx.clip(Rect::new(left, y, (right - left).max(0.0), (c.b() - y).max(0.0)));
+        for (letter, total) in drives {
+            let label = format!("{letter}:");
+            let root = format!("{label}\\");
+            let Some(d) = self.drives.iter().find(|d| d.root.eq_ignore_ascii_case(&root)) else { continue };
+            let kind = d.kind;
+            let selected = total.count > 0;
+            let (frees, free) = if selected {
+                let before = fmt::size_short(d.free);
+                let after = fmt::size_short(d.free.saturating_add(total.bytes).min(d.total.max(d.free)));
+                let before = match (before.rsplit_once(' '), after.rsplit_once(' ')) {
+                    (Some((value, unit)), Some((_, next))) if unit == next => value,
+                    _ => &before,
+                };
+                (format!("frees {}", fmt::size(total.bytes)), format!("· {before} → {after} free"))
+            } else {
+                ("nothing selected".into(), String::new())
+            };
+            let label_w = self.gfx.measure(&label, Font::Ui, 12.0, 600).ceil() + 2.0;
+            let frees_w = self.gfx.measure(&frees, Font::Ui, 12.0, 400).ceil() + 2.0;
+            let free_w = if selected { self.gfx.measure(&free, Font::Ui, 12.0, 400).ceil() + 6.0 } else { 0.0 };
+            let width = 22.0 + label_w + 4.0 + frees_w + free_w;
+            if x > left && x + width > right {
+                x = left;
+                y += 22.0;
+            }
+            self.gfx.push_scale(x, y + 4.0, 0.4, 0.0, 0.0);
+            self.drive_slab(x, y + 4.0, &root, kind, t);
+            self.gfx.pop_xf();
+            let tx = x + 22.0;
+            self.cleanup_label(&label, Rect::new(tx, y, label_w, 20.0), 12.0, 600, if selected { t.text } else { t.text3 });
+            let tx = tx + label_w + 4.0;
+            self.cleanup_label(&frees, Rect::new(tx, y, frees_w, 20.0), 12.0, 400, if total.bytes > 0 { t.accent_text } else { t.text3 });
+            if selected {
+                self.cleanup_label(&free, Rect::new(tx + frees_w + 4.0, y, free_w - 4.0, 20.0), 12.0, 400, t.text3);
+            }
+            x += width + 16.0;
+        }
+        self.gfx.unclip();
+        y - c.y + 30.0
+    }
+
     fn paint_cleanup_tile(&mut self, g: usize, r: Rect, list: Rect, t: &Theme) {
         let tile = &self.cleanup.tiles[g];
         let (total, sel, verdicts) = (tile.total, tile.selected, tile.verdicts);
@@ -458,15 +508,24 @@ impl App {
             self.gfx.fill_round(more, R_SMALL, t.hover.a(t.hover.3 * self.hk(mh)));
             self.cleanup_label("Items", Rect::new(more.x + 10.0, more.y, 37.0, more.h), 12.5, 400, if self.hov(mh) { t.text } else { t.text2 });
             self.gfx.glyph(0xE76C, Rect::new(more.r() - 18.0, more.y, 9.0, more.h), 8.0, t.text3);
-            let (n, sub) = if g == 3 {
-                (count(if mixed { sel.count } else { total.count }), if mixed { format!("of {} folders", count(total.count)) } else { "folders".into() })
-            } else {
-                (fmt::size(if mixed { sel.bytes } else { total.bytes }), if mixed { format!("of {}", fmt::size(total.bytes)) } else { items(total.count) })
-            };
+            let n = fmt::size(if mixed { sel.bytes } else { total.bytes });
+            let sub = if mixed { format!("of {} · {}", fmt::size(total.bytes), items(total.count)) } else { items(total.count) };
             let nr = Rect::new(r.x + 16.0, r.b() - 42.0, (more.x - r.x - 18.0).max(0.0), 30.0);
             self.gfx.clip(nr);
             self.cleanup_number(&n, &sub, nr, 22.0, if on { t.text } else { t.text2 }, t);
             self.gfx.unclip();
+            let tags: Vec<_> = self.cleanup.tiles[g].drives.keys().map(char::to_string).collect();
+            let mut x = nr.x + self.gfx.measure(&n, Font::Display, 22.0, 600)
+                + 7.0 + self.gfx.measure(&sub, Font::Ui, 12.5, 400) + 6.0;
+            let widths: Vec<_> = tags.iter().map(|label| self.gfx.measure(label, Font::Ui, 11.0, 600).ceil() + 8.0).collect();
+            if x + widths.iter().map(|w| w + 4.0).sum::<f32>() - 4.0 <= nr.r() {
+                for (label, w) in tags.iter().zip(widths) {
+                    let tag = Rect::new(x, nr.cy() - 4.0, w, 16.0);
+                    self.gfx.stroke_round(tag, 4.0, t.stroke, 1.0);
+                    self.gfx.text(label, tag, Font::Ui, 11.0, 600, Align::Center, t.text3);
+                    x += w + 4.0;
+                }
+            }
         }
         if k < 1.0 {
             self.gfx.pop_xf();
@@ -496,22 +555,36 @@ impl App {
         }
     }
 
-    fn paint_cleanup_bin(&mut self, r: Rect, list: Rect, done: bool, t: &Theme) {
+    fn paint_cleanup_bin(&mut self, r: Rect, list: Rect, t: &Theme) {
         if !r.intersects(&list) { return; }
-        if !done { self.cleanup_card(r, 0.0, t); }
-        self.gfx.glyph(BIN_GLYPH, Rect::new(r.x + 12.0, r.y, 36.0, r.h), 16.0, t.text2);
         let info = self.cleanup.bin;
-        let oldest = if info.oldest != 0 && !done { format!(" · oldest from {}", fmt::date(info.oldest, true)) } else { String::new() };
-        let s = format!("{} · {}{oldest}", fmt::size(info.bytes), items(info.count as usize));
+        let label = "Recycle Bin";
+        let meta = format!(" · {} · {}", fmt::size(info.bytes), items(info.count as usize));
+        let label_w = self.gfx.measure(label, Font::Ui, 13.0, 400);
+        let meta_w = self.gfx.measure(&meta, Font::Ui, 12.0, 400);
+        self.gfx.glyph(BIN_GLYPH, Rect::new(r.x, r.y, 16.0, r.h), 16.0, t.text3);
+        let x = r.x + 24.0;
+        self.cleanup_label(label, Rect::new(x, r.y, label_w + 2.0, r.h), 13.0, 400, t.text2);
+        self.cleanup_label(&meta, Rect::new(x + label_w, r.y, meta_w + 2.0, r.h), 12.0, 400, t.text3);
+        let open_w = self.gfx.measure("Open", Font::Ui, 13.0, 400);
+        let b = Rect::new(x + label_w + meta_w + 10.0, r.y, open_w + 2.0, r.h);
+        self.cleanup_label("Open", b, 13.0, 400, t.accent_text);
+        if self.hov(hit(Bin)) {
+            self.gfx.line(b.x, b.cy() + 7.0, b.x + open_w, b.cy() + 7.0, t.accent_text, 1.0);
+        }
+        self.hit(intersect(b, list), hit(Bin));
+    }
+
+    fn paint_cleanup_done_bin(&mut self, r: Rect, list: Rect, t: &Theme) {
+        if !r.intersects(&list) { return; }
+        let info = self.cleanup.bin;
+        let s = format!("{} · {}", fmt::size(info.bytes), items(info.count as usize));
+        self.gfx.glyph(BIN_GLYPH, Rect::new(r.x + 12.0, r.y, 36.0, r.h), 16.0, t.text2);
         self.cleanup_label("Recycle Bin", Rect::new(r.x + 60.0, r.y + 9.0, r.w - 125.0, 20.0), 13.0, 600, t.text);
-        self.cleanup_label(&s, Rect::new(r.x + 60.0, r.y + 29.0, r.w - if done { 228.0 } else { 130.0 }, 16.0), 12.0, 400, t.text2);
-        let b = Rect::new(r.r() - if done { 158.0 } else { 68.0 }, r.y + 12.0, if done { 146.0 } else { 56.0 }, 30.0);
-        if b.y >= list.y && b.b() <= list.b() {
-            if done && info.count > 0 {
-                self.button(b, "Empty Recycle Bin", 0xE74D, Btn::Std, hit(Empty), t);
-            } else if !done {
-                self.button(b, "Open", 0, Btn::Std, hit(Bin), t);
-            }
+        self.cleanup_label(&s, Rect::new(r.x + 60.0, r.y + 29.0, r.w - 228.0, 16.0), 12.0, 400, t.text2);
+        let b = Rect::new(r.r() - 158.0, r.y + 12.0, 146.0, 30.0);
+        if b.y >= list.y && b.b() <= list.b() && info.count > 0 {
+            self.button(b, "Empty Recycle Bin", 0xE74D, Btn::Std, hit(Empty), t);
         }
     }
 
@@ -560,15 +633,14 @@ impl App {
         self.cleanup_label(name, Rect::new(r.x + 69.0, r.y + 18.0, r.w - 121.0, 20.0), 14.5, 600, t.text);
         self.cleanup_label(why, Rect::new(r.x + 69.0, r.y + 39.0, r.w - 89.0, 16.0), 12.0, 400, t.text2);
         self.icon_btn(Rect::new(r.r() - 44.0, r.y + 12.0, 32.0, 32.0), 0xE711, 10.0, t.text2, hit(PanelClose), R_CTRL, t);
-        let (n, sub) = if group == 3 { (count(total.count), "folders".into()) } else { (fmt::size(total.bytes), items(total.count)) };
-        self.cleanup_number(&n, &sub, Rect::new(r.x + 21.0, r.y + 70.0, r.w - 41.0, 30.0), 22.0, t.text, t);
+        self.cleanup_number(&fmt::size(total.bytes), &items(total.count), Rect::new(r.x + 21.0, r.y + 70.0, r.w - 41.0, 30.0), 22.0, t.text, t);
         let all = Rect::new(r.x + 1.0, r.y + 118.0, r.w - 1.0, 38.0);
         self.gfx.fill(all, t.hover.a(t.hover.3 * self.hk(hit(All))));
         self.gfx.fill(Rect::new(all.x, all.y, all.w, 1.0), t.divider);
         self.gfx.fill(Rect::new(all.x, all.b() - 1.0, all.w, 1.0), t.divider);
         self.cleanup_checkbox(Rect::new(r.x + 20.0, all.y + 11.0, 16.0, 16.0), selected.count > 0, selected.count > 0 && selected.count != total.count, hit(All), t);
         self.cleanup_label(&format!("All {}", count(total.count)), Rect::new(r.x + 48.0, all.y, 120.0, all.h), 12.5, 400, t.text2);
-        let selected_text = if group == 3 { count(selected.count) } else { fmt::size(selected.bytes) };
+        let selected_text = fmt::size(selected.bytes);
         self.gfx.text(&format!("{selected_text} selected"), Rect::new(r.x + 170.0, all.y, (r.w - 190.0).max(0.0), all.h), Font::Ui, 12.5, 400, Align::Right, t.text3);
         if self.cleanup.can_select() { self.hit(intersect(c, all), hit(All)); }
         let list = Rect::new(r.x + 1.0, r.y + PANEL_HEAD, r.w - 1.0, (r.h - PANEL_HEAD - if overlay_pill { 70.0 } else { 0.0 }).max(0.0));
@@ -605,7 +677,8 @@ impl App {
                 let data = &p.tiles[group].rows[i];
                 let k = if notes { data.advice_at.map_or(f32::from(reviewing), |at| motion::since(at, Spring::Gentle, instant)) } else { 0.0 };
                 animating |= notes && data.advice_at.is_some() && k < 1.0;
-                p.offsets.push(p.offsets.last().copied().unwrap_or(4.0) + 52.0 + 18.0 * k);
+                let detail_line = if data.item.copy_of.is_some() || data.item.is_package_download() { 17.0 } else { 0.0 };
+                p.offsets.push(p.offsets.last().copied().unwrap_or(4.0) + 52.0 + detail_line + 18.0 * k);
             }
             p.rows_moving = animating;
         }
@@ -640,14 +713,15 @@ impl App {
         }
         self.cleanup_checkbox(Rect::new(r.x + 14.0, r.y + 18.0, 16.0, 16.0), row.on, false, h, t);
         let name = item_name(&row.item);
-        let is_dir = matches!(group, 2 | 3);
+        let package = row.item.is_package_download();
+        let is_dir = group == 2 && !package;
         let kind = crate::ficons::kind_of(&name, is_dir);
         self.item_icon(&row.item.path, &name, is_dir, kind, Rect::new(r.x + 40.0, r.y + 16.0, 20.0, 20.0), t);
         let x = r.x + 70.0;
         let rw = (r.w - 174.0).max(0.0);
         let nr = Rect::new(x, r.y + 8.0, rw, 18.0);
         let parent = row.item.path.parent();
-        if group == 2 && let Some(project) = parent.and_then(Path::file_name) {
+        if is_dir && let Some(project) = parent.and_then(Path::file_name) {
             let project = project.to_string_lossy();
             let pw = (self.gfx.measure(&project, Font::Ui, 13.0, 400) + 2.0).min(nr.w);
             self.cleanup_label(&project, Rect::new(nr.x, nr.y, pw, nr.h), 13.0, 400, t.text);
@@ -660,12 +734,20 @@ impl App {
             let path = middle_ellipsis(&path, rw, |s| self.gfx.measure(s, Font::Ui, 12.0, 400));
             self.cleanup_label(&path, Rect::new(x, r.y + 26.0, rw, 17.0), 12.0, 400, t.text3);
         }
-        let size = if group == 3 { "Empty".into() } else { fmt::size(row.item.size) };
+        let detail = row.item.copy_of.as_ref().map(|kept| format!("Copy of {}", kept.display()))
+            .or_else(|| package.then(|| row.item.reason.to_owned()));
+        let detail_line = if let Some(detail) = detail {
+            let width = if package { (r.r() - x - 14.0).max(0.0) } else { rw };
+            let detail = middle_ellipsis(&detail, width, |s| self.gfx.measure(s, Font::Ui, 12.0, 400));
+            self.cleanup_label(&detail, Rect::new(x, r.y + 43.0, width, 17.0), 12.0, 400, t.text2);
+            17.0
+        } else { 0.0 };
+        let size = fmt::size(row.item.size);
         let mut rr = Rect::new(r.r() - 100.0, r.y + 8.0, 86.0, 18.0);
-        self.gfx.text(&size, rr, Font::Ui, 13.0, 400, Align::Right, if group == 3 { t.text3 } else { t.text });
+        self.gfx.text(&size, rr, Font::Ui, 13.0, 400, Align::Right, t.text);
         rr.y += 18.0;
         self.gfx.text(&fmt::date(row.item.modified, false), rr, Font::Ui, 11.5, 400, Align::Right, t.text3);
-        if self.cleanup.show_notes && r.h > 53.0 {
+        if self.cleanup.show_notes && r.h > 53.0 + detail_line {
             self.gfx.clip(r);
             if let Some(advice) = &row.advice {
                 let k = self.cleanup_motion(row.advice_at, Spring::Gentle);
@@ -673,10 +755,10 @@ impl App {
                     Verdict::Safe => ("Safe", t.ok), Verdict::CheckFirst => ("Check first", t.warn), Verdict::Keep => ("Keep", t.danger),
                 };
                 let width = self.gfx.measure(verdict, Font::Ui, 12.0, 600) + 2.0;
-                self.cleanup_label(verdict, Rect::new(x, r.y + 46.0, width, 17.0), 12.0, 600, color.a(k));
-                self.cleanup_label(&advice.reason, Rect::new(x + width + 6.0, r.y + 46.0, (rw - width - 6.0).max(0.0), 17.0), 12.0, 400, t.text2.a(k));
+                self.cleanup_label(verdict, Rect::new(x, r.y + 46.0 + detail_line, width, 17.0), 12.0, 600, color.a(k));
+                self.cleanup_label(&advice.reason, Rect::new(x + width + 6.0, r.y + 46.0 + detail_line, (rw - width - 6.0).max(0.0), 17.0), 12.0, 400, t.text2.a(k));
             } else if self.cleanup.phase == Phase::Review {
-                self.cleanup_shimmer(Rect::new(x, r.y + 50.0, rw * 0.8, 9.0), t);
+                self.cleanup_shimmer(Rect::new(x, r.y + 50.0 + detail_line, rw * 0.8, 9.0), t);
             }
             self.gfx.unclip();
         }
@@ -728,7 +810,7 @@ impl App {
         if k < 1.0 { self.gfx.opacity_layer(list, k.max(0.05)); }
         let card = Rect::new(r.x, r.y, r.w, r.h - 46.0);
         self.cleanup_card(card, 0.0, t);
-        self.paint_cleanup_bin(Rect::new(r.x, r.y, r.w, 56.0), list, true, t);
+        self.paint_cleanup_done_bin(Rect::new(r.x, r.y, r.w, 56.0), list, t);
         for (i, (d, bytes)) in drives.iter().enumerate() {
             let y = r.y + 56.0 + i as f32 * 60.0;
             self.gfx.fill(Rect::new(r.x, y, r.w, 1.0), t.divider);
@@ -781,15 +863,19 @@ impl App {
         let Some(dialog) = &self.cleanup.dialog else { return };
         let screen = Rect::new(0.0, 0.0, self.w, self.h);
         let w = 468.0f32.min(self.w - 24.0);
-        let (title, groups, focus_cancel, ready, at, warnings) = match dialog {
-            Dialog::Move(c) => ("Move to Recycle Bin?", c.by_group, c.on_cancel, c.limits.is_some(), c.at, confirm_warnings(c)),
-            Dialog::Empty { on_cancel, at } => ("Empty Recycle Bin?", [Total::default(); 6], *on_cancel, true, *at, vec![]),
+        let (title, groups, drive_line, focus_cancel, ready, at, warnings) = match dialog {
+            Dialog::Move(c) => {
+                let line = c.by_drive.iter().map(|(d, total)| format!("{d}: {}", fmt::size(total.bytes))).collect::<Vec<_>>().join(" · ");
+                ("Move to Recycle Bin?", c.by_group, line, c.on_cancel, c.limits.is_some(), c.at, confirm_warnings(c))
+            }
+            Dialog::Empty { on_cancel, at } => ("Empty Recycle Bin?", [Total::default(); 6], String::new(), *on_cancel, true, *at, vec![]),
         };
         let empty = matches!(dialog, Dialog::Empty { .. });
         self.hit(screen, Hit::Block);
         let group_h = 30.0 * groups.iter().filter(|g| g.count > 0).count() as f32;
         let warn_h: f32 = warnings.iter().map(|(_, detail)| if detail.is_empty() { 36.0 } else { 52.0 }).sum();
-        let h = if empty { 170.0 } else { 208.0 + warn_h + group_h };
+        let drive_h = if drive_line.is_empty() { 0.0 } else { 22.0 };
+        let h = if empty { 170.0 } else { 208.0 + drive_h + warn_h + group_h };
         let k = self.cleanup_motion(Some(at), Spring::Bouncy).min(1.0);
         self.gfx.fill(screen, t.scrim.a(t.scrim.3 * k));
         let r = Rect::new((screen.w - w) * 0.5, (screen.h - h) * 0.5, w, h);
@@ -807,14 +893,17 @@ impl App {
         } else {
             let total = groups.iter().copied().fold(Total::default(), |mut a, b| { a.add(b); a });
             self.cleanup_number(&fmt::size(total.bytes), &items(total.count), Rect::new(x, r.y + 60.0, width, 38.0), 30.0, t.text, t);
-            let mut y = r.y + 108.0;
+            if drive_h > 0.0 {
+                self.cleanup_label(&drive_line, Rect::new(x, r.y + 99.0, width, drive_h), 13.0, 400, t.text2);
+            }
+            let mut y = r.y + 108.0 + drive_h;
             self.gfx.fill(Rect::new(x, y, width, 1.0), t.divider);
             y += 8.0;
             for (i, g) in groups.iter().enumerate().filter(|(_, g)| g.count > 0) {
                 self.gfx.glyph(GROUPS[i].2, Rect::new(x, y, 15.0, 30.0), 15.0, t.text3);
                 self.cleanup_label(GROUPS[i].0, Rect::new(x + 25.0, y, (width - 185.0).max(0.0), 30.0), 13.0, 400, t.text2);
                 self.gfx.text(&count(g.count), Rect::new(r.r() - 184.0, y, 70.0, 30.0), Font::Ui, 12.5, 400, Align::Right, t.text3);
-                self.gfx.text(&if i == 3 { "Empty".into() } else { fmt::size(g.bytes) }, Rect::new(r.r() - 104.0, y, 80.0, 30.0), Font::Ui, 13.0, 400, Align::Right, t.text);
+                self.gfx.text(&fmt::size(g.bytes), Rect::new(r.r() - 104.0, y, 80.0, 30.0), Font::Ui, 13.0, 400, Align::Right, t.text);
                 y += 30.0;
             }
             for (label, detail) in warnings {

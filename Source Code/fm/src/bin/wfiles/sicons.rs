@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Premultiplied BGRA pixels.
 pub type Img = (u32, u32, Vec<u8>);
@@ -45,6 +45,19 @@ pub fn bucket(px: f32) -> u32 {
     256
 }
 
+/// New menu icons use a separate type cache so every row has its Shell icon on first paint.
+pub fn new_item_icon(name: &'static str, px: u32, folder: bool) -> Option<Arc<fmcore::menu::Icon>> {
+    type Cache = HashMap<(&'static str, u32), Arc<fmcore::menu::Icon>>;
+    static ICONS: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let mut icons = ICONS.get_or_init(Mutex::default).lock().unwrap();
+    if let Some(icon) = icons.get(&(name, px)) {
+        return Some(icon.clone());
+    }
+    let icon = Arc::new(fmcore::menu::shgetfileinfo_type_icon(Path::new(name), px, folder)?);
+    icons.insert((name, px), icon.clone());
+    Some(icon)
+}
+
 /// Start the icon worker (one thread, its own COM apartment). `done` posts each result to the window.
 pub fn start(q: Queue, done: impl Fn(String, u32, Option<Img>) + Send + 'static) {
     std::thread::spawn(move || {
@@ -65,7 +78,7 @@ pub fn start(q: Queue, done: impl Fn(String, u32, Option<Img>) + Send + 'static)
 }
 
 /// The icon of a file at `px` pixels (shortcuts with the arrow, as Explorer draws them).
-pub fn load(path: &Path, px: u32) -> Option<Img> {
+fn load(path: &Path, px: u32) -> Option<Img> {
     // list sizes (up to 32 px): SHGetFileInfo, the system image list (Explorer's own icons, shortcut arrow
     // included); it is lighter than the image factory (about 4 MB less in memory). Bigger: the image factory.
     let i = if px <= 32 {

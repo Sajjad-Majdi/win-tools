@@ -12,14 +12,13 @@ use windows::core::PCWSTR;
 pub struct BinInfo {
     pub bytes: u64,
     pub count: u64,
-    pub oldest: u64,
 }
 
 fn bin_query(root: &str) -> Option<BinInfo> {
     let root = wide(root);
     let mut info = SHQUERYRBINFO { cbSize: size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
     unsafe { SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info) }.ok()?;
-    Some(BinInfo { bytes: info.i64Size.max(0) as u64, count: info.i64NumItems.max(0) as u64, oldest: 0 })
+    Some(BinInfo { bytes: info.i64Size.max(0) as u64, count: info.i64NumItems.max(0) as u64 })
 }
 
 pub fn bin_info(roots: &[String]) -> BinInfo {
@@ -28,9 +27,6 @@ pub fn bin_info(roots: &[String]) -> BinInfo {
         if let Some(info) = bin_query(root) {
             out.bytes += info.bytes;
             out.count += info.count;
-            if let Some(r) = recycle::list_bin(Path::new(root)).last() {
-                out.oldest = if out.oldest == 0 { r.deleted } else { out.oldest.min(r.deleted) };
-            }
         }
     }
     out
@@ -109,10 +105,14 @@ fn move_one(item: &Item, rules: &Rules) -> Result<(), Skip> {
     }
     let facts = rules.check(&item.path, &name, &mut HashMap::new())
         .ok_or_else(|| if in_use(&item.path) { Skip::InUse } else { Skip::Refused })?;
-    if facts.modified != item.modified || (!facts.is_dir() && facts.size != item.size) {
+    if facts.modified != item.modified || (!facts.is_dir() && (facts.size != item.size || facts.links != 1)) {
         return Err(Skip::Changed);
     }
     if facts.is_dir() && can_recycle(rules, &item.path) != Some(item.size) {
+        return Err(Skip::Changed);
+    }
+    if let Some(kept) = &item.copy_of && !super::duplicates::still_duplicate(item, kept, rules)
+    {
         return Err(Skip::Changed);
     }
     recycle_one(&item.path).map_err(|e| match e.code() {
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn known_bin_limits_refuse_oversize_and_missing_bins() {
         let mut limits = HashMap::from([("C:\\".into(), Ok(Some(100))), ("D:\\".into(), Err(Skip::NoBin))]);
-        let item = |path: &str, size| Item { path: path.into(), size, modified: 0, reason: "" };
+        let item = |path: &str, size| Item { path: path.into(), size, modified: 0, reason: "", copy_of: None };
         assert_eq!(check_limit(&item(r"C:\Temp\fits", 100), &mut limits), Ok("C:\\".into()));
         assert_eq!(check_limit(&item(r"C:\Temp\too-big", 101), &mut limits), Err(Skip::TooBig));
         assert_eq!(check_limit(&item(r"D:\Temp\no-bin", 1), &mut limits), Err(Skip::NoBin));

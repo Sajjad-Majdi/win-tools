@@ -305,6 +305,12 @@ impl Search {
     pub fn new(text: &str, pc: bool) -> Search {
         Search { ai: None, done_words: String::new(), pending_words: String::new(), field: Field::new(text), pc, ftype: 0, fsize: 0, fdate: 0, items: vec![], total: 0, seq: 0, busy: false, note: String::new(), all: vec![], junk: false, open: HashSet::new(), own: vec![] }
     }
+    pub fn next_request(&mut self) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.seq
+    }
     /// Rank `all` into the rows shown (after a toggle or an opened "N more" row).
     pub fn rearrange(&mut self) {
         self.items = crate::rank::arrange(&self.all, self.field.text.trim(), &self.own, self.junk, &self.open, fmcore::util::now_ft());
@@ -347,6 +353,21 @@ impl Search {
     }
 }
 
+pub struct HistoryEntry {
+    pub loc: Loc,
+    search: Option<Box<SearchView>>,
+}
+
+pub struct SearchView {
+    search: Search,
+    sel: HashSet<PathBuf>,
+    focus: Option<usize>,
+    anchor: Option<usize>,
+    scroll: f32,
+    kb: bool,
+    saved_at: Instant,
+}
+
 pub struct Pane {
     pub loc: Loc,
     pub items: Vec<Item>,
@@ -355,8 +376,8 @@ pub struct Pane {
     pub anchor: Option<usize>,
     pub scroll: f32,
     pub sort: (SortCol, bool),
-    pub back: Vec<Loc>,
-    pub fwd: Vec<Loc>,
+    pub back: Vec<HistoryEntry>,
+    pub fwd: Vec<HistoryEntry>,
     pub search: Option<Search>,
     pub seq: u64,
     pub loading: bool,
@@ -407,6 +428,35 @@ impl Pane {
             sel_fade: std::collections::HashMap::new(),
             slide: None,
         }
+    }
+    fn history_entry(&mut self) -> HistoryEntry {
+        let search = if self.searching() {
+            let mut search = self.search.take().unwrap();
+            if std::mem::take(&mut search.busy) {
+                search.note.clear();
+                search.pending_words.clear();
+                search.done_words.clear();
+                search.seq = 0;
+            }
+            Some(Box::new(SearchView {
+                search, sel: std::mem::take(&mut self.sel), focus: self.focus,
+                anchor: self.anchor, scroll: self.scroll, kb: self.kb, saved_at: Instant::now(),
+            }))
+        } else { None };
+        HistoryEntry { loc: self.loc.clone(), search }
+    }
+
+    pub fn restore_search(&mut self, view: SearchView) {
+        self.search = Some(view.search);
+        self.sel = view.sel;
+        self.focus = view.focus;
+        self.anchor = view.anchor;
+        self.scroll = view.scroll;
+        self.sf.set(view.scroll);
+        self.sf_written = view.scroll;
+        self.kb = view.kb;
+        self.want = None;
+        self.loading = false;
     }
     /// The rows currently shown: search results in search mode, else the folder.
     pub fn rows(&self) -> &Vec<Item> {
@@ -465,6 +515,55 @@ pub struct Tab {
 }
 
 impl Tab {
+    pub fn visit(&mut self, p: usize, loc: Loc, history: bool) {
+        let pane = &mut self.panes[p];
+        let searching = history && pane.searching();
+        if history && (pane.loc != loc || searching) {
+            let old = pane.history_entry();
+            pane.back.push(old);
+            pane.fwd.clear();
+        }
+        pane.back_anim = false;
+        pane.loc = loc;
+        if searching { self.trim_search_history(); }
+    }
+
+    pub fn step(&mut self, p: usize, back: bool) -> Option<HistoryEntry> {
+        let pane = &mut self.panes[p];
+        let entry = if back { pane.back.pop() } else { pane.fwd.pop() }?;
+        let old = pane.history_entry();
+        let added_search = old.search.is_some() && entry.search.is_none();
+        if back {
+            pane.want = old.loc.path().map(Path::to_path_buf);
+            pane.fwd.push(old);
+        } else {
+            pane.back.push(old);
+        }
+        pane.loc = entry.loc.clone();
+        pane.back_anim = back;
+        if added_search { self.trim_search_history(); }
+        Some(entry)
+    }
+
+    fn trim_search_history(&mut self) {
+        const MAX_SEARCHES: usize = 5;
+        let mut searches = Vec::new();
+        for (p, pane) in self.panes.iter().enumerate() {
+            for (forward, entries) in [(false, &pane.back), (true, &pane.fwd)] {
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(view) = &entry.search {
+                        searches.push((view.saved_at, p, forward, i));
+                    }
+                }
+            }
+        }
+        if searches.len() > MAX_SEARCHES {
+            let (_, p, forward, i) = *searches.iter().min().unwrap();
+            let pane = &mut self.panes[p];
+            if forward { pane.fwd.remove(i); } else { pane.back.remove(i); }
+        }
+    }
+
     pub fn pane(&self) -> &Pane {
         &self.panes[self.active.min(self.panes.len() - 1)]
     }
@@ -477,6 +576,89 @@ impl Tab {
     }
     pub fn title(&self) -> String {
         self.pane().loc.title()
+    }
+}
+
+impl HistoryEntry {
+    pub fn into_search(self) -> Option<Box<SearchView>> {
+        self.search
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn tab() -> Tab {
+        Tab { id: 1, panes: vec![Pane::new(Loc::ThisPc)], active: 0, view: View::Details, split_at: Instant::now() }
+    }
+
+    #[test]
+    fn back_and_forward_restore_normal_and_ai_search_views() {
+        for ai in [None, Some("AI kept these results".to_owned())] {
+            let mut tab = tab();
+            let base = Loc::Folder(r"C:\fixture".into());
+            tab.visit(0, base.clone(), true);
+            let row = Item {
+                name: "found folder".into(), path: r"C:\fixture\found folder".into(), is_dir: true,
+                size: None, modified: 0, attrs: 0, kind: Kind::Folder, folder: r"C:\fixture".into(),
+                hl: vec![], recycled: None, empty: true,
+            };
+            let mut search = Search::new("fixture", false);
+            search.ai = ai.clone();
+            search.items.push(row.clone());
+            search.all.push(row.clone());
+            search.total = 1;
+            search.ftype = 1;
+            search.open.insert("group".into());
+            let seq = search.next_request();
+            let pane = tab.pane_mut();
+            pane.search = Some(search);
+            pane.sel.insert(row.path.clone());
+            pane.focus = Some(0);
+            pane.anchor = Some(0);
+            pane.scroll = 75.0;
+            pane.kb = true;
+
+            // Opening a result's location can land in the same folder as the search scope.
+            tab.visit(0, base.clone(), true);
+            assert!(tab.pane().search.is_none());
+            let back = tab.step(0, true).unwrap().into_search().unwrap();
+            tab.pane_mut().restore_search(*back);
+            let pane = tab.pane();
+            let search = pane.search.as_ref().unwrap();
+            assert_eq!(pane.loc, base);
+            assert_eq!((pane.scroll, pane.focus, pane.anchor, pane.kb), (75.0, Some(0), Some(0), true));
+            assert_eq!(pane.sel, HashSet::from([row.path.clone()]));
+            assert_eq!(search.field.text, "fixture");
+            assert_eq!(search.ai, ai);
+            assert_eq!((search.total, search.ftype, search.seq), (1, 1, seq));
+            assert_eq!(search.items[0].path, row.path);
+            assert_eq!(search.all[0].path, row.path);
+            assert!(search.open.contains("group"));
+            assert!(tab.step(0, false).unwrap().into_search().is_none());
+            assert!(tab.step(0, true).unwrap().into_search().is_some());
+        }
+    }
+
+    #[test]
+    fn search_history_caps_both_panes_and_can_restore_forward() {
+        let mut tab = tab();
+        tab.panes.push(Pane::new(Loc::RecycleBin));
+        for i in 0..6 {
+            let p = i % 2;
+            tab.panes[p].search = Some(Search::new(&format!("query {i}"), false));
+            tab.visit(p, Loc::Folder(format!(r"C:\fixture{i}").into()), true);
+        }
+        assert_eq!(tab.panes.iter().flat_map(|p| &p.back).filter(|e| e.search.is_some()).count(), 5);
+        assert!(tab.panes[0].back.iter().all(|e| e.search.as_ref().is_none_or(|s| s.search.field.text != "query 0")));
+        let first = tab.step(1, true).unwrap().into_search().unwrap();
+        tab.panes[1].restore_search(*first);
+        let older = tab.step(1, true).unwrap().into_search().unwrap();
+        tab.panes[1].restore_search(*older);
+        let newer = tab.step(1, false).unwrap().into_search().unwrap();
+        assert_eq!(newer.search.field.text, "query 5");
+        assert_eq!(tab.panes[0].loc, Loc::Folder(r"C:\fixture4".into()));
     }
 }
 

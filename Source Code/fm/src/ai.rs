@@ -6,16 +6,33 @@
 //! - Only what Settings lists is sent: for a process its name, path, file description, publisher, window title and
 //!   command line (first 400 chars) plus the local checks; nothing else.
 //! - Honours HTTPS_PROXY / https_proxy, else the system (WinHTTP / Internet Options) proxy, so it works behind a VPN.
-//! - Model fixed: gemini-3.5-flash-lite (free tier, ~1.7 s per answer; Sajjad 2026-11-19: fast + free plan), thinking
-//!   "minimal", through generateContent (model id and thinking levels checked in the Gemini API docs 2026-11-19).
+//! - Gemini uses generateContent, with a short retry and an in-memory fallback when a model fails.
 //! Settings file %LOCALAPPDATA%\WinTools\ai.json: { "enabled": false, "lang": "en" | "fa" }.
 use crate::util::wide;
 use serde_json::{Value, json};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::PCWSTR;
 
 pub const MODEL: &str = "gemini-3.5-flash-lite";
-const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+const GOOGLE: &str = "https://generativelanguage.googleapis.com";
+const MODELS: [&str; 3] = [MODEL, "gemini-3.1-flash-lite", "gemini-4-hydrogen"];
+const FALLBACK_TTL: Duration = Duration::from_secs(10 * 60);
+
+struct Fallback {
+    base: String,
+    model: usize,
+    until: Instant,
+}
+
+impl Fallback {
+    fn preferred(&self, base: &str, now: Instant) -> Option<usize> {
+        (self.base == base && now < self.until).then_some(self.model)
+    }
+}
+
+static FALLBACK: Mutex<Option<Fallback>> = Mutex::new(None);
 pub const GET_KEY_URL: &str = "https://aistudio.google.com/apikey";
 /// shown next to the switch in Settings
 pub const SENT_NOTE: &str = "AI Search sends your search words and the names, folders and dates of up to 60 matches. AI Review sends the names, folders, sizes and dates of Cleanup items when you start a review. Both use your own Gemini key. Nothing is sent while AI features are off.";
@@ -59,11 +76,72 @@ fn features_ready(on: bool, has_key: impl FnOnce() -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn search_and_review_share_the_switch_and_key_gate() {
         assert!(!super::features_ready(false, || panic!("AI is off")));
         assert!(!super::features_ready(true, || false));
         assert!(super::features_ready(true, || true));
+    }
+
+    fn run_chain(base: &str, start: usize, replies: &[(u32, &str, Option<Duration>)])
+        -> (Result<(String, usize), String>, Vec<(String, bool)>, Vec<Duration>) {
+        let mut calls = vec![];
+        let mut waits = vec![];
+        let mut replies = replies.iter();
+        let result = gemini_chain(base, "fake", json!({"generationConfig": {"thinkingConfig": {}}}), start,
+            |url, headers, body, _| {
+                assert_eq!(headers, "fake");
+                calls.push((url.to_owned(), body.contains("thinkingConfig")));
+                let &(code, text, retry_after) = replies.next().expect("unexpected HTTP call");
+                Ok(Reply { code, text: text.into(), retry_after })
+            }, |delay| waits.push(delay));
+        assert!(replies.next().is_none());
+        (result, calls, waits)
+    }
+
+    const ANSWER: &str = r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"hidden"},{"text":"answer"}]}}]}"#;
+
+    #[test]
+    fn gemini_retries_busy_models_and_uses_the_relay_for_each_fallback() {
+        let relay = "https://relay.test";
+        let delay = Duration::from_secs(2);
+        let (out, calls, waits) = run_chain(relay, 0, &[
+            (503, "", Some(delay)), (504, "", None), (429, "", None),
+            (400, r#"{"error":{"message":"Unsupported thinkingConfig"}}"#, None), (200, ANSWER, None),
+        ]);
+        assert_eq!(out.unwrap(), ("answer".into(), 2));
+        let call = |i: usize, thinking| (format!("{relay}/v1beta/models/{}:generateContent", MODELS[i]), thinking);
+        assert_eq!(calls, [call(0, true), call(0, true), call(1, true), call(2, true), call(2, false)]);
+        assert_eq!(waits, [delay]);
+    }
+
+    #[test]
+    fn gemini_recovers_from_500_and_reports_error_after_all_three_models() {
+        let (out, calls, waits) = run_chain(GOOGLE, 0, &[(500, "", None), (200, ANSWER, None)]);
+        assert_eq!(out.unwrap(), ("answer".into(), 0));
+        assert_eq!(calls[0], calls[1]);
+        assert!((900..=1100).contains(&waits[0].as_millis()));
+        let (out, calls, waits) = run_chain(GOOGLE, 0, &[(429, "", None); 3]);
+        assert_eq!(out.unwrap_err(), "Free quota reached, try later.");
+        assert_eq!(calls.len(), 3);
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn gemini_fallback_preference_expires_and_stays_scoped_to_the_base() {
+        let now = Instant::now();
+        let f = Fallback { base: GOOGLE.into(), model: 2, until: now + FALLBACK_TTL };
+        assert_eq!(f.preferred(GOOGLE, now), Some(2));
+        assert_eq!(f.preferred("https://relay.test", now), None);
+        assert_eq!(f.preferred(GOOGLE, now + FALLBACK_TTL), None);
+        let (out, calls, _) = run_chain(GOOGLE, 2, &[(429, "", None), (200, ANSWER, None)]);
+        assert_eq!(out.unwrap(), ("answer".into(), 0));
+        assert!(calls[0].0.contains(MODELS[2]));
+        assert!(calls[1].0.contains(MODEL));
+        assert_eq!(retry_after(" 12 "), Some(Duration::from_secs(12)));
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(Duration::ZERO));
     }
 }
 
@@ -200,7 +278,29 @@ fn env_proxy() -> Option<String> {
     Some(p.rsplit('@').next().unwrap_or(p).to_string())
 }
 
-fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<(u32, String), String> {
+struct Reply {
+    code: u32,
+    text: String,
+    retry_after: Option<Duration>,
+}
+
+fn retry_after(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.trim().parse() {
+        return Some(Duration::from_secs(seconds));
+    }
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::SystemTimeToFileTime;
+    let mut time = SYSTEMTIME::default();
+    let mut file = FILETIME::default();
+    unsafe {
+        WinHttpTimeToSystemTime(PCWSTR(wide(value).as_ptr()), &mut time).ok()?;
+        SystemTimeToFileTime(&time, &mut file).ok()?;
+    }
+    let ticks = crate::util::ft_u64(file).saturating_sub(crate::util::now_ft());
+    Some(Duration::from_secs(ticks / 10_000_000) + Duration::from_nanos(ticks % 10_000_000 * 100))
+}
+
+fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Reply, String> {
     unsafe {
         let wurl = wide(url);
         let mut host = [0u16; 256];
@@ -242,6 +342,10 @@ fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<(u
         let mut status = 0u32;
         let mut sz = 4u32;
         let _ = WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, PCWSTR::null(), Some(&mut status as *mut u32 as *mut _), &mut sz, std::ptr::null_mut());
+        let mut retry = [0u16; 128];
+        let mut len = size_of_val(&retry) as u32;
+        let retry_after = WinHttpQueryHeaders(r, WINHTTP_QUERY_RETRY_AFTER, PCWSTR::null(), Some(retry.as_mut_ptr().cast()), &mut len, std::ptr::null_mut())
+            .ok().and_then(|()| retry_after(&crate::util::from_wide(&retry)));
         let mut out = vec![];
         loop {
             let mut avail = 0u32;
@@ -256,7 +360,7 @@ fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<(u
             out.extend_from_slice(&chunk[..got as usize]);
         }
         close();
-        Ok((status, String::from_utf8_lossy(&out).into_owned()))
+        Ok(Reply { code: status, text: String::from_utf8_lossy(&out).into_owned(), retry_after })
     }
 }
 
@@ -266,37 +370,85 @@ fn gemini(key: &str, system: &str, prompt: &str, max_tokens: u32) -> Result<Stri
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2, "maxOutputTokens": max_tokens,
             "thinkingConfig": {"thinkingLevel": "minimal"}}
-    })
-    .to_string();
+    });
     let mut headers = format!("Content-Type: application/json\r\nx-goog-api-key: {key}\r\n");
     // where Google is blocked (Iran): the relay from Settings, else from the environment (never in the code)
-    let endpoint = match relay() {
+    let base = match relay() {
         Some(r) => {
             if let Some(secret) = &r.secret {
                 headers += &format!("{}: {secret}\r\n", r.header);
             }
-            format!("{}/v1beta/models/{MODEL}:generateContent", r.url.trim_end_matches('/'))
+            r.url.trim_end_matches('/').to_string()
         }
-        None => ENDPOINT.to_string(),
+        None => GOOGLE.to_string(),
     };
-    let (mut code, mut text) = http_post(&endpoint, &headers, &body, 40000)?;
-    // "high demand" (503) is usually gone a moment later: one more try
-    if code == 503 {
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        (code, text) = http_post(&endpoint, &headers, &body, 40000)?;
+    let start = FALLBACK.lock().unwrap().as_ref().and_then(|f| f.preferred(&base, Instant::now())).unwrap_or(0);
+    let (answer, model) = gemini_chain(&base, &headers, body, start, http_post, std::thread::sleep)?;
+    let mut fallback = FALLBACK.lock().unwrap();
+    if model == 0 {
+        if fallback.as_ref().is_some_and(|f| f.base == base) {
+            *fallback = None;
+        }
+    } else if model != start {
+        *fallback = Some(Fallback { base, model, until: Instant::now() + FALLBACK_TTL });
     }
-    if code != 200 {
-        let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string())).unwrap_or_default();
-        return Err(match code {
-            400 if msg.to_lowercase().contains("api key") => "the API key is not valid".into(),
-            // an HTML 403 with no message = Google blocks this region: a relay helps
-            403 if msg.is_empty() => "Google blocks Gemini from this region: add a relay in Settings > Search and AI".into(),
-            403 => format!("Gemini refused the request (HTTP 403: {msg})"),
-            429 => "Free quota reached, try later.".into(),
-            _ => format!("Gemini error HTTP {code}{}", if msg.is_empty() { String::new() } else { format!(": {msg}") }),
-        });
+    Ok(answer)
+}
+
+fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
+    mut post: impl FnMut(&str, &str, &str, i32) -> Result<Reply, String>, mut wait: impl FnMut(Duration)) -> Result<(String, usize), String> {
+    let thinking = body.to_string();
+    body["generationConfig"].as_object_mut().unwrap().remove("thinkingConfig");
+    let plain = body.to_string();
+    let mut error = String::new();
+    for i in (start..MODELS.len()).chain(0..start) {
+        let url = format!("{base}/v1beta/models/{}:generateContent", MODELS[i]);
+        let mut request = &thinking;
+        let mut retried = false;
+        loop {
+            let Reply { code, text, retry_after } = match post(&url, headers, request, 40000) {
+                Ok(reply) => reply,
+                Err(e) => { error = e; break; }
+            };
+            if code == 200 {
+                match gemini_text(&text) {
+                    Ok(answer) => return Ok((answer, i)),
+                    Err(e) => { error = e; break; }
+                }
+            }
+            if matches!(code, 500 | 503 | 504) && !retried {
+                let jitter = (crate::util::now_ft() / 10_000) % 201;
+                // a long Retry-After is not worth waiting for: the next model is tried instead
+                wait(retry_after.unwrap_or_else(|| Duration::from_millis(900 + jitter)).min(Duration::from_secs(3)));
+                retried = true;
+                continue;
+            }
+            let parsed = serde_json::from_str::<Value>(&text).unwrap_or_default();
+            let msg = parsed["error"]["message"].as_str().unwrap_or_default();
+            let lower = msg.to_ascii_lowercase();
+            if i != 0 && code == 400 && std::ptr::eq(request, &thinking)
+                && ["thinkingconfig", "thinking_config", "thinkinglevel", "thinking level", "thinking config"].iter().any(|term| lower.contains(term))
+            {
+                request = &plain;
+                continue;
+            }
+            error = match code {
+                400 if lower.contains("api key") => "the API key is not valid".into(),
+                // An HTML 403 with no message usually means Google blocks this region.
+                403 if msg.is_empty() => "Google blocks Gemini from this region: add a relay in Settings > Search and AI".into(),
+                403 => format!("Gemini refused the request (HTTP 403: {msg})"),
+                429 => "Free quota reached, try later.".into(),
+                _ if msg.is_empty() => format!("Gemini error HTTP {code}"),
+                _ => format!("Gemini error HTTP {code}: {msg}"),
+            };
+            break;
+        }
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Err(error)
+}
+
+fn gemini_text(text: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let parts = v["candidates"][0]["content"]["parts"].as_array().cloned().unwrap_or_default();
     let out: String = parts.iter().filter(|p| !p["thought"].as_bool().unwrap_or(false)).filter_map(|p| p["text"].as_str()).collect();
     if out.is_empty() { Err("empty answer".into()) } else { Ok(out) }
