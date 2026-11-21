@@ -588,25 +588,36 @@ impl App {
         if self.side_hidden() { 48.0 } else { 10.0 }
     }
 
-    fn cleanup_toolbar_width(&mut self) -> f32 {
-        if self.pane().loc == Loc::ThisPc {
-            46.0 + self.gfx.measure("Clean up", Font::Ui, 13.0, 400)
+    pub(crate) fn toolbar_compact(&self) -> bool {
+        self.w < 1000.0
+    }
+
+    fn toolbar_action_width(&mut self, label: &str) -> f32 {
+        if self.toolbar_compact() { 34.0 } else { 46.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) }
+    }
+
+    fn toolbar_action(&mut self, r: Rect, label: &str, glyph: u32, enabled: bool, hit: Hit, t: &Theme) {
+        if self.toolbar_compact() {
+            self.icon_btn(r, glyph, 14.0, if enabled { t.text } else { t.text_dis }, hit, R_CTRL, t);
         } else {
-            0.0
+            self.button(r, label, glyph, if enabled { Btn::Ghost } else { Btn::Disabled }, hit, t);
         }
     }
 
+    fn toolbar_widths(&mut self) -> (f32, f32, f32) {
+        let this_pc = self.pane().loc == Loc::ThisPc;
+        let cleanup = if this_pc { self.toolbar_action_width("Clean up") } else { 0.0 };
+        let new = if this_pc || self.w >= 560.0 { self.toolbar_action_width("New") } else { 0.0 };
+        let view = if self.toolbar_compact() { 34.0 } else { 53.0 };
+        (cleanup, new, view)
+    }
+
     pub fn omni_rect(&mut self) -> Rect {
-        let narrow = self.w < 1000.0;
-        let tiny = self.w < 560.0;
-        let vw = if narrow { 34.0 } else { 53.0 };
-        let nw = if tiny && self.pane().loc != Loc::ThisPc { 0.0 } else if narrow { 34.0 } else { 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0 };
-        let vx = self.w - 10.0 - vw;
-        let cw = self.cleanup_toolbar_width();
-        let nx = vx - 4.0 - nw - if cw > 0.0 { cw + 4.0 } else { 0.0 };
+        let (cw, nw, vw) = self.toolbar_widths();
+        let nx = self.w - 10.0 - vw - 4.0 - nw - if cw > 0.0 { cw + 4.0 } else { 0.0 };
         // very narrow: no forward button
-        let x0 = self.nav_x() + if tiny { 82.0 } else { 120.0 };
-        Rect::new(x0, TITLE_H + 7.0, (nx - 4.0 - 6.0 - x0).max(60.0), 34.0)
+        let x0 = self.nav_x() + if self.w < 560.0 { 82.0 } else { 120.0 };
+        Rect::new(x0, TITLE_H + 7.0, (nx - 10.0 - x0).max(60.0), 34.0)
     }
 
     fn crumbs(&self) -> Vec<(String, Loc)> {
@@ -664,36 +675,27 @@ impl App {
         }
         self.icon_btn(Rect::new(nx0 + if tiny { 38.0 } else { 76.0 }, y, 34.0, 32.0), 0xE74A, 16.0, if can_up { t.text } else { t.text_dis }, Hit::Up, R_CTRL, t);
         let o = self.omni_rect();
-        let narrow = self.w < 1000.0;
+        let narrow = self.toolbar_compact();
         // Cleanup, New and View buttons.
         let mut nx = o.r() + 10.0;
-        let cw = self.cleanup_toolbar_width();
+        let (cw, nw, vw) = self.toolbar_widths();
         if cw > 0.0 {
-            self.button(Rect::new(nx, y, cw, 32.0), "Clean up", crate::cleanup_page::BROOM, Btn::Ghost,
+            self.toolbar_action(Rect::new(nx, y, cw, 32.0), "Clean up", crate::cleanup_page::BROOM, true,
                 Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
             nx += cw + 4.0;
         }
-        let vx;
-        if tiny && cw == 0.0 {
-            vx = nx;
-            let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
-        } else if narrow {
-            let c = if self.pane().loc.path().is_some() { t.text } else { t.text_dis };
-            self.icon_btn(Rect::new(nx, y, 34.0, 32.0), 0xE710, 14.0, c, Hit::New, R_CTRL, t);
-            vx = nx + 34.0 + 4.0;
-            let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-            self.icon_btn(Rect::new(vx, y, 34.0, 32.0), g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
+        if nw > 0.0 {
+            // New makes items only inside a folder.
+            self.toolbar_action(Rect::new(nx, y, nw, 32.0), "New", 0xE710, self.pane().loc.path().is_some(), Hit::New, t);
+            nx += nw + 4.0;
+        }
+        let vr = Rect::new(nx, y, vw, 32.0);
+        let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
+        if narrow {
+            self.icon_btn(vr, g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
         } else {
-            let nw = 12.0 + 14.0 + 8.0 + self.gfx.measure("New", Font::Ui, 13.0, 400) + 12.0;
-            let r = Rect::new(nx, y, nw, 32.0);
-            // New makes items only inside a folder (not on This PC, the Recycle Bin or Settings)
-            self.button(r, "New", 0xE710, if self.pane().loc.path().is_some() { Btn::Ghost } else { Btn::Disabled }, Hit::New, t);
-            vx = nx + nw + 4.0;
-            let vr = Rect::new(vx, y, 53.0, 32.0);
             let open = self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false);
             self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
-            let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
             let off = cleanup || self.pane().loc == Loc::Settings;
             self.gfx.glyph(g, Rect::new(vr.x + 12.0, vr.y, 14.0, 32.0), 14.0, if off { t.text_dis } else { t.text });
             self.gfx.glyph(0xE70D, Rect::new(vr.x + 32.0, vr.y, 9.0, 32.0), 9.0, if off { t.text_dis } else { t.text2 });

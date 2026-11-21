@@ -10,7 +10,9 @@
 //! Settings file %LOCALAPPDATA%\WinTools\ai.json: { "enabled": false, "lang": "en" | "fa" }.
 use crate::util::wide;
 use serde_json::{Value, json};
-use std::sync::Mutex;
+use std::cell::UnsafeCell;
+use std::ffi::c_void;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::PCWSTR;
@@ -19,6 +21,10 @@ pub const MODEL: &str = "gemini-3.5-flash-lite";
 const GOOGLE: &str = "https://generativelanguage.googleapis.com";
 const MODELS: [&str; 3] = [MODEL, "gemini-3.1-flash-lite", "gemini-4-hydrogen"];
 const FALLBACK_TTL: Duration = Duration::from_secs(10 * 60);
+pub const FREE_QUOTA: &str = "Free quota reached, try later.";
+const CANCELLED: &str = "AI review cancelled";
+const UNREACHABLE: &str = "cannot reach Google Gemini (check the internet, VPN or proxy)";
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 struct Fallback {
     base: String,
@@ -90,7 +96,7 @@ mod tests {
         let mut calls = vec![];
         let mut waits = vec![];
         let mut replies = replies.iter();
-        let result = gemini_chain(base, "fake", json!({"generationConfig": {"thinkingConfig": {}}}), start,
+        let result = gemini_chain(base, "fake", json!({"generationConfig": {"thinkingConfig": {}}}), start, false,
             |url, headers, body, _| {
                 assert_eq!(headers, "fake");
                 calls.push((url.to_owned(), body.contains("thinkingConfig")));
@@ -102,6 +108,20 @@ mod tests {
     }
 
     const ANSWER: &str = r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"hidden"},{"text":"answer"}]}}]}"#;
+
+    #[test]
+    fn review_quota_reaches_the_scheduler_without_trying_another_model() {
+        for (code, text) in [(429, ""), (403, r#"{"error":{"message":"Free quota exceeded"}}"#)] {
+            let mut calls = 0;
+            let result = gemini_chain(GOOGLE, "fake", json!({"generationConfig": {}}), 0, true,
+                |_, _, _, _| {
+                    calls += 1;
+                    Ok(Reply { code, text: text.into(), retry_after: None })
+                }, |_| panic!("the scheduler owns quota retries"));
+            assert_eq!(result.unwrap_err(), FREE_QUOTA);
+            assert_eq!(calls, 1);
+        }
+    }
 
     #[test]
     fn gemini_retries_busy_models_and_uses_the_relay_for_each_fallback() {
@@ -300,7 +320,25 @@ fn retry_after(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(ticks / 10_000_000) + Duration::from_nanos(ticks % 10_000_000 * 100))
 }
 
-fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Reply, String> {
+struct Request {
+    session: *mut c_void,
+    connection: *mut c_void,
+    handle: *mut c_void,
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        unsafe {
+            for handle in [self.handle, self.connection, self.session] {
+                if !handle.is_null() {
+                    let _ = WinHttpCloseHandle(handle);
+                }
+            }
+        }
+    }
+}
+
+fn open_request(url: &str, timeout_ms: i32, flags: u32) -> Result<Request, String> {
     unsafe {
         let wurl = wide(url);
         let mut host = [0u16; 256];
@@ -317,28 +355,30 @@ fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Re
         let agent = wide("WinTools/0.1");
         let proxy = env_proxy().map(|p| wide(&p));
         let s = match &proxy {
-            Some(p) => WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_NAMED_PROXY, PCWSTR(p.as_ptr()), PCWSTR::null(), 0),
+            Some(p) => WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_NAMED_PROXY, PCWSTR(p.as_ptr()), PCWSTR::null(), flags),
             // system proxy: WinHTTP's own setting, else Internet Options (Windows 8.1+)
-            None => WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
+            None => WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), flags),
         };
         if s.is_null() {
             return Err("WinHttpOpen failed".into());
         }
         let _ = WinHttpSetTimeouts(s, 8000, 10000, timeout_ms, timeout_ms);
-        let c = WinHttpConnect(s, PCWSTR(host.as_ptr()), uc.nPort, 0);
-        let verb = wide("POST");
-        let r = WinHttpOpenRequest(c, PCWSTR(verb.as_ptr()), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE);
-        let close = || {
-            let _ = WinHttpCloseHandle(r);
-            let _ = WinHttpCloseHandle(c);
-            let _ = WinHttpCloseHandle(s);
-        };
-        let wh: Vec<u16> = headers.encode_utf16().collect();
-        let b = body.as_bytes();
-        if WinHttpSendRequest(r, Some(&wh), Some(b.as_ptr() as *const _), b.len() as u32, b.len() as u32, 0).is_err() || WinHttpReceiveResponse(r, std::ptr::null_mut()).is_err() {
-            close();
-            return Err("cannot reach Google Gemini (check the internet, VPN or proxy)".into());
+        let mut request = Request { session: s, connection: std::ptr::null_mut(), handle: std::ptr::null_mut() };
+        request.connection = WinHttpConnect(s, PCWSTR(host.as_ptr()), uc.nPort, 0);
+        if request.connection.is_null() {
+            return Err(UNREACHABLE.into());
         }
+        let verb = wide("POST");
+        request.handle = WinHttpOpenRequest(request.connection, PCWSTR(verb.as_ptr()), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE);
+        if request.handle.is_null() {
+            return Err(UNREACHABLE.into());
+        }
+        Ok(request)
+    }
+}
+
+fn reply_headers(r: *mut c_void) -> (u32, Option<Duration>) {
+    unsafe {
         let mut status = 0u32;
         let mut sz = 4u32;
         let _ = WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, PCWSTR::null(), Some(&mut status as *mut u32 as *mut _), &mut sz, std::ptr::null_mut());
@@ -346,6 +386,22 @@ fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Re
         let mut len = size_of_val(&retry) as u32;
         let retry_after = WinHttpQueryHeaders(r, WINHTTP_QUERY_RETRY_AFTER, PCWSTR::null(), Some(retry.as_mut_ptr().cast()), &mut len, std::ptr::null_mut())
             .ok().and_then(|()| retry_after(&crate::util::from_wide(&retry)));
+        (status, retry_after)
+    }
+}
+
+fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Reply, String> {
+    let request = open_request(url, timeout_ms, 0)?;
+    let r = request.handle;
+    unsafe {
+        let wh: Vec<u16> = headers.encode_utf16().collect();
+        let b = body.as_bytes();
+        if WinHttpSendRequest(r, Some(&wh), Some(b.as_ptr().cast()), b.len() as u32, b.len() as u32, 0).is_err()
+            || WinHttpReceiveResponse(r, std::ptr::null_mut()).is_err()
+        {
+            return Err(UNREACHABLE.into());
+        }
+        let (code, retry_after) = reply_headers(r);
         let mut out = vec![];
         loop {
             let mut avail = 0u32;
@@ -359,12 +415,94 @@ fn http_post(url: &str, headers: &str, body: &str, timeout_ms: i32) -> Result<Re
             }
             out.extend_from_slice(&chunk[..got as usize]);
         }
-        close();
-        Ok(Reply { code: status, text: String::from_utf8_lossy(&out).into_owned(), retry_after })
+        Ok(Reply { code, text: String::from_utf8_lossy(&out).into_owned(), retry_after })
+    }
+}
+
+// Each async request owns its buffers until WinHTTP's final HANDLE_CLOSING callback.
+// Only the calling worker uses or closes the handle.
+struct AsyncRequest {
+    events: mpsc::Sender<(u32, u32)>,
+    headers: Vec<u16>,
+    body: Vec<u8>,
+    read: UnsafeCell<[u8; 8192]>,
+}
+
+unsafe extern "system" fn http_status(_: *mut c_void, context: usize, status: u32, _: *mut c_void, len: u32) {
+    if context == 0 {
+        return;
+    }
+    let context = context as *mut AsyncRequest;
+    unsafe {
+        if status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING {
+            drop(Box::from_raw(context));
+        } else {
+            let _ = (*context).events.send((status, len));
+        }
+    }
+}
+
+fn http_post_cancellable(url: &str, headers: &str, body: &str, timeout_ms: i32, cancelled: &dyn Fn() -> bool) -> Result<Reply, String> {
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
+    let request = open_request(url, timeout_ms, WINHTTP_FLAG_ASYNC)?;
+    let r = request.handle;
+    let (send, events) = mpsc::channel();
+    let context = Box::into_raw(Box::new(AsyncRequest {
+        events: send, headers: headers.encode_utf16().collect(), body: body.as_bytes().to_vec(), read: UnsafeCell::new([0; 8192]),
+    }));
+    let wait = |expected| {
+        while !cancelled() {
+            match events.recv_timeout(CANCEL_POLL) {
+                Ok((status, len)) if status == expected => return Ok(len),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                _ => return Err(UNREACHABLE.to_string()),
+            }
+        }
+        Err(CANCELLED.to_string())
+    };
+    unsafe {
+        let id = context as usize;
+        let flags = WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING | WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE
+            | WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE | WINHTTP_CALLBACK_FLAG_READ_COMPLETE | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR;
+        if WinHttpSetOption(Some(r), WINHTTP_OPTION_CONTEXT_VALUE, Some(&id.to_ne_bytes())).is_err()
+            || WinHttpSetStatusCallback(r, Some(http_status), flags, 0).is_some_and(|cb| cb as usize == usize::MAX)
+        {
+            drop(Box::from_raw(context));
+            return Err(UNREACHABLE.into());
+        }
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        let body_len = (*context).body.len() as u32;
+        WinHttpSendRequest(r, Some(&(*context).headers), Some((*context).body.as_ptr().cast()), body_len, body_len, id)
+            .map_err(|_| UNREACHABLE.to_string())?;
+        wait(WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE)?;
+        WinHttpReceiveResponse(r, std::ptr::null_mut()).map_err(|_| UNREACHABLE.to_string())?;
+        wait(WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE)?;
+        let (code, retry_after) = reply_headers(r);
+        let mut out = vec![];
+        let read = (*context).read.get().cast::<u8>();
+        if code != 429 {
+            loop {
+                WinHttpReadData(r, read.cast(), 8192, std::ptr::null_mut()).map_err(|_| UNREACHABLE.to_string())?;
+                let len = wait(WINHTTP_CALLBACK_STATUS_READ_COMPLETE)? as usize;
+                if len == 0 {
+                    break;
+                }
+                out.extend_from_slice(std::slice::from_raw_parts(read, len));
+            }
+        }
+        Ok(Reply { code, text: String::from_utf8_lossy(&out).into_owned(), retry_after })
     }
 }
 
 fn gemini(key: &str, system: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
+    gemini_request(key, system, prompt, max_tokens, None)
+}
+
+fn gemini_request(key: &str, system: &str, prompt: &str, max_tokens: u32, cancelled: Option<&dyn Fn() -> bool>) -> Result<String, String> {
     let body = json!({
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -383,7 +521,21 @@ fn gemini(key: &str, system: &str, prompt: &str, max_tokens: u32) -> Result<Stri
         None => GOOGLE.to_string(),
     };
     let start = FALLBACK.lock().unwrap().as_ref().and_then(|f| f.preferred(&base, Instant::now())).unwrap_or(0);
-    let (answer, model) = gemini_chain(&base, &headers, body, start, http_post, std::thread::sleep)?;
+    let (answer, model) = gemini_chain(&base, &headers, body, start, cancelled.is_some(),
+        |url, headers, body, timeout| match cancelled {
+            Some(cancelled) => http_post_cancellable(url, headers, body, timeout, cancelled),
+            None => http_post(url, headers, body, timeout),
+        },
+        |delay| {
+            let until = Instant::now() + delay;
+            while !cancelled.is_some_and(|check| check()) {
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(if cancelled.is_some() { remaining.min(CANCEL_POLL) } else { remaining });
+            }
+        })?;
     let mut fallback = FALLBACK.lock().unwrap();
     if model == 0 {
         if fallback.as_ref().is_some_and(|f| f.base == base) {
@@ -395,7 +547,7 @@ fn gemini(key: &str, system: &str, prompt: &str, max_tokens: u32) -> Result<Stri
     Ok(answer)
 }
 
-fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
+fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize, stop_on_quota: bool,
     mut post: impl FnMut(&str, &str, &str, i32) -> Result<Reply, String>, mut wait: impl FnMut(Duration)) -> Result<(String, usize), String> {
     let thinking = body.to_string();
     body["generationConfig"].as_object_mut().unwrap().remove("thinkingConfig");
@@ -408,6 +560,7 @@ fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
         loop {
             let Reply { code, text, retry_after } = match post(&url, headers, request, 40000) {
                 Ok(reply) => reply,
+                Err(e) if e == CANCELLED => return Err(e),
                 Err(e) => { error = e; break; }
             };
             if code == 200 {
@@ -416,6 +569,12 @@ fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
                     Err(e) => { error = e; break; }
                 }
             }
+            let parsed = serde_json::from_str::<Value>(&text).unwrap_or_default();
+            let msg = parsed["error"]["message"].as_str().unwrap_or_default();
+            let lower = msg.to_ascii_lowercase();
+            if stop_on_quota && (code == 429 || lower.contains("free quota")) {
+                return Err(FREE_QUOTA.into());
+            }
             if matches!(code, 500 | 503 | 504) && !retried {
                 let jitter = (crate::util::now_ft() / 10_000) % 201;
                 // a long Retry-After is not worth waiting for: the next model is tried instead
@@ -423,9 +582,6 @@ fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
                 retried = true;
                 continue;
             }
-            let parsed = serde_json::from_str::<Value>(&text).unwrap_or_default();
-            let msg = parsed["error"]["message"].as_str().unwrap_or_default();
-            let lower = msg.to_ascii_lowercase();
             if i != 0 && code == 400 && std::ptr::eq(request, &thinking)
                 && ["thinkingconfig", "thinking_config", "thinkinglevel", "thinking level", "thinking config"].iter().any(|term| lower.contains(term))
             {
@@ -437,7 +593,7 @@ fn gemini_chain(base: &str, headers: &str, mut body: Value, start: usize,
                 // An HTML 403 with no message usually means Google blocks this region.
                 403 if msg.is_empty() => "Google blocks Gemini from this region: add a relay in Settings > Search and AI".into(),
                 403 => format!("Gemini refused the request (HTTP 403: {msg})"),
-                429 => "Free quota reached, try later.".into(),
+                429 => FREE_QUOTA.into(),
                 _ if msg.is_empty() => format!("Gemini error HTTP {code}"),
                 _ => format!("Gemini error HTTP {code}: {msg}"),
             };
@@ -469,11 +625,15 @@ pub fn complete(system: &str, prompt: &str) -> Result<String, String> {
 }
 
 pub(crate) fn complete_with_limit(system: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
+    complete_request(system, prompt, max_tokens, None)
+}
+
+pub(crate) fn complete_request(system: &str, prompt: &str, max_tokens: u32, cancelled: Option<&dyn Fn() -> bool>) -> Result<String, String> {
     if !enabled() {
         return Err("AI features are off (Settings > AI features)".into());
     }
     let key = load_key().ok_or("no API key saved")?;
-    gemini(&key, system, prompt, max_tokens)
+    gemini_request(&key, system, prompt, max_tokens, cancelled)
 }
 
 // ------------------------------------------------------------------------------------------------ file cache

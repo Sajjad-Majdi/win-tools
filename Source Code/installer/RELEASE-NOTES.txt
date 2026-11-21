@@ -1,4 +1,8 @@
-Rust Task Manager and Rust File Explorer 0.2.4: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.5: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.5
+- Rust File Explorer: AI Review sends several requests at once, so it finishes several times faster.
+- Rust File Explorer: in a narrow window the Clean up button shrinks to its icon, like New.
 
 New in 0.2.4
 - Rust File Explorer: Cleanup (the "Clean up" button on This PC). It finds space to free in about two seconds:

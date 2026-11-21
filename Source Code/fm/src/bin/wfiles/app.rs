@@ -834,9 +834,16 @@ impl App {
     }
 
     // ------------------------------------------------------------------ navigation
+    pub fn select_tab(&mut self, i: usize) {
+        self.cur = i;
+        if self.pane().loc != Loc::Cleanup {
+            self.stop_cleanup_review();
+        }
+    }
+
     pub fn new_tab(&mut self, loc: Loc) {
         if loc == Loc::Cleanup && let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::Cleanup) {
-            self.cur = i;
+            self.select_tab(i);
             self.invalidate();
             return;
         }
@@ -845,7 +852,7 @@ impl App {
         let tab = Tab { id: self.next_id, panes: vec![Pane::new(loc.clone())], active: 0, view, split_at: Instant::now() };
         let at = if self.tabs.is_empty() { 0 } else { self.cur + 1 };
         self.tabs.insert(at, tab);
-        self.cur = at;
+        self.select_tab(at);
         self.path_edit = None;
         self.load(self.cur, 0, false);
     }
@@ -865,7 +872,7 @@ impl App {
         }
         self.tabs.remove(i);
         if self.cur >= self.tabs.len() || self.cur > i {
-            self.cur = self.cur.saturating_sub(1).min(self.tabs.len() - 1);
+            self.select_tab(self.cur.saturating_sub(1).min(self.tabs.len() - 1));
         }
         self.whatis = None;
         self.invalidate();
@@ -893,7 +900,7 @@ impl App {
     pub fn go(&mut self, loc: Loc) {
         if self.pane().loc == Loc::Cleanup || loc == Loc::Cleanup {
             if loc == Loc::ThisPc && let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::ThisPc) {
-                self.cur = i;
+                self.select_tab(i);
                 self.invalidate();
             } else if self.pane().loc != loc {
                 self.new_tab(loc);
@@ -920,7 +927,7 @@ impl App {
 
     pub fn back(&mut self) {
         if let Some(i) = self.cleanup_back_tab() {
-            self.cur = i;
+            self.select_tab(i);
             self.invalidate();
             return;
         }
@@ -974,6 +981,9 @@ impl App {
             }
         }
         if t == self.cur {
+            if self.pane().loc != Loc::Cleanup {
+                self.stop_cleanup_review();
+            }
             self.path_edit = None;
             self.search_focus = false;
             self.inline = None;
@@ -2193,6 +2203,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                app.stop_cleanup_review();
                 // remember where we were (start page "Last session"), the tabs and the window's place
                 if let Some(p) = app.pane().loc.path() {
                     app.look.last = p.display().to_string();

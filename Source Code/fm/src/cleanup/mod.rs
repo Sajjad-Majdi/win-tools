@@ -4,7 +4,7 @@ mod duplicates;
 mod packages;
 mod protect;
 
-pub use classify::{Classification, REVIEW_BATCH, Verdict, classify, review};
+pub use classify::{Classification, REVIEW_BATCH, Verdict, classify, review, review_cancellable};
 mod move_items;
 pub use move_items::{BinInfo, MoveReport, Skip, bin_info, bin_limits, move_items};
 

@@ -7,10 +7,10 @@ use crate::gfx::Rect;
 use crate::model::Loc;
 use crate::motion::Follow;
 use fmcore::cleanup::{self, BinInfo, Classification, Group, GroupId, Item, MoveReport, Skip, Verdict};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+use std::time::{Duration, Instant};
 
 pub const BROOM: u32 = 0xEA99;
 const GROUPS: [(&str, &str, u32); 6] = [
@@ -169,6 +169,7 @@ pub struct Page {
     phase: Phase,
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
+    review_cancel: Option<Arc<ReviewCancel>>,
     scan_worker: Option<mpsc::Sender<ScanTask>>,
     waiting_for_drives: bool,
     scope: Option<Vec<String>>,
@@ -215,6 +216,9 @@ impl Page {
     fn next(&mut self) -> u64 {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(cancel) = self.review_cancel.take() {
+            cancel.stop();
         }
         self.generation += 1;
         self.generation
@@ -410,6 +414,76 @@ fn scan_worker() -> mpsc::Sender<ScanTask> {
     tx
 }
 
+#[derive(Default)]
+struct ReviewCancel(Mutex<bool>);
+
+impl ReviewCancel {
+    fn stopped(&self) -> bool {
+        *self.0.lock().unwrap()
+    }
+
+    fn stop(&self) {
+        *self.0.lock().unwrap() = true;
+    }
+
+    fn publish(&self, post: impl FnOnce()) {
+        // Serialize cancel with the actual post, then let the generation reject any already queued updates.
+        let stopped = self.0.lock().unwrap();
+        if !*stopped {
+            post();
+        }
+    }
+}
+
+fn review_batches(
+    count: usize, cancel: &ReviewCancel, retry_delay: Duration,
+    review: impl Fn(usize) -> Result<Vec<(usize, usize, Classification)>, String> + Sync,
+    mut post: impl FnMut(Update),
+) {
+    const POLL: Duration = Duration::from_millis(25);
+    std::thread::scope(|scope| {
+        let (send, replies) = mpsc::channel();
+        let mut pending = 0..count;
+        let mut retries = VecDeque::new();
+        let mut limit = 4;
+        let mut in_flight = 0;
+        let mut ready_at = Instant::now();
+        while !cancel.stopped() {
+            while in_flight < limit && Instant::now() >= ready_at && !cancel.stopped() {
+                let Some(batch) = retries.pop_front().or_else(|| pending.next()) else { break };
+                let (send, review) = (send.clone(), &review);
+                let started_at_limit = limit;
+                scope.spawn(move || {
+                    if !cancel.stopped() {
+                        let _ = send.send((batch, started_at_limit, review(batch)));
+                    }
+                });
+                in_flight += 1;
+            }
+            if in_flight == 0 && pending.is_empty() && retries.is_empty() {
+                cancel.publish(|| post(Update::Reviewed(Ok(()))));
+                break;
+            }
+            let Ok((batch, started_at_limit, result)) = replies.recv_timeout(POLL) else { continue };
+            in_flight -= 1;
+            match result {
+                Ok(rows) => cancel.publish(|| post(Update::Rated(rows))),
+                Err(e) if e == fmcore::ai::FREE_QUOTA && started_at_limit > 1 => {
+                    // Replies from the old tier may still arrive. Each tier can drop the cap only once.
+                    limit = limit.min(started_at_limit / 2);
+                    ready_at = Instant::now() + retry_delay;
+                    retries.push_back(batch);
+                }
+                Err(e) => {
+                    cancel.publish(|| post(Update::Reviewed(Err(e))));
+                    cancel.stop();
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn empty_confirmed(confirmed: bool, empty: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     if confirmed { empty() } else { Err("Empty Recycle Bin cancelled".into()) }
 }
@@ -475,7 +549,7 @@ impl App {
         }
         let was_open = self.tabs.iter().position(|t| t.pane().loc == Loc::Cleanup);
         if let Some(i) = was_open {
-            self.cur = i;
+            self.select_tab(i);
         } else {
             self.new_tab(Loc::Cleanup);
         }
@@ -594,7 +668,6 @@ impl App {
 
     fn cleanup_review_click(&mut self) {
         if self.ai_on && self.cleanup.phase == Phase::Results && self.cleanup.has_notes() {
-            self.cleanup.cache.clear();
             self.start_cleanup_scan(true);
         } else {
             self.start_cleanup_review();
@@ -605,18 +678,25 @@ impl App {
         if !self.ai_on || !matches!(self.cleanup.phase, Phase::Results | Phase::Done) {
             return;
         }
-        let mut work = vec![];
+        let mut items = vec![];
+        let mut positions = vec![];
+        let mut cached = vec![];
         for (g, tile) in self.cleanup.tiles.iter().enumerate() {
             for (i, row) in tile.rows.iter().enumerate() {
-                work.push((g, i, row.item.clone(), self.cleanup.cache.get(&cache_key(&row.item)).cloned()));
+                if let Some(advice) = self.cleanup.cache.get(&cache_key(&row.item)) {
+                    cached.push((g, i, advice.clone()));
+                } else {
+                    positions.push((g, i));
+                    items.push(row.item.clone());
+                }
             }
         }
-        if work.is_empty() {
+        if items.is_empty() && cached.is_empty() {
             return;
         }
         let id = self.cleanup.next();
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cleanup.cancel = Some(cancel.clone());
+        let cancel = Arc::new(ReviewCancel::default());
+        self.cleanup.review_cancel = Some(cancel.clone());
         self.cleanup.phase = Phase::Review;
         self.cleanup.show_notes = true;
         self.cleanup.review_done = 0;
@@ -629,26 +709,19 @@ impl App {
             }
             tile.recalc();
         }
+        if !cached.is_empty() {
+            self.cleanup.rate(cached);
+        }
         self.cleanup.sort_panel();
         let post = self.cleanup_post(id);
         std::thread::spawn(move || {
-            for batch in work.chunks(cleanup::REVIEW_BATCH) {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let missing: Vec<_> = batch.iter().filter(|r| r.3.is_none()).map(|r| r.2.clone()).collect();
-                let fresh = if missing.is_empty() { Ok(vec![]) } else { cleanup::review(&missing) };
-                let mut fresh = match fresh {
-                    Ok(items) => items.into_iter(),
-                    Err(e) => {
-                        post(Update::Reviewed(Err(e)));
-                        return;
-                    }
-                };
-                let rows = batch.iter().filter_map(|(g, i, _, cached)| Some((*g, *i, cached.clone().or_else(|| fresh.next())?))).collect();
-                post(Update::Rated(rows));
-            }
-            post(Update::Reviewed(Ok(())));
+            let size = cleanup::REVIEW_BATCH;
+            review_batches(items.len().div_ceil(size), &cancel, Duration::from_secs(2), |batch| {
+                let start = batch * size;
+                let end = (start + size).min(items.len());
+                let advice = cleanup::review_cancellable(&items[start..end], &|| cancel.stopped())?;
+                Ok(positions[start..end].iter().zip(advice).map(|(&(g, i), answer)| (g, i, answer)).collect())
+            }, post);
         });
         self.invalidate();
     }
@@ -1060,6 +1133,7 @@ impl App {
             return None;
         }
         Some(match h {
+            Entry if self.toolbar_compact() => "Clean up".into(),
             Entry => "Find items to clean up on these drives".into(),
             Rescan => "Scan again (F5)".into(),
             Stop if self.cleanup.phase == Phase::Scan => "Cancel scan (Esc)".into(),
@@ -1260,6 +1334,81 @@ mod tests {
         assert!(token.load(Ordering::Relaxed));
         assert!(!page.accepts(scan));
         assert!(page.accepts(review));
+    }
+
+    #[test]
+    fn review_batches_run_in_parallel_and_retry_quota_at_lower_limits() {
+        let cancel = ReviewCancel::default();
+        let (started, attempts) = mpsc::channel();
+        let (posted, updates) = mpsc::channel();
+        let timeout = Duration::from_secs(3);
+        let advice = Classification { verdict: Verdict::Safe, reason: "Test reason".into() };
+        std::thread::scope(|scope| {
+            scope.spawn(|| review_batches(4, &cancel, Duration::from_millis(40), |batch| {
+                let (answer, reply) = mpsc::channel::<Result<(), String>>();
+                started.send((batch, answer)).unwrap();
+                reply.recv_timeout(timeout).map_err(|e| e.to_string())?
+                    .map(|()| vec![(0, batch, advice.clone())])
+            }, |update| posted.send(update).unwrap()));
+            let take_attempts = |count| (0..count).map(|_| attempts.recv_timeout(timeout).unwrap()).collect::<BTreeMap<_, _>>();
+            let expect_rated = |batch| {
+                assert!(matches!(updates.recv_timeout(timeout).unwrap(), Update::Rated(rows) if rows == [(0, batch, advice.clone())]));
+            };
+            let first = take_attempts(4);
+            assert_eq!(first.keys().copied().collect::<Vec<_>>(), [0, 1, 2, 3]);
+            first[&3].send(Ok(())).unwrap();
+            expect_rated(3);
+            first[&2].send(Ok(())).unwrap();
+            expect_rated(2);
+            let quota = || Err(fmcore::ai::FREE_QUOTA.to_string());
+            first[&0].send(quota()).unwrap();
+            first[&1].send(quota()).unwrap();
+            let second = take_attempts(2);
+            assert_eq!(second.keys().copied().collect::<Vec<_>>(), [0, 1]);
+            second[&0].send(quota()).unwrap();
+            // The next retry must wait until the other request at the two-batch limit returns.
+            assert!(matches!(attempts.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+            second[&1].send(Ok(())).unwrap();
+            expect_rated(1);
+            let (batch, answer) = attempts.recv_timeout(timeout).unwrap();
+            assert_eq!(batch, 0);
+            answer.send(quota()).unwrap();
+            assert!(matches!(updates.recv_timeout(timeout).unwrap(), Update::Reviewed(Err(e)) if e == fmcore::ai::FREE_QUOTA));
+        });
+        assert!(updates.try_recv().is_err());
+        assert!(attempts.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_review_stops_workers_without_posting_late_results() {
+        let cancel = ReviewCancel::default();
+        let (started, attempts) = mpsc::channel();
+        let (posted, updates) = mpsc::channel();
+        let timeout = Duration::from_secs(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| review_batches(8, &cancel, Duration::from_secs(2), |batch| {
+                started.send(batch).unwrap();
+                let start = Instant::now();
+                while !cancel.stopped() && start.elapsed() < timeout {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(vec![])
+            }, |update| posted.send(update).unwrap()));
+            let mut batches: Vec<_> = (0..4).map(|_| attempts.recv_timeout(timeout).unwrap()).collect();
+            batches.sort_unstable();
+            assert_eq!(batches, [0, 1, 2, 3]);
+            cancel.stop();
+        });
+        assert!(updates.try_recv().is_err());
+        assert!(attempts.try_recv().is_err());
+    }
+
+    #[test]
+    fn review_stops_and_reports_a_non_quota_error_once() {
+        let cancel = ReviewCancel::default();
+        let mut updates = vec![];
+        review_batches(8, &cancel, Duration::ZERO, |_| Err("fake error".into()), |update| updates.push(update));
+        assert!(matches!(&updates[..], [Update::Reviewed(Err(e))] if e == "fake error"));
     }
 
     #[test]

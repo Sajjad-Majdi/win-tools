@@ -585,7 +585,7 @@ impl App {
             Act::TabDuplicate => {
                 let loc = self.tabs[i].pane().loc.clone();
                 if loc == Loc::Cleanup {
-                    self.cur = i;
+                    self.select_tab(i);
                     return;
                 }
                 let view = self.tabs[i].view;
@@ -595,7 +595,7 @@ impl App {
                 let at = (i + 1).min(self.tabs.len());
                 self.tabs.insert(at, t);
                 self.tabs[at].view = view;
-                self.cur = at;
+                self.select_tab(at);
             }
             Act::TabClose => self.close_tab(i),
             Act::TabCloseOthers => {
@@ -604,7 +604,7 @@ impl App {
                 }
                 let keep = self.tabs.remove(i);
                 self.tabs = vec![keep];
-                self.cur = 0;
+                self.select_tab(0);
                 self.whatis = None;
                 self.cleanup_tabs_changed();
             }
@@ -613,7 +613,7 @@ impl App {
                     return;
                 }
                 self.tabs.truncate(i + 1);
-                self.cur = self.cur.min(i);
+                self.select_tab(self.cur.min(i));
                 self.whatis = None;
                 self.cleanup_tabs_changed();
             }
@@ -813,7 +813,7 @@ impl App {
         let (url, header, _) = crate::ai::relay_saved();
         self.relay_fields = [Field::new(&url), Field::new(&header), Field::default()];
         if let Some(i) = self.tabs.iter().position(|t| t.pane().loc == Loc::Settings) {
-            self.cur = i;
+            self.select_tab(i);
         } else {
             self.new_tab(Loc::Settings);
         }
@@ -1339,7 +1339,7 @@ impl App {
                 self.cleanup_click(target, r, dbl);
             }
             Hit::Tab(i) => {
-                self.cur = i;
+                self.select_tab(i);
                 self.path_edit = None;
                 self.search_focus = false;
                 self.whatis = None;
@@ -2362,12 +2362,12 @@ impl App {
             }
             (TAB, true, s, _) => {
                 let n = self.tabs.len();
-                self.cur = if s { (self.cur + n - 1) % n } else { (self.cur + 1) % n };
+                self.select_tab(if s { (self.cur + n - 1) % n } else { (self.cur + 1) % n });
             }
             (k @ 0x31..=0x39, true, false, _) => {
                 let i = (k - 0x31) as usize;
                 if i < self.tabs.len() {
-                    self.cur = if k == 0x39 { self.tabs.len() - 1 } else { i };
+                    self.select_tab(if k == 0x39 { self.tabs.len() - 1 } else { i });
                 }
             }
             (k @ 0x31..=0x33, true, true, _) => {
@@ -4042,7 +4042,7 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
                     a.close_tab(i);
                 }
                 Some(n) => match n.parse::<usize>() {
-                    Ok(i) if i < a.tabs.len() => a.cur = i,
+                    Ok(i) if i < a.tabs.len() => a.select_tab(i),
                     _ => return err("tab new [path] | close [N] | N"),
                 },
                 None => return err("tab new [path] | close [N] | N"),
