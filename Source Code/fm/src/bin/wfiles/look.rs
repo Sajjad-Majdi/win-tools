@@ -12,7 +12,7 @@ pub const SIZES3: [&str; 3] = ["Small", "Medium", "Large"];
 pub const CORNERS: [&str; 2] = ["Rounded", "Square"];
 /// Accent presets (name, colour). The first entry of the picker is "Windows accent".
 pub const ACCENTS: [(&str, u32); 9] = [
-    ("Blue", 0x0067C0),
+    ("Blue", 0x2563EB),
     ("Teal", 0x00897B),
     ("Green", 0x2E8B3A),
     ("Purple", 0x7B4FC9),
@@ -128,7 +128,8 @@ impl Look {
             // (older files had "window_colour" / "hue": the palette now always comes from the accent)
             strength: u8_("colour_strength", d.strength, 2),
             theme,
-            accent: v["accent"].as_str().and_then(|s| u32::from_str_radix(s.trim_start_matches('#'), 16).ok()).filter(|c| *c <= 0xFFFFFF),
+            // the old Blue (0x0067C0, an azure that read as sky blue) becomes today's Blue
+            accent: v["accent"].as_str().and_then(|s| u32::from_str_radix(s.trim_start_matches('#'), 16).ok()).filter(|c| *c <= 0xFFFFFF).map(|c| if c == 0x0067C0 { ACCENTS[0].1 } else { c }),
             desktop: v["accent"].as_str() == Some("desktop"),
             density: u8_("density", d.density, 1),
             font: u8_("font", d.font, 2),

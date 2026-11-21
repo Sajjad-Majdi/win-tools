@@ -195,7 +195,7 @@ pub const PANEL_ALPHA: [f32; 4] = [1.0, 0.75, 0.5, 0.3];
 
 /// Accent presets offered in Settings (base colours; light and dark shades are derived).
 pub const PRESETS: [(&str, u32); 8] = [
-    ("Blue", 0x0078D4),
+    ("Blue", 0x2563EB),
     ("Purple", 0x8764B8),
     ("Pink", 0xC239B3),
     ("Red", 0xD13438),
@@ -234,6 +234,21 @@ pub fn from_hsl(h: f32, s: f32, l: f32) -> C {
     C(r + m, g + m, b + m, 1.0)
 }
 
+/// The old Blue preset (an azure that read as sky blue); saved settings that still hold it get today's Blue.
+pub const OLD_BLUE: u32 = 0x0078D4;
+
+/// Accent picker: where a colour sits in the colour field (hue 0..360, colourfulness 0..1).
+pub fn hs_of(rgb: u32) -> (f32, f32) {
+    let (h, s, _) = to_hsl(C::hex(rgb));
+    (h, s)
+}
+
+/// Accent picker: the colour at a place in the colour field (what `Gfx::spectrum` draws there).
+pub fn pick_rgb(h: f32, s: f32) -> u32 {
+    let c = from_hsl(h, s.clamp(0.0, 1.0), 0.5);
+    ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32
+}
+
 /// Hue of an RGB colour (0..360), for the custom accent picker.
 pub fn hue_of(rgb: u32) -> f32 {
     to_hsl(C::hex(rgb)).0
@@ -244,7 +259,9 @@ pub fn hue_of(rgb: u32) -> f32 {
 pub fn accent_pair(rgb: u32) -> (C, C) {
     let (h, s, _) = to_hsl(C::hex(rgb));
     let s2 = s.min(0.92);
-    (from_hsl(h, s2.max(0.35), 0.37), from_hsl(h, s2.max(0.45), 0.72))
+    // blues turn pale (periwinkle) at the shared dark-theme lightness: they go a little deeper, so they still read as blue
+    let deep = 0.07 * (1.0 - (h - 230.0).abs() / 45.0).max(0.0);
+    (from_hsl(h, s2.max(0.35), 0.37), from_hsl(h, s2.max(0.45), 0.72 - deep))
 }
 
 pub fn hex(c: C) -> String {

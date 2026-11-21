@@ -3,6 +3,11 @@ Rust Task Manager and Rust File Explorer 0.2.5: a fast Task Manager and a fast f
 New in 0.2.5
 - Rust File Explorer: AI Review sends several requests at once, so it finishes several times faster.
 - Rust File Explorer: in a narrow window the Clean up button shrinks to its icon, like New.
+- Both apps: the custom accent is a colour field now: click or drag to pick any colour, and the window follows at once
+  (the hex field stays for an exact colour).
+- Both apps: Blue is a true blue (it read as sky blue), also in dark mode.
+- Rust File Explorer: the Windows accent swatch shows the Windows mark, as in Rust Task Manager.
+- Rust File Explorer: no stale stripe in the window after a quick resize.
 
 New in 0.2.4
 - Rust File Explorer: Cleanup (the "Clean up" button on This PC). It finds space to free in about two seconds:

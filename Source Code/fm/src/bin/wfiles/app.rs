@@ -530,6 +530,10 @@ pub struct App {
     /// the OS can draw a backdrop (Windows 11 22H2+, not --no-mica)
     pub can_mica: bool,
     pub accent_field: Option<Field>,
+    /// Settings > Accent > Custom (open while `accent_field` is): the colour field's place and the place picked
+    /// (hue, colourfulness; kept so a grey keeps its hue)
+    pub pick_rect: Rect,
+    pub pick: (f32, f32),
 }
 
 /// Rubber-band selection: start in content coordinates (scroll included), end in window coordinates.
@@ -661,6 +665,22 @@ impl App {
             if self.can_mica {
                 let v: i32 = self.look.dwm_backdrop();
                 let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &v as *const i32 as *const _, 4);
+            }
+        }
+        if on != self.mica {
+            unsafe {
+                let old = SetClassLongPtrW(self.hwnd, GCLP_HBRBACKGROUND, class_brush(on, &self.t).0 as isize);
+                if old != 0 && old != GetStockObject(BLACK_BRUSH).0 as usize {
+                    let _ = DeleteObject(HGDIOBJ(old as _));
+                }
+                if on {
+                    // what Windows filled with the old colour would show through the panels: clear it
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(self.hwnd, &mut rc);
+                    let dc = GetDC(Some(self.hwnd));
+                    FillRect(dc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+                    ReleaseDC(Some(self.hwnd), dc);
+                }
             }
         }
         self.mica = on;
@@ -2123,6 +2143,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // minimised: nothing is drawn, so the pages can go back to Windows until it is restored
                 if wp.0 == SIZE_MINIMIZED as usize {
                     trim_memory();
+                } else if app.mica && app.gfx.composed() {
+                    // the window's own surface lies under the drawn frame: keep it transparent after every resize
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let dc = GetDC(Some(hwnd));
+                    FillRect(dc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+                    ReleaseDC(Some(hwnd), dc);
                 }
                 app.invalidate();
                 LRESULT(0)
@@ -2292,6 +2319,10 @@ pub fn run(o: Opts) -> i32 {
             _ => theme::system_dark(),
         });
         let t = theme::make(dark, look.accent, tint_for(&look), look.strength);
+        // Backdrop (Windows 11 22H2+): DWM draws Mica / Mica Alt / Acrylic where the window is transparent
+        let build = os_build();
+        let can_mica = !o.no_mica && build >= 22621 && std::env::var("WFILES_NO_MICA").is_err();
+        let mica = can_mica && look.backdrop != 3;
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_DBLCLKS,
@@ -2300,7 +2331,7 @@ pub fn run(o: Opts) -> i32 {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hIcon: LoadIconW(Some(inst.into()), PCWSTR(1 as _)).unwrap_or_default(),
             lpszClassName: cls,
-            hbrBackground: CreateSolidBrush(COLORREF(((t.layer.2 * 255.0) as u32) << 16 | ((t.layer.1 * 255.0) as u32) << 8 | (t.layer.0 * 255.0) as u32)),
+            hbrBackground: class_brush(mica, &t),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -2320,10 +2351,6 @@ pub fn run(o: Opts) -> i32 {
         let (ex, x, y) = if o.offscreen { (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000) } else { (WINDOW_EX_STYLE(0), (sw - w) / 2, (sh - h) / 2) };
         let Ok(hwnd) = CreateWindowExW(ex, cls, w!("Rust File Explorer"), style, x, y, w, h, None, None, Some(inst.into()), None) else { return 1 };
         set_dark_frame(hwnd, t.dark);
-        // Backdrop (Windows 11 22H2+): DWM draws Mica / Mica Alt / Acrylic where the window is transparent
-        let build = os_build();
-        let can_mica = !o.no_mica && build >= 22621 && std::env::var("WFILES_NO_MICA").is_err();
-        let mica = can_mica && look.backdrop != 3;
         if can_mica {
             let v: i32 = look.dwm_backdrop();
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &v as *const i32 as *const _, 4);
@@ -2452,6 +2479,8 @@ pub fn run(o: Opts) -> i32 {
             offscreen: o.offscreen,
             can_mica,
             accent_field: None,
+            pick_rect: Rect::default(),
+            pick: (221.0, 0.82),
         });
         let ptr = Box::into_raw(app);
         let app = &mut *ptr;
@@ -2591,6 +2620,19 @@ pub fn run(o: Opts) -> i32 {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         drop(Box::from_raw(ptr));
         0
+    }
+}
+
+/// What Windows fills the window's own (GDI) surface with when it grows. Under a see-through window that surface
+/// shows through the panels, so it must be transparent black there, or a stripe of the panel colour stays behind
+/// after a resize; an opaque window takes its panel colour (no white flash before the first frame).
+fn class_brush(see_through: bool, t: &Theme) -> HBRUSH {
+    unsafe {
+        if see_through {
+            HBRUSH(GetStockObject(BLACK_BRUSH).0)
+        } else {
+            CreateSolidBrush(COLORREF(((t.layer.2 * 255.0) as u32) << 16 | ((t.layer.1 * 255.0) as u32) << 8 | (t.layer.0 * 255.0) as u32))
+        }
     }
 }
 

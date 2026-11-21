@@ -339,6 +339,28 @@ impl Gfx {
         unsafe { self.rt().FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: rad, radiusY: rad }, self.b(c)) };
     }
 
+
+    /// The accent picker's colour field: every hue left to right, full colour at the top fading to grey at the bottom
+    /// (in HSL at lightness 0.5 that fade is a straight mix with grey, so two gradients draw it exactly).
+    pub fn spectrum(&self, r: Rect, rad: f32) {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let rr = D2D1_ROUNDED_RECT { rect: r.d2(), radiusX: super::theme::radius(rad, self.corner.get() > 0.5), radiusY: super::theme::radius(rad, self.corner.get() > 0.5) };
+        let hues = [0xFF0000u32, 0xFFFF00, 0x00FF00, 0x00FFFF, 0x0000FF, 0xFF00FF, 0xFF0000];
+        let across: Vec<D2D1_GRADIENT_STOP> = hues.iter().enumerate().map(|(i, c)| D2D1_GRADIENT_STOP { position: i as f32 / 6.0, color: C::hex(*c).d2() }).collect();
+        let down = [D2D1_GRADIENT_STOP { position: 0.0, color: C(0.5, 0.5, 0.5, 0.0).d2() }, D2D1_GRADIENT_STOP { position: 1.0, color: C(0.5, 0.5, 0.5, 1.0).d2() }];
+        for (stops, end) in [(&across[..], Vector2 { X: r.r(), Y: r.y }), (&down[..], Vector2 { X: r.x, Y: r.b() })] {
+            unsafe {
+                let Ok(coll) = self.rt().CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.x, Y: r.y }, endPoint: end };
+                if let Ok(br) = self.rt().CreateLinearGradientBrush(&props, None, &coll) {
+                    self.rt().FillRoundedRectangle(&rr, &br);
+                }
+            }
+        }
+    }
+
     pub fn stroke_round(&self, r: Rect, rad: f32, c: C, w: f32) {
         if c.3 <= 0.0 {
             return;

@@ -67,6 +67,8 @@ pub const STARTUP_SORT: [&str; 3] = ["Impact", "Name", "Starts from"];
 
 /// Rows a section shows before "Show N more".
 pub const ST_TOP: usize = 5;
+/// Settings > Accent > Custom: height of the colour picker row
+pub const PICK_H: f32 = 132.0;
 
 /// One drawn row of the startup page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -496,8 +498,7 @@ impl App {
         y += 18.0;
         self.gfx.text_at("Personalize", lx, y, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
         y += 28.0;
-        let n = 9 + self.custom_open as usize;
-        let card = Rect::new(lx, y, lw, 56.0 * n as f32);
+        let card = Rect::new(lx, y, lw, 56.0 * 9.0 + if self.custom_open { PICK_H } else { 0.0 });
         self.gfx.card(card, 8.0, t.card, t.card_s);
         let right = lx + lw - 16.0;
         let mut ry = y;
@@ -533,7 +534,7 @@ impl App {
         ry += 56.0;
         if self.custom_open {
             self.custom_row(lx + 48.0, ry, right, lx, lw);
-            ry += 56.0;
+            ry += PICK_H;
         }
         self.set_row(lx, lw, ry, true, 0xE8D2, "Text size", "");
         self.segmented(right, ry + 28.0, &["Small", "Medium", "Large"], self.prefs.font as usize, 6);
@@ -772,28 +773,24 @@ impl App {
         }
     }
 
-    /// Settings > Accent > Custom: hue strip and hex field.
+    /// Settings > Accent > Custom: a colour field (every hue across, full colour at the top to grey at the bottom),
+    /// picked by click or drag, and the hex field.
     fn custom_row(&mut self, x: f32, ry: f32, right: f32, lx: f32, lw: f32) {
         let t = self.t;
         self.gfx.hline(lx + 1.0, lx + lw - 1.0, ry, t.line);
         let fw = 104.0;
-        let hr = Rect::new(x, ry + 21.0, (right - fw - 16.0 - x).max(60.0), 14.0);
-        self.hue_rect = hr;
-        let n = 36;
-        for i in 0..n {
-            let seg = Rect::new(hr.x + hr.w * i as f32 / n as f32, hr.y, hr.w / n as f32 + 0.6, hr.h);
-            let c = super::theme::from_hsl(i as f32 * 360.0 / n as f32, 0.78, if t.dark { 0.62 } else { 0.45 });
-            self.gfx.fill(seg, c);
-        }
-        self.gfx.stroke_round(hr, 0.0, t.card_s, 1.0);
-        let hue = self.prefs.accent.map(super::theme::hue_of).unwrap_or(206.0);
-        let kx = hr.x + hr.w * hue / 359.0;
-        let (gx, _) = self.glide(0x6300, kx, super::motion::GLIDE);
-        self.gfx.fill_round(Rect::new(gx - 3.0, hr.y - 4.0, 6.0, hr.h + 8.0), 3.0, t.card);
-        self.gfx.stroke_round(Rect::new(gx - 3.0, hr.y - 4.0, 6.0, hr.h + 8.0), 3.0, t.t1, 1.5);
-        self.hit(hr.inset(0.0, -6.0), Hit::Hue);
+        let fr = Rect::new(x, ry + 14.0, (right - fw - 16.0 - x).max(60.0), PICK_H - 28.0);
+        self.hue_rect = fr;
+        self.gfx.spectrum(fr, 6.0);
+        self.gfx.stroke_round(fr, 6.0, t.card_s, 1.0);
+        let (h, s) = self.pick;
+        let (kx, ky) = (fr.x + fr.w * h / 360.0, fr.y + fr.h * (1.0 - s));
+        self.gfx.ellipse(kx, ky, 8.0, super::theme::from_hsl(h, s, 0.5), true, 0.0);
+        self.gfx.ellipse(kx, ky, 8.0, C(1.0, 1.0, 1.0, 1.0), false, 2.0);
+        self.gfx.ellipse(kx, ky, 9.5, C(0.0, 0.0, 0.0, 0.35), false, 1.0);
+        self.hit(fr.inset(-6.0, -6.0), Hit::Hue);
         // hex field
-        let fr = Rect::new(right - fw, ry + 12.0, fw, 32.0);
+        let fr = Rect::new(right - fw, ry + 14.0, fw, 32.0);
         let focus = self.hex_focus;
         self.gfx.fill_round(fr, 4.0, t.inp.mix(t.ctl_h, if focus { 0.0 } else { self.hov(Hit::HexField) }));
         self.input_ring(fr, Hit::HexField, focus);

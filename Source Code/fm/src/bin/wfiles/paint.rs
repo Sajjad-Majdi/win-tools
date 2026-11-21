@@ -11,6 +11,9 @@ use std::time::Instant;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// Settings > Accent > Custom: height of the colour picker under the swatches
+const PICK_H: f32 = 108.0;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Btn {
     Std,
@@ -1954,7 +1957,7 @@ impl App {
         y = r.b() + 12.0;
         // Personalize: theme, background, transparency, accent, corners
         let lk = self.look.clone();
-        let rows_h = 38.0 + 48.0 * 4.0 + 48.0 + 44.0 + if self.accent_field.is_some() { 44.0 } else { 0.0 } + 48.0 + 4.0;
+        let rows_h = 38.0 + 48.0 * 4.0 + 48.0 + 44.0 + if self.accent_field.is_some() { PICK_H } else { 0.0 } + 48.0 + 4.0;
         let r = Rect::new(lx, y, colw, rows_h);
         self.set_card(r, t);
         self.gfx.text("Personalize", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
@@ -2023,6 +2026,13 @@ impl App {
             if id == 50 && sel_i != 50 {
                 self.gfx.glyph(0xE710, sr, 10.0, t.text2);
             }
+            if id == 40 {
+                // the Windows accent: a small four-pane Windows mark in white (as in Task Manager)
+                let ink = C(1.0, 1.0, 1.0, 0.92);
+                for (dx, dy) in [(-4.0f32, -4.0f32), (0.5, -4.0), (-4.0, 0.5), (0.5, 0.5)] {
+                    self.gfx.fill(Rect::new(sr.cx() + dx, sr.cy() + dy, 3.5, 3.5), ink);
+                }
+            }
             if id == 52 {
                 // a small picture: the colour comes from the wallpaper
                 self.gfx.glyph(0xE91B, sr, 11.0, if self.desk.is_some() { C::hex(0xFFFFFF).a(0.9) } else { t.text2 });
@@ -2032,13 +2042,26 @@ impl App {
         }
         ry += 44.0;
         if let Some(f) = self.accent_field.clone() {
-            let fr = Rect::new(r.x + 46.0, ry, 130.0, 32.0);
+            // Custom: a colour field (every hue across, full colour at the top to grey at the bottom), picked by
+            // click or drag; the hex field and Apply beside it are for an exact colour
+            let fw = 120.0;
+            let hx = r.r() - 16.0 - fw;
+            let pr = Rect::new(r.x + 46.0, ry, (hx - 12.0 - r.x - 46.0).max(60.0), PICK_H - 12.0);
+            self.pick_rect = pr;
+            self.gfx.spectrum(pr, 6.0);
+            self.gfx.stroke_round(pr, 6.0, t.text.a(0.14), 1.0);
+            let (h, s) = self.pick;
+            let (kx, ky) = (pr.x + pr.w * h / 360.0, pr.y + pr.h * (1.0 - s));
+            self.gfx.ellipse(kx, ky, 8.0, C::hex(crate::theme::pick_rgb(h, s)), true, 0.0);
+            self.gfx.ellipse(kx, ky, 8.0, C(1.0, 1.0, 1.0, 1.0), false, 2.0);
+            self.gfx.ellipse(kx, ky, 9.5, C(0.0, 0.0, 0.0, 0.35), false, 1.0);
+            self.hit(pr.inset(-6.0, -6.0), Hit::Set(53));
+            let fr = Rect::new(hx, ry, fw, 32.0);
             self.field_box(fr, true, t);
             self.field_text(&f, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, true, t, &[]);
             self.hit(fr, Hit::Set(50));
-            let aw = self.gfx.measure("Apply", Font::Ui, 13.0, 400) + 26.0;
-            self.button(Rect::new(fr.r() + 8.0, ry, aw, 32.0), "Apply", 0, Btn::Accent, Hit::Set(51), t);
-            ry += 44.0;
+            self.button(Rect::new(hx, ry + 40.0, fw, 32.0), "Apply", 0, Btn::Accent, Hit::Set(51), t);
+            ry += PICK_H;
         }
         dd(self, ry, 0xE8B3, "Corners", crate::look::CORNERS[lk.square as usize], 25, false);
         y = r.b() + 12.0;

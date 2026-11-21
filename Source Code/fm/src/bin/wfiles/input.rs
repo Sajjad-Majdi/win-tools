@@ -922,6 +922,10 @@ impl App {
             self.invalidate();
             return;
         }
+        if down && self.pressed == Hit::Set(53) {
+            self.pick_at(x, y);
+            return;
+        }
         if self.marquee.is_some() {
             if let Some(m) = self.marquee.as_mut() {
                 m.x1 = x;
@@ -1322,8 +1326,11 @@ impl App {
         if self.relay_focus != 0 && !matches!(h, Hit::Set(90..=93)) {
             self.relay_focus = 0;
         }
-        if self.accent_field.is_some() && !matches!(h, Hit::Set(50) | Hit::Set(51)) {
+        if self.accent_field.is_some() && !matches!(h, Hit::Set(50) | Hit::Set(51) | Hit::Set(53)) {
             self.accent_commit();
+        }
+        if h == Hit::Set(53) {
+            self.pick_at(x, y);
         }
         if self.path_edit.is_some() && !matches!(h, Hit::Omni | Hit::Sug(_)) {
             self.path_edit = None;
@@ -3226,10 +3233,14 @@ impl App {
             50 => {
                 if self.accent_field.is_none() {
                     let cur = self.look.accent.map(|c| format!("#{c:06X}")).unwrap_or_else(|| "#".into());
+                    self.pick = crate::theme::hs_of(self.look.accent.unwrap_or(crate::look::ACCENTS[0].1));
                     let mut f = Field::new(&cur);
                     f.caret = cur.chars().count();
                     f.anchor = 0;
                     self.accent_field = Some(f);
+                } else {
+                    // the Custom swatch again closes the picker
+                    self.accent_commit();
                 }
             }
             51 => self.accent_commit(),
@@ -3242,9 +3253,31 @@ impl App {
             }
             _ => {}
         }
-        if (20..=52).contains(&k) {
+        // 53: a click or drag in the colour field ends (it already showed live; now it is saved)
+        if (20..=53).contains(&k) {
             self.look_changed();
         }
+        self.invalidate();
+    }
+
+    /// Settings > Accent > Custom: the colour under (x, y) in the colour field is the accent at once (saved when
+    /// the button is released); dragging past the edges keeps the nearest colour.
+    fn pick_at(&mut self, x: f32, y: f32) {
+        let r = self.pick_rect;
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return;
+        }
+        let (h, s) = (((x - r.x) / r.w).clamp(0.0, 1.0) * 360.0, 1.0 - ((y - r.y) / r.h).clamp(0.0, 1.0));
+        self.pick = (h, s);
+        let c = crate::theme::pick_rgb(h, s);
+        self.look.accent = Some(c);
+        self.look.desktop = false;
+        let hex = format!("#{c:06X}");
+        let mut f = Field::new(&hex);
+        f.caret = hex.chars().count();
+        f.anchor = 0;
+        self.accent_field = Some(f);
+        self.apply_theme();
         self.invalidate();
     }
 
@@ -3255,6 +3288,7 @@ impl App {
         if hex.len() == 6
             && let Ok(c) = u32::from_str_radix(&hex, 16)
         {
+            self.pick = crate::theme::hs_of(c);
             self.look.accent = Some(c);
             self.look.desktop = false;
             self.look_changed();

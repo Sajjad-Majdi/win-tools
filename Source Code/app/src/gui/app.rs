@@ -383,6 +383,8 @@ pub struct App {
     pub hex_focus: bool,
     pub hex_buf: String,
     pub hue_rect: Rect,
+    /// Settings > Accent > Custom: the place picked in the colour field (hue, colourfulness); kept so a grey keeps its hue
+    pub pick: (f32, f32),
     /// Settings > Accent > Custom is open
     pub custom_open: bool,
     pub w: f32,
@@ -2132,17 +2134,18 @@ impl App {
         self.invalidate();
     }
 
-    /// Settings > Accent > Custom: set the accent from a hue (0..360) at a pleasant saturation.
-    pub fn set_hue(&mut self, hue: f32) {
-        let c = theme::from_hsl(hue, 0.78, 0.45);
-        let rgb = ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32;
-        self.hex_buf = theme::hex(c);
+    /// Settings > Accent > Custom: the accent is the colour at this place of the colour field.
+    pub fn set_pick(&mut self, h: f32, s: f32) {
+        self.pick = (h, s);
+        let rgb = theme::pick_rgb(h, s);
+        self.hex_buf = format!("#{rgb:06X}");
         self.set_pref(|p| p.accent = Some(rgb));
     }
 
     /// Settings > Accent > Custom: the hex field is complete -> apply it.
     fn hex_apply(&mut self) {
         if let Some(rgb) = prefs::parse_hex(&self.hex_buf) {
+            self.pick = theme::hs_of(rgb);
             self.set_pref(|p| p.accent = Some(rgb));
         }
     }
@@ -2202,7 +2205,7 @@ impl App {
             self.hex_apply();
         }
         if h == Hit::Hue {
-            self.hue_at(x);
+            self.pick_at(x, y);
         }
         // a click on a row (or anything in the list) moves the keyboard to the list
         self.search_focus = h == Hit::Search || h == Hit::SearchClear || (self.search_focus && self.searching() && !matches!(h, Hit::Tab(_) | Hit::Settings | Hit::Row(_) | Hit::Chevron(_) | Hit::StRow(_) | Hit::Header(_)));
@@ -2491,8 +2494,9 @@ impl App {
                     self.set_pref(|p| p.desktop = false);
                     self.custom_open = !self.custom_open;
                     if self.custom_open {
-                        let cur = self.prefs.accent.unwrap_or(0x0078D4);
+                        let cur = self.prefs.accent.unwrap_or(theme::PRESETS[0].1);
                         self.hex_buf = format!("#{cur:06X}");
+                        self.pick = theme::hs_of(cur);
                         if self.prefs.accent.is_none() {
                             self.set_pref(|p| p.accent = Some(cur));
                         }
@@ -2527,11 +2531,11 @@ impl App {
         }
     }
 
-    /// Hue strip: pick the hue under x.
-    fn hue_at(&mut self, x: f32) {
+    /// Colour field: pick the colour under (x, y); dragging past the edges keeps the nearest colour.
+    pub fn pick_at(&mut self, x: f32, y: f32) {
         let r = self.hue_rect;
-        if r.w > 0.0 {
-            self.set_hue(((x - r.x) / r.w).clamp(0.0, 1.0) * 359.0);
+        if r.w > 0.0 && r.h > 0.0 {
+            self.set_pick(((x - r.x) / r.w).clamp(0.0, 1.0) * 360.0, 1.0 - ((y - r.y) / r.h).clamp(0.0, 1.0));
         }
     }
 
@@ -3332,6 +3336,7 @@ impl App {
                             self.custom_open = acc.is_some() && !theme::PRESETS.iter().any(|p| Some(p.1) == acc);
                             if let Some(a) = acc {
                                 self.hex_buf = format!("#{a:06X}");
+                                self.pick = theme::hs_of(a);
                             }
                             self.set_pref(|p| {
                                 p.accent = acc;
@@ -3882,7 +3887,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.nc_hover = Hit::None;
                 app.nc_down = Hit::None;
                 if app.pressed == Hit::Hue {
-                    app.hue_at(x);
+                    app.pick_at(x, y);
                     app.invalidate();
                     return LRESULT(0);
                 }
@@ -4305,6 +4310,7 @@ pub fn run(software: bool) -> i32 {
             hex_focus: false,
             hex_buf: String::new(),
             hue_rect: Rect::default(),
+            pick: (221.0, 0.82),
             custom_open: false,
             w: 1180.0,
             h: 760.0,

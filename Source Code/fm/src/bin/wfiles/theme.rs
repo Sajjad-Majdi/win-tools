@@ -224,14 +224,58 @@ pub fn make(dark_mode: bool, custom: Option<u32>, tint: Tint, strength: u8) -> T
     t
 }
 
+fn to_hsl(c: C) -> (f32, f32, f32) {
+    let (r, g, b) = (c.0, c.1, c.2);
+    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (mx + mn) / 2.0;
+    if mx - mn < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = mx - mn;
+    let s = if l > 0.5 { d / (2.0 - mx - mn) } else { d / (mx + mn) };
+    let h = if mx == r { (g - b) / d + if g < b { 6.0 } else { 0.0 } } else if mx == g { (b - r) / d + 2.0 } else { (r - g) / d + 4.0 };
+    (h * 60.0, s, l)
+}
+
+fn from_hsl(h: f32, s: f32, l: f32) -> C {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    C(r + m, g + m, b + m, 1.0)
+}
+
+/// Accent picker: where a colour sits in the colour field (hue 0..360, colourfulness 0..1).
+pub fn hs_of(rgb: u32) -> (f32, f32) {
+    let (h, s, _) = to_hsl(C::hex(rgb));
+    (h, s)
+}
+
+/// Accent picker: the colour at a place in the colour field (what `Gfx::spectrum` draws there).
+pub fn pick_rgb(h: f32, s: f32) -> u32 {
+    let c = from_hsl(h, s.clamp(0.0, 1.0), 0.5);
+    ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32
+}
+
 /// Accent tokens from one base colour: darker for light mode, lighter for dark mode (readable text on both).
 pub fn set_accent(t: &mut Theme, base: C) {
     let white = C::hex(0xFFFFFF);
     let black = C::hex(0x000000);
     if t.dark {
-        t.accent = base.mix(white, 0.42);
-        t.accent2 = base.mix(white, 0.56);
-        t.accent_text = base.mix(white, 0.50);
+        // blues turn pale (periwinkle) with as much white as other hues: they get less, so they still read as blue
+        let (h, s, _) = to_hsl(base);
+        let w = 0.42 - 0.12 * (1.0 - (h - 230.0).abs() / 45.0).max(0.0) * s.min(1.0);
+        t.accent = base.mix(white, w);
+        t.accent2 = base.mix(white, w + 0.14);
+        t.accent_text = base.mix(white, w + 0.08);
         t.on_accent = C::hex(0x0A0F14);
         t.sel = t.layer.mix(base, 0.30);
         t.sel_stroke = t.layer.mix(base, 0.55);

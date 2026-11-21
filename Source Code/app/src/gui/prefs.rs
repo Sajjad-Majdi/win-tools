@@ -130,7 +130,8 @@ impl Prefs {
                     let c = super::theme::from_hsl(h, 0.78, 0.45);
                     ((c.0 * 255.0).round() as u32) << 16 | ((c.1 * 255.0).round() as u32) << 8 | (c.2 * 255.0).round() as u32
                 })
-            }),
+            })
+            .map(|a| if a == super::theme::OLD_BLUE { super::theme::PRESETS[0].1 } else { a }),
             density: small("density", 1, d.density),
             font: small("text_size", 2, d.font),
             corners: small("corners", 1, d.corners),
