@@ -1,17 +1,13 @@
-Rust Task Manager and Rust File Explorer 0.2.2: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.3: a fast Task Manager and a fast file manager for Windows 10/11.
 
-New in 0.2.2
-- Rust File Explorer: AI Search. Describe what you need in your own words, in any language, and press Shift+Enter
-  (or the AI Search button). It uses your own Google Gemini key (with an optional relay) and is off by default.
-  When a normal search finds nothing, it offers AI Search.
-- Rust File Explorer: search settings choose which file kinds and which places are searched (a folder tree, like
-  Indexing Options). System and temp files are off by default. Hidden folders never show in results.
-- Rust File Explorer: faster search while you type.
-- Rust File Explorer: Win+E opens Rust File Explorer when it is the default file manager (a small helper,
-  installed and removed by the setup).
-- Rust File Explorer: "Choose default app" opens the Windows dialog and sets the real system default; file icons
-  update after the change. New tabs open This PC. A second click on an open menu closes it.
-- Rust Task Manager: the command line list no longer cuts text in narrow windows.
+New in 0.2.3
+- Rust Task Manager: Startup apps show their impact (High / Medium / Low) and are sorted by it, with the top 5
+  first and "Show more" for the rest. Sections fold. Disabled apps sit right under the enabled ones; a switch
+  animates first and the row moves after a short pause. A details pane shows where each item comes from.
+- Rust Task Manager: Windows services that start with Windows are listed last, each with an on/off switch
+  (asks for admin rights through UAC).
+- Rust Task Manager: Settings always stay in one column; the command line panel left Settings.
+- Both apps: a second click on a menu or dropdown button closes it.
 
 Downloads
 - RustTaskManager-<version>-setup.exe    install for the current user (no admin), Start menu shortcut, uninstaller
