@@ -1382,8 +1382,8 @@ impl App {
                 if s.map(|s| s.busy).unwrap_or(true) {
                     ""
                 } else if self.ai_on && s.map(|s| s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false) {
-                    // the only text under "No results": plain words + Enter = AI Search (Sajjad, 2026-11-23)
-                    "Describe what you need in your own words, in any language, and press Enter to search with AI"
+                    // under "No results": plain words work, then the big "Search with AI" button (Sajjad, 2026-11-23)
+                    "Describe what you need in your own words, in any language"
                 } else if s.map(|s| s.ftype + s.fsize + s.fdate > 0).unwrap_or(false) {
                     "Try fewer filters"
                 } else if !s.map(|s| s.pc).unwrap_or(true) && self.tabs[cur].panes[p].loc != Loc::ThisPc {
@@ -1402,8 +1402,25 @@ impl App {
             // nothing by name: describe it in your own words with AI Search (or turn AI on first)
             let no_hits = pane_searching && self.tabs[cur].panes[p].search.as_ref().map(|s| !s.busy && s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false);
             if no_hits && error.is_none() && !loading {
-                // AI on: the hint line above says it all (Enter); AI off: offer to turn it on
-                if !self.ai_on {
+                // AI on: one big "Search with AI" button (Enter does the same); AI off: offer to turn it on
+                if self.ai_on {
+                    let label = "Search with AI";
+                    let lw = self.gfx.measure(label, Font::Ui, 15.0, 600);
+                    let kw = self.gfx.measure("Enter", Font::Ui, 12.0, 400) + 12.0;
+                    let bw = 20.0 + 16.0 + 10.0 + lw + 14.0 + kw + 16.0;
+                    let br = Rect::new((list.x + (list.w - bw) / 2.0).round(), list.y + 100.0, bw, 44.0);
+                    self.round_button(br, "", 0, Btn::Accent, Hit::Ask, R_CTRL, t);
+                    let fg = t.on_accent;
+                    let mut x = br.x + 20.0;
+                    self.gfx.glyph(0xF4A5, Rect::new(x, br.y, 16.0, br.h), 16.0, fg);
+                    x += 26.0;
+                    self.gfx.text(label, Rect::new(x, br.y, lw + 2.0, br.h), Font::Ui, 15.0, 600, Align::Left, fg);
+                    x += lw + 14.0;
+                    // the key that does the same
+                    let kr = Rect::new(x, br.y + 12.0, kw, 20.0);
+                    self.gfx.stroke_round(kr, 4.0, fg.a(0.45), 1.0);
+                    self.gfx.text("Enter", kr, Font::Ui, 12.0, 400, Align::Center, fg.a(0.85));
+                } else {
                     let (line, label) = ("Turn on AI features to search in your own words, in any language", "Turn on AI Search");
                     self.gfx.text(line, Rect::new(list.x, list.y + 96.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text2);
                     let bw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 14.0;
