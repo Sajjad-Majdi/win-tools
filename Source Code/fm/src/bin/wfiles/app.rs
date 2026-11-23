@@ -176,6 +176,8 @@ pub enum Act {
     NewDocument(&'static str, &'static str),
     NewMenu,
     Properties,
+    /// "Run as administrator" (programs and scripts): the shell's runas verb, right under Open
+    RunAsAdmin,
     SelectAll,
     Terminal,
     CopyToMenu,

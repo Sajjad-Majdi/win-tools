@@ -455,6 +455,14 @@ impl App {
                     }
                 }
             }
+            Act::RunAsAdmin => {
+                // the same shell verb "More options" ran, in wfm.exe (the UAC prompt is Windows' own)
+                let ps = paths.clone();
+                self.spawn(move || match crate::outproc::invoke(&ps, "runas") {
+                    Ok(()) => Msg::Refresh,
+                    Err(e) => Msg::ToastErr(e),
+                });
+            }
             Act::SelectAll => {
                 let pane = self.pane_mut();
                 let all: Vec<PathBuf> = pane.rows().iter().map(|i| i.path.clone()).collect();
@@ -2496,6 +2504,10 @@ impl App {
         let mut o = MItem::new("Open", 0xE8E5, Act::Open).keys("Enter");
         o.bold = true;
         items.push(o);
+        // programs and scripts: Run as administrator at the top, not in More options (Sajjad, 2026-11-23)
+        if one && !sel[0].is_dir && matches!(sel[0].ext().as_str(), "exe" | "bat" | "cmd" | "com" | "msi") {
+            items.push(MItem::new("Run as administrator", 0xEA18, Act::RunAsAdmin));
+        }
         // apps and the shell's own entries (Terminal, VS Code, Git ...) live in this submenu, so the menu itself
         // has its final size from the first frame
         let mut ow = MItem::new("Open with", 0xE7AC, Act::OpenWith);
@@ -3673,7 +3685,9 @@ fn shell_rows(m: &CtxMenu, more: bool) -> Vec<MItem> {
         let long = rest.strip_prefix("vs ").map(|x| format!("visual studio {x}")).unwrap_or_else(|| rest.to_string());
         !rest.is_empty() && apps_low.iter().any(|a| a == rest || a.starts_with(rest) || *a == long)
     };
-    let keep = |s: &fmcore::menu::MenuItem, text: &str| !(text.is_empty() || SKIP_VERBS.contains(&s.verb.to_lowercase().as_str()) || SKIP_TEXT.contains(&text.to_lowercase().as_str()) || (!s.enabled && text.ends_with("...")));
+    // Run as administrator is already at the top of the menu: not again in More options
+    let runas_top = m.items.iter().any(|i| matches!(i.act, Act::RunAsAdmin));
+    let keep = |s: &fmcore::menu::MenuItem, text: &str| !(text.is_empty() || (runas_top && s.verb.eq_ignore_ascii_case("runas")) || SKIP_VERBS.contains(&s.verb.to_lowercase().as_str()) || SKIP_TEXT.contains(&text.to_lowercase().as_str()) || (!s.enabled && text.ends_with("...")));
     for s in m.shell.iter().filter(|s| s.parent.is_empty()) {
         let text = clean(&s.text);
         if !keep(s, &text) || repeats(&text) || app_like(&text) == more || !seen.insert(text.to_lowercase()) {
