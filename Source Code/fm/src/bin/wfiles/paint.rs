@@ -725,13 +725,52 @@ impl App {
             let f = self.path_edit.clone().unwrap();
             self.field_text(&f, Rect::new(o.x + 12.0, o.y, o.w - 24.0, o.h), 13.0, true, t, &[]);
         } else if searching {
-            self.gfx.glyph(0xE721, Rect::new(o.x + 10.0, o.y, 16.0, o.h), 14.0, t.text2);
+            // no hits + AI on: Enter runs AI Search now, so the magnifier turns into the AI sparkle with a short pop, one
+            // ring out of the box and two slow glows, then rests (Sajjad, 2026-11-23)
+            // also while AI is thinking (it keeps glowing) and while its results are shown
+            let empty = self.pane().rows().is_empty();
+            let (armed, asking) = self
+                .pane()
+                .search
+                .as_ref()
+                .map(|s| {
+                    let asking = s.busy && !s.note.is_empty();
+                    (self.ai_on && (asking || s.ai.is_some() || (empty && !s.busy && !s.field.text.trim().is_empty())), asking)
+                })
+                .unwrap_or((false, false));
+            if !armed {
+                self.ai_armed = None;
+            } else if self.ai_armed.is_none() {
+                self.ai_armed = Some(Instant::now());
+            }
+            let gr = Rect::new(o.x + 10.0, o.y, 16.0, o.h);
+            match self.ai_armed {
+                Some(at) => {
+                    let k = prog(at, 200.0, self.shooting);
+                    let el = if self.shooting { 9.0 } else { at.elapsed().as_secs_f32() };
+                    let kv = k.clamp(0.0, 1.0);
+                    if kv < 1.0 {
+                        self.gfx.glyph(0xE721, gr, (14.0 * (1.0 - kv)).max(0.5), t.text2.a(t.text2.3 * (1.0 - kv)));
+                    }
+                    if el < 0.6 {
+                        let q = el / 0.6;
+                        self.gfx.stroke_round(o.inset(-4.0 * q, -4.0 * q), R_CTRL + 4.0 * q, t.accent.a(0.5 * (1.0 - q)), 1.5);
+                    }
+                    let pulse = (el < 2.4 || asking) && !self.shooting;
+                    let glow = if pulse { 0.7 + 0.3 * (el * std::f32::consts::TAU / 1.2).cos() } else { 1.0 };
+                    self.gfx.glyph(0xF4A5, gr, (14.0 * k).max(0.5), t.accent_text.a(t.accent_text.3 * glow * kv));
+                    if pulse || k != 1.0 {
+                        self.anim();
+                    }
+                }
+                None => self.gfx.glyph(0xE721, gr, 14.0, t.text2),
+            }
             let f = self.pane().search.as_ref().unwrap().field.clone();
             let focus = self.search_focus;
             self.field_text(&f, Rect::new(o.x + 37.0, o.y, o.w - 37.0 - 36.0, o.h), 13.0, focus, t, &[]);
             if f.text.is_empty() {
                 // with AI on, say that plain words work too
-                let hint = if self.ai_on { "Search, or describe what you need in your own words (Shift+Enter)" } else { "Search" };
+                let hint = if self.ai_on { "Search, or describe what you need in your own words" } else { "Search" };
                 self.gfx.text(hint, Rect::new(o.x + 38.0, o.y, o.w - 80.0, o.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
             }
             let cr = Rect::new(o.r() - 32.0, o.y + 4.0, 26.0, 26.0);
@@ -1192,8 +1231,8 @@ impl App {
         } else if !note.is_empty() {
             note
         } else if total == 0 && ai.is_none() && self.ai_on {
-            // nothing by name: point at the plain-words search
-            "No results  \u{00b7}  try AI Search (Shift+Enter)".into()
+            // nothing by name: the empty list says what to do (Sajjad, 2026-11-23: no text here)
+            String::new()
         } else if let Some(a) = &ai {
             // what the AI looked for, then the count
             // the count first: a Persian note at the end keeps its own direction
@@ -1201,23 +1240,8 @@ impl App {
         } else {
             format!("{} result{}", fmt::thousands(total as u64), if total == 1 { "" } else { "s" })
         };
-        let mut right = s.r() - 16.0;
-        // AI Search: plain words become up to three searches (only with AI features on)
-        if self.ai_on {
-            let label = "AI Search";
-            let aw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 12.0;
-            let r = Rect::new(right - aw, s.y + 8.0, aw, 32.0);
-            let on = ai.is_some();
-            self.gfx.fill_round(r, R_CTRL, if on { t.sel } else { t.card });
-            self.gfx.stroke_round(r, R_CTRL, if on { t.sel_stroke } else { t.stroke }, 1.0);
-            if self.hov(Hit::Ask) {
-                self.gfx.fill_round(r, R_CTRL, t.hover);
-            }
-            self.gfx.glyph(0xF4A5, Rect::new(r.x + 13.0, r.y, 14.0, r.h), 13.0, t.accent_text);
-            self.gfx.text(label, Rect::new(r.x + 35.0, r.y, aw - 40.0, r.h), Font::Ui, 13.0, 400, Align::Left, t.text);
-            self.hit(r, Hit::Ask);
-            right = r.x - 8.0;
-        }
+        // no AI Search button here: Enter in the search box runs it (Sajjad, 2026-11-23)
+        let right = s.r() - 16.0;
         self.gfx.text(&count, Rect::new(x + 6.0, s.y, (right - x - 6.0).max(0.0), s.h), Font::Ui, 12.0, 400, Align::Left, t.text2);
     }
 
@@ -1357,6 +1381,9 @@ impl App {
                 let s = self.tabs[cur].panes[p].search.as_ref();
                 if s.map(|s| s.busy).unwrap_or(true) {
                     ""
+                } else if self.ai_on && s.map(|s| s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false) {
+                    // the only text under "No results": plain words + Enter = AI Search (Sajjad, 2026-11-23)
+                    "Describe what you need in your own words, in any language, and press Enter to search with AI"
                 } else if s.map(|s| s.ftype + s.fsize + s.fdate > 0).unwrap_or(false) {
                     "Try fewer filters"
                 } else if !s.map(|s| s.pc).unwrap_or(true) && self.tabs[cur].panes[p].loc != Loc::ThisPc {
@@ -1375,15 +1402,14 @@ impl App {
             // nothing by name: describe it in your own words with AI Search (or turn AI on first)
             let no_hits = pane_searching && self.tabs[cur].panes[p].search.as_ref().map(|s| !s.busy && s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false);
             if no_hits && error.is_none() && !loading {
-                let (line, label) = if self.ai_on {
-                    ("Or describe what you need in your own words, in any language", "AI Search")
-                } else {
-                    ("Turn on AI features to search in your own words, in any language", "Turn on AI Search")
-                };
-                self.gfx.text(line, Rect::new(list.x, list.y + 96.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text2);
-                let bw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 14.0;
-                let br = Rect::new(list.x + (list.w - bw) / 2.0, list.y + 124.0, bw, 32.0);
-                self.button(br, label, 0xF4A5, Btn::Accent, if self.ai_on { Hit::Ask } else { Hit::AiOffer }, t);
+                // AI on: the hint line above says it all (Enter); AI off: offer to turn it on
+                if !self.ai_on {
+                    let (line, label) = ("Turn on AI features to search in your own words, in any language", "Turn on AI Search");
+                    self.gfx.text(line, Rect::new(list.x, list.y + 96.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text2);
+                    let bw = 14.0 + 13.0 + 8.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 14.0;
+                    let br = Rect::new(list.x + (list.w - bw) / 2.0, list.y + 124.0, bw, 32.0);
+                    self.button(br, label, 0xF4A5, Btn::Accent, Hit::AiOffer, t);
+                }
             }
         }
         let menu_rows: Vec<std::path::PathBuf> = self.menu.as_ref().map(|m| m.paths.clone()).unwrap_or_default();

@@ -95,7 +95,7 @@ impl App {
             Hit::New => "New (Ctrl+Shift+N: folder)".to_string(),
             Hit::OmniClear => "Clear".to_string(),
             Hit::OmniSearch => "Search (Ctrl+F)".to_string(),
-            Hit::Ask => "AI Search: describe what you need in your own words, in any language (Shift+Enter)".to_string(),
+            Hit::Ask => "AI Search: describe what you need in your own words, in any language (Enter)".to_string(),
             Hit::Min => "Minimize".to_string(),
             Hit::Max => if unsafe { IsZoomed(self.hwnd).as_bool() } { "Restore down".to_string() } else { "Maximize".to_string() },
             Hit::Close => "Close".to_string(),
@@ -2284,8 +2284,9 @@ impl App {
                     self.end_search();
                     return true;
                 }
-                ENTER if shift && !ctrl => {
-                    // Shift+Enter: AI Search (plain words become up to three searches)
+                ENTER if !ctrl && self.ai_on && (shift || self.pane().sel.is_empty()) => {
+                    // Enter with no result picked: AI Search (plain words become up to three searches). A result picked
+                    // with the arrows or a click opens with Enter as before (Sajjad, 2026-11-23: Enter, not Shift+Enter)
                     self.ask_search();
                     return true;
                 }

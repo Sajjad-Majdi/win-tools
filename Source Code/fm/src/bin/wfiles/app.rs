@@ -510,6 +510,8 @@ pub struct App {
     /// menus that are closing (painted fading out, without hits)
     pub menu_out: Option<(CtxMenu, Instant)>,
     pub drop_out: Option<(DropMenu, bool, Instant)>,
+    /// when the search box turned into AI Search mode (no hits, AI on): drives its icon animation
+    pub ai_armed: Option<Instant>,
     pub marquee: Option<Marquee>,
     /// press on the empty part of a row: a drag there starts the marquee, not a drag-out
     pub press_ws: bool,
@@ -2467,6 +2469,7 @@ pub fn run(o: Opts) -> i32 {
             press_f: crate::motion::Fades::new(60.0, crate::motion::NORMAL),
             menu_out: None,
             drop_out: None,
+            ai_armed: None,
             marquee: None,
             press_ws: false,
             side_drag: None,

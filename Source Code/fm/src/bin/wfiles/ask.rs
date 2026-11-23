@@ -1,4 +1,4 @@
-//! "AI Search" search (Shift+Enter in the search box, or the strip button): Gemini turns plain words (any language) into
+//! "AI Search" search (Enter in the search box with no result picked): Gemini turns plain words (any language) into
 //! up to three Everything queries; they run together inside the same scope, rules and filters as a normal search,
 //! and the merged rows come back ordered by how many queries found them, then newest first.
 use crate::app::*;
