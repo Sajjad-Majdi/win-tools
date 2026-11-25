@@ -255,6 +255,7 @@ impl App {
         self.hits.clear();
         self.name_w.clear();
         self.inline_rect = Rect::default();
+        self.field_geo.clear();
         // set again by the sidebar / rail when they are drawn (a hidden sidebar must not catch the wheel)
         self.side_area = Rect::default();
         let t = self.t.clone();
@@ -465,16 +466,27 @@ impl App {
         }
     }
 
-    /// Text of a field with selection and caret; returns nothing. Single line, left aligned, scrolled to the caret.
-    pub fn field_text(&mut self, f: &crate::fmt::Field, r: Rect, size: f32, focus: bool, t: &Theme, spans: &[Span]) {
-        let caret_x = self.gfx.caret_x(&f.text, Font::Ui, size, 400, f.caret);
-        let off = (caret_x - (r.w - 6.0)).max(0.0);
+    /// Text of a field with selection and caret. Single line, left aligned; the text scrolls sideways the way an
+    /// EDIT control's does (`fmt::edit_scroll`). `id` names the box so that clicks and drags find it again
+    /// (`FieldId::None`: a masked box, keys only).
+    pub fn field_text(&mut self, id: FieldId, f: &crate::fmt::Field, r: Rect, size: f32, focus: bool, t: &Theme, spans: &[Span]) {
+        let caret_x = self.gfx.caret_pos(&f.text, Font::Ui, size, 400, f.caret, f.lead);
+        let text_w = self.gfx.measure(&f.text, Font::Ui, size, 400);
+        let off = f.scroll_for(caret_x, text_w, r.w - 2.0);
+        if id != FieldId::None {
+            self.field_geo.push(FieldGeo { id, r, size });
+            if off != f.scroll
+                && let Some(m) = self.field_by_id(id)
+            {
+                m.scroll = off;
+            }
+        }
         self.gfx.clip(r);
         if focus && f.has_sel() {
             let (a, b) = f.sel_range();
-            let xa = self.gfx.caret_x(&f.text, Font::Ui, size, 400, a);
-            let xb = self.gfx.caret_x(&f.text, Font::Ui, size, 400, b);
-            self.gfx.fill(Rect::new(r.x + xa.min(xb) - off, r.cy() - 9.0, (xb - xa).abs(), 18.0), t.accent.a(0.28));
+            for (x, w) in self.gfx.sel_rects(&f.text, Font::Ui, size, 400, a, b) {
+                self.gfx.fill(Rect::new(r.x + x - off, r.cy() - 9.0, w, 18.0), t.accent.a(0.28));
+            }
         }
         let tr = Rect::new(r.x - off, r.y, r.w + off + 400.0, r.h);
         if spans.is_empty() {
@@ -787,7 +799,7 @@ impl App {
         self.hit(o, Hit::Omni);
         if editing {
             let f = self.path_edit.clone().unwrap();
-            self.field_text(&f, Rect::new(o.x + 12.0, o.y, o.w - 24.0, o.h), 13.0, true, t, &[]);
+            self.field_text(FieldId::Path, &f, Rect::new(o.x + 12.0, o.y, o.w - 24.0, o.h), 13.0, true, t, &[]);
         } else if searching {
             // no hits + AI on: Enter runs AI Search now, so the magnifier turns into the AI sparkle with a short pop, one
             // ring out of the box and two slow glows, then rests (Sajjad, 2026-11-23)
@@ -832,7 +844,7 @@ impl App {
             }
             let f = self.pane().search.as_ref().unwrap().field.clone();
             let focus = self.search_focus;
-            self.field_text(&f, Rect::new(o.x + 37.0, o.y, o.w - 37.0 - 36.0, o.h), 13.0, focus, t, &[]);
+            self.field_text(FieldId::Search, &f, Rect::new(o.x + 37.0, o.y, o.w - 37.0 - 36.0, o.h), 13.0, focus, t, &[]);
             if f.text.is_empty() {
                 // with AI on, say that plain words work too
                 let hint = if self.ai_on { "Search, or describe what you need in your own words" } else { "Search" };
@@ -1642,7 +1654,7 @@ impl App {
                     let fr = Rect::new(r.x + 2.0, r.y + 110.0, r.w - 4.0, 26.0);
                     self.inline_rect = fr;
                     self.field_box(fr, true, t);
-                    self.field_text(f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 12.5, true, t, &[]);
+                    self.field_text(FieldId::Inline, f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 12.5, true, t, &[]);
                 } else {
                     self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, r.y + 108.0, 128.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
                 }
@@ -1657,7 +1669,7 @@ impl App {
                     let fr = Rect::new(nx - 6.0, r.y + (rh - 26.0) / 2.0, nw + 6.0, 26.0);
                     self.inline_rect = fr;
                     self.field_box(fr, true, t);
-                    self.field_text(f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 13.0, true, t, &[]);
+                    self.field_text(FieldId::Inline, f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 13.0, true, t, &[]);
                 } else if pane_searching {
                     let spans: Vec<Span> = it.hl.iter().map(|(s, l)| Span { start: *s, len: *l, color: t.accent_text, weight: 600, italic: false }).collect();
                     self.gfx.text_spans(&name, Rect::new(nx, r.y + 5.0, nw, 20.0), Font::Ui, fs, 400, t.text, &spans);
@@ -2244,7 +2256,7 @@ impl App {
             self.hit(pr.inset(-6.0, -6.0), Hit::Set(53));
             let fr = Rect::new(hx, ry, fw, 32.0);
             self.field_box(fr, true, t);
-            self.field_text(&f, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, true, t, &[]);
+            self.field_text(FieldId::None, &f, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, true, t, &[]);
             self.hit(fr, Hit::Set(50));
             self.button(Rect::new(hx, ry + 40.0, fw, 32.0), "Apply", 0, Btn::Accent, Hit::Set(51), t);
             ry += PICK_H;
@@ -2344,7 +2356,7 @@ impl App {
         let mut mf = crate::fmt::Field::new(&masked);
         mf.caret = masked.chars().count();
         mf.anchor = mf.caret;
-        self.field_text(&mf, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
+        self.field_text(FieldId::None, &mf, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
         if masked.is_empty() && !focus {
             self.gfx.text("Paste your Gemini API key", Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
         }
@@ -2370,7 +2382,7 @@ impl App {
         let field = |a: &mut App, fr: Rect, i: usize, shown: &crate::fmt::Field, hint: &str| {
             let focus = rfocus == i as u8 + 1;
             a.field_box(fr, focus, t);
-            a.field_text(shown, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
+            a.field_text(if i < 2 { FieldId::Relay(i as u8) } else { FieldId::None }, shown, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), 13.0, focus, t, &[]);
             if shown.text.is_empty() && !focus {
                 a.gfx.text(hint, Rect::new(fr.x + 10.0, fr.y, fr.w - 20.0, fr.h), Font::Ui, 13.0, 400, Align::Left, t.text3);
             }
@@ -2975,7 +2987,7 @@ impl App {
         self.hit(r, Hit::Block);
         let ir = Rect::new(r.x, r.y, r.w, 48.0);
         self.gfx.glyph(0xE721, Rect::new(ir.x + 16.0, ir.y, 16.0, ir.h), 15.0, t.text2);
-        self.field_text(&field, Rect::new(ir.x + 44.0, ir.y, ir.w - 110.0, ir.h), 15.0, true, t, &[]);
+        self.field_text(FieldId::Palette, &field, Rect::new(ir.x + 44.0, ir.y, ir.w - 110.0, ir.h), 15.0, true, t, &[]);
         let _ = self.kbd(ir.r() - 16.0 - 30.0, ir.y + 14.0, "Esc", t);
         self.gfx.fill(Rect::new(r.x, ir.b() - 1.0, r.w, 1.0), t.divider);
         let mut y = ir.b();
@@ -3112,7 +3124,7 @@ impl App {
                 let pr = Rect::new(fx, y, pw, 34.0);
                 self.field_box(pr, focus == 0, t);
                 let spans = tok_spans(&pattern.text, t);
-                self.field_text(&pattern, Rect::new(pr.x + 10.0, pr.y, pr.w - 80.0, pr.h), 13.0, focus == 0, t, &spans);
+                self.field_text(FieldId::Ren(0), &pattern, Rect::new(pr.x + 10.0, pr.y, pr.w - 80.0, pr.h), 13.0, focus == 0, t, &spans);
                 self.hit(pr, Hit::Dlg(20));
                 let ir = Rect::new(pr.r() - 66.0, pr.y + 4.0, 60.0, 26.0);
                 if self.hov(Hit::Dlg(21)) {
@@ -3123,7 +3135,7 @@ impl App {
                 self.hit(ir, Hit::Dlg(21));
                 let sr = Rect::new(pr.r() + 12.0, y, 96.0, 34.0);
                 self.field_box(sr, focus == 1, t);
-                self.field_text(&start, Rect::new(sr.x + 10.0, sr.y, sr.w - 20.0, sr.h), 13.0, focus == 1, t, &[]);
+                self.field_text(FieldId::Ren(1), &start, Rect::new(sr.x + 10.0, sr.y, sr.w - 20.0, sr.h), 13.0, focus == 1, t, &[]);
                 self.hit(sr, Hit::Dlg(22));
                 self.dropdown(Rect::new(sr.r() + 12.0, y + 1.0, 96.0, 32.0), &digits.to_string(), Hit::Dlg(23), t, Font::Ui);
             }
@@ -3134,11 +3146,11 @@ impl App {
                 y += 24.0;
                 let a = Rect::new(fx, y, hw, 34.0);
                 self.field_box(a, focus == 0, t);
-                self.field_text(&find, Rect::new(a.x + 10.0, a.y, a.w - 20.0, a.h), 13.0, focus == 0, t, &[]);
+                self.field_text(FieldId::Ren(2), &find, Rect::new(a.x + 10.0, a.y, a.w - 20.0, a.h), 13.0, focus == 0, t, &[]);
                 self.hit(a, Hit::Dlg(20));
                 let b = Rect::new(fx + hw + 12.0, y, hw, 34.0);
                 self.field_box(b, focus == 1, t);
-                self.field_text(&repl, Rect::new(b.x + 10.0, b.y, b.w - 20.0, b.h), 13.0, focus == 1, t, &[]);
+                self.field_text(FieldId::Ren(3), &repl, Rect::new(b.x + 10.0, b.y, b.w - 20.0, b.h), 13.0, focus == 1, t, &[]);
                 self.hit(b, Hit::Dlg(22));
             }
             _ => {

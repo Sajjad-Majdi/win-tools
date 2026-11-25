@@ -273,6 +273,7 @@ impl App {
                     }
                 }
                 T_MARQ => self.marquee_tick(),
+                T_FIELD => self.field_tick(),
                 T_TRIM => {
                     let _ = KillTimer(Some(self.hwnd), T_TRIM);
                     // wait while things still move (a list loading, an animation): try again a bit later
@@ -285,7 +286,9 @@ impl App {
                 T_TIP => {
                     let _ = KillTimer(Some(self.hwnd), T_TIP);
                     let h = if self.nc_hover != Hit::None { self.nc_hover } else { self.hover };
+                    // (no tooltip of the cut name over the box that name is being edited in)
                     if self.menu.is_none() && self.drop.is_none() && self.pressed == Hit::None
+                        && !(self.inline.is_some() && self.inline_rect.has(self.mx, self.my))
                         && let Some(s) = self.tip_text(h)
                     {
                         self.tip = Some((h, s, self.mx, self.my));
@@ -679,6 +682,7 @@ impl App {
             }
             Act::TabNew | Act::TabClose | Act::TabCloseOthers | Act::TabCloseRight | Act::TabDuplicate => self.tab_act(a),
             Act::SideOpen | Act::SideNewTab | Act::SideUnpin | Act::SideEject | Act::SideCopyPath | Act::SideProps | Act::SideEmptyBin => self.side_act(a),
+            Act::EditUndo | Act::EditCut | Act::EditCopy | Act::EditPaste | Act::EditDelete | Act::EditSelectAll => self.edit_act(a),
             Act::MoreMenu | Act::None => {}
         }
         self.invalidate();
@@ -1056,6 +1060,14 @@ impl App {
             self.pick_at(x, y);
             return;
         }
+        // a press that began in a text box selects text until the button comes up
+        if self.text_drag.is_some() {
+            if down {
+                self.field_drag(x);
+                return;
+            }
+            self.field_drag_end();
+        }
         if self.marquee.is_some() {
             if let Some(m) = self.marquee.as_mut() {
                 m.x1 = x;
@@ -1165,6 +1177,7 @@ impl App {
         if self.side_drag.take().is_some() || self.col_drag.take().is_some() {
             self.save_look();
         }
+        self.field_drag_end();
         // a test drag ends: drop here (OLE does this for a real drag)
         if self.drag_in.as_ref().map(|d| d.internal).unwrap_or(false) {
             let keys = self.test_keys();
@@ -1405,7 +1418,24 @@ impl App {
         if self.pv.is_some() || self.rename.is_some() || self.palette.is_some() {
             return;
         }
-        match self.hit_at(x, y) {
+        let h = self.hit_at(x, y);
+        // inside an open text box: its own menu (Undo, Cut, Copy, Paste, Delete, Select all), as in Explorer. The
+        // caret and the selection stay as they are.
+        if let Some(g) = self.field_under(x, y, h)
+            && matches!(g.id, FieldId::Inline | FieldId::Path | FieldId::Search)
+        {
+            if g.id == FieldId::Search {
+                self.search_focus = true;
+            }
+            self.edit_menu(g.id, x, y);
+            self.invalidate();
+            return;
+        }
+        // anywhere else the rename ends first (a failed rename keeps the box and the click is ignored)
+        if !self.inline_end_for_press(h) {
+            return;
+        }
+        match h {
             Hit::Cleanup(crate::cleanup_page::Target::Row(i)) => self.cleanup_menu(i, x, y),
             Hit::Row(p, i) => {
                 let path = self.tab().panes[p].rows().get(i).map(|x| x.path.clone());
@@ -1453,9 +1483,15 @@ impl App {
         if !matches!(h, Hit::Row(..)) {
             self.last_click = None;
         }
-        self.pressed = h;
+        // a press inside the open rename box is for its text: the row behind it neither lights up nor gets the click
+        let in_inline = self.field_under(x, y, h).is_some_and(|g| g.id == FieldId::Inline);
+        let had_path = self.path_edit.is_some();
+        if in_inline {
+            self.last_click = None;
+        }
+        self.pressed = if in_inline { Hit::None } else { h };
         self.press_ws = false;
-        if !matches!(h, Hit::None | Hit::Block | Hit::ListBg(_)) {
+        if !matches!(h, Hit::None | Hit::Block | Hit::ListBg(_)) && !in_inline {
             self.press_f.only(Some(h));
             self.anim();
         }
@@ -1511,9 +1547,11 @@ impl App {
             self.invalidate();
             return;
         }
-        // leaving an edit commits it (a failed rename keeps the box and ignores the click)
-        if self.inline.is_some() && !matches!(h, Hit::Row(..)) && !self.commit_inline() {
-            self.invalidate();
+        // a click on the text menu of a box (Undo, Cut, Copy ...) works on that box: it neither commits nor closes it
+        let edit_click = self.edit_menu_open() && (matches!(h, Hit::MenuItem(_)) || (h == Hit::Block && self.menu_rect().is_some_and(|r| r.has(x, y))));
+        // leaving an edit commits it, as in Explorer: a press anywhere outside the box, the rest of its own row
+        // included (a failed rename keeps the box and ignores the click)
+        if !in_inline && !edit_click && !self.inline_end_for_press(h) {
             return;
         }
         if self.key_focus && h != Hit::Set(15) && h != Hit::Set(16) {
@@ -1528,12 +1566,12 @@ impl App {
         if h == Hit::Set(53) {
             self.pick_at(x, y);
         }
-        if self.path_edit.is_some() && !matches!(h, Hit::Omni | Hit::Sug(_)) {
+        if self.path_edit.is_some() && !edit_click && !matches!(h, Hit::Omni | Hit::Sug(_)) {
             self.path_edit = None;
             self.sug.clear();
         }
         // a click on a result moves the keys to the list (as in Explorer); search controls keep them in the box
-        if !matches!(h, Hit::Omni | Hit::OmniClear | Hit::Scope(_) | Hit::Filter(_) | Hit::Ask | Hit::AiOffer | Hit::Drop(_) | Hit::Block) {
+        if !edit_click && !matches!(h, Hit::Omni | Hit::OmniClear | Hit::Scope(_) | Hit::Filter(_) | Hit::Ask | Hit::AiOffer | Hit::Drop(_) | Hit::Block) {
             self.search_focus = false;
         }
         match h {
@@ -1563,24 +1601,11 @@ impl App {
                 }
             }
             Hit::Omni => {
+                // (a press in the text of an open box puts the caret there: `field_press`, after this match)
                 if self.pane().search.is_some() {
                     self.search_focus = true;
-                    let o = self.omni_rect();
-                    if let Some(s) = self.pane_mut().search.as_mut() {
-                        let idx = 0;
-                        let _ = (o, idx);
-                    }
                 } else if self.path_edit.is_none() {
                     self.edit_path();
-                } else {
-                    let o = self.omni_rect();
-                    let text = self.path_edit.as_ref().unwrap().text.clone();
-                    let i = self.gfx.index_at(&text, crate::gfx::Font::Ui, 13.0, 400, x - o.x - 12.0);
-                    let f = self.path_edit.as_mut().unwrap();
-                    f.caret = i;
-                    if !shift {
-                        f.anchor = i;
-                    }
                 }
             }
             Hit::OmniSearch => self.search_mode(""),
@@ -1628,16 +1653,10 @@ impl App {
                 let path = self.tab().panes[p].rows()[i].path.to_string_lossy().into_owned();
                 self.search_marker(p, &path);
             }
+            // inside the rename box the text takes the press (`field_press`, after this match)
+            Hit::Row(..) if in_inline => {}
             Hit::Row(p, i) => {
                 self.tab_mut().active = p;
-                if let Some(inl) = &self.inline
-                    && self.tab().panes[p].rows().get(i).map(|r| r.path == inl.path).unwrap_or(false)
-                {
-                    return;
-                }
-                if self.inline.is_some() {
-                    self.commit_inline();
-                }
                 if self.pane().loc == Loc::Settings {
                     return;
                 }
@@ -1837,6 +1856,19 @@ impl App {
                 }
             },
             _ => {}
+        }
+        // a press in the text of an open box: the caret goes under the pointer, Shift extends the selection, a
+        // double-click takes the word, and the drag that follows selects
+        if let Some(g) = self.field_under(x, y, h) {
+            let open = match g.id {
+                FieldId::Path => had_path,
+                FieldId::Ren(k) => self.rename.as_ref().is_some_and(|r| r.focus == k % 2),
+                FieldId::Relay(k) => self.relay_focus == k + 1,
+                _ => true,
+            };
+            if open {
+                self.field_press(g, x, shift, dbl);
+            }
         }
         if let Some(p) = self.pending_rename.take() {
             self.pending_rename = Some(p);
@@ -2119,11 +2151,13 @@ impl App {
     fn inline_rename(&mut self, path: PathBuf) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut f = Field::new(&name);
-        f.anchor = 0;
+        // a file: the name without its extension is selected; a folder: all of it (Explorer). Nothing scrolls: a long
+        // name shows from its start.
         let stem = if path.is_dir() { name.clone() } else { name.rsplit_once('.').map(|x| x.0.to_string()).unwrap_or(name.clone()) };
-        f.caret = stem.encode_utf16().count();
-        f.anchor = 0;
+        f.select(0, stem.encode_utf16().count());
         let p = self.tab().active;
+        self.field_drag_end();
+        self.inline_tip = None;
         self.inline = Some(Inline { pane: p, path, field: f });
         self.search_focus = false;
         self.path_edit = None;
@@ -2138,13 +2172,15 @@ impl App {
             self.inline = None;
             return true;
         }
-        let path = inl.path.clone();
+        let (path, pane) = (inl.path.clone(), inl.pane);
         match fmcore::ops::rename(&path, &new) {
             Ok(p) => {
                 self.inline = None;
-                self.pane_mut().want = Some(p);
+                // (the pane the box was in: a click in the other pane may have ended the rename)
+                let t = self.cur;
+                let pi = pane.min(self.tabs[t].panes.len().saturating_sub(1));
+                self.tabs[t].panes[pi].want = Some(p);
                 self.toast("Renamed to ", &new, true);
-                let (t, pi) = (self.cur, self.tab().active);
                 self.load(t, pi, true);
                 true
             }
@@ -2152,12 +2188,253 @@ impl App {
                 self.toast_err(&e);
                 if let Some(i) = self.inline.as_mut() {
                     let stem = i.field.text.rfind('.').filter(|x| *x > 0).unwrap_or(i.field.text.len());
-                    i.field.anchor = 0;
-                    i.field.caret = i.field.text[..stem].encode_utf16().count();
+                    let to = i.field.text[..stem].encode_utf16().count();
+                    i.field.select(0, to);
                 }
                 false
             }
         }
+    }
+
+    /// A press at `h`, outside the rename box, ends the rename and keeps the name (Explorer). False: the name could
+    /// not be kept, so the box stays and the press is ignored.
+    fn inline_end_for_press(&mut self, h: Hit) -> bool {
+        let Some(pane) = self.inline.as_ref().map(|f| f.pane) else { return true };
+        if !self.commit_inline() {
+            self.invalidate();
+            return false;
+        }
+        // a press on a row picks that row: the renamed item is not selected again when the folder is read anew
+        if matches!(h, Hit::Row(..))
+            && let Some(pn) = self.tab_mut().panes.get_mut(pane)
+        {
+            pn.want = None;
+        }
+        true
+    }
+
+    /// The window lost the keys while a name was being edited: the rename is kept (Explorer does the same).
+    pub fn inline_blur(&mut self) {
+        if self.inline.is_some() {
+            self.field_drag_end();
+            self.commit_inline();
+            self.invalidate();
+        }
+    }
+
+    /// Tab in the rename box: keep this name and rename the next item (Shift+Tab: the one before), as in Explorer.
+    fn inline_next(&mut self, back: bool) {
+        let Some(inl) = self.inline.as_ref() else { return };
+        let (p, path) = (inl.pane, inl.path.clone());
+        let t = self.cur;
+        let next = self.tabs[t].panes.get(p).and_then(|pn| {
+            let rows = pn.rows();
+            let at = rows.iter().position(|r| r.path == path)?;
+            let k = if back { at.checked_sub(1)? } else { at + 1 };
+            rows.get(k).filter(|r| r.recycled.is_none() && r.kind != crate::ficons::Kind::Drive && !r.path.to_string_lossy().starts_with("::")).map(|r| r.path.clone())
+        });
+        if !self.commit_inline() {
+            return;
+        }
+        let Some(next) = next else { return };
+        self.tab_mut().active = p;
+        let pane = &mut self.tabs[t].panes[p];
+        pane.sel.clear();
+        pane.sel.insert(next.clone());
+        let at = pane.rows().iter().position(|r| r.path == next);
+        pane.focus = at;
+        pane.anchor = at;
+        pane.kb = true;
+        // (the folder is being read again after the rename: this is the item it selects when it arrives)
+        if pane.want.is_some() {
+            pane.want = Some(next.clone());
+        }
+        if let Some(k) = at {
+            self.scroll_to(t, p, k);
+        }
+        self.inline_rename(next);
+    }
+
+    // ------------------------------------------------------------------ text boxes: mouse and menu, as the EDIT control
+    /// The text of a box that takes clicks (None when that box is not open).
+    pub fn field_by_id(&mut self, id: FieldId) -> Option<&mut Field> {
+        match id {
+            FieldId::None => None,
+            FieldId::Inline => self.inline.as_mut().map(|f| &mut f.field),
+            FieldId::Path => self.path_edit.as_mut(),
+            FieldId::Search => self.pane_mut().search.as_mut().map(|s| &mut s.field),
+            FieldId::Palette => self.palette.as_mut().map(|p| &mut p.field),
+            FieldId::Ren(k) => self.rename.as_mut().map(|r| match k {
+                0 => &mut r.pattern,
+                1 => &mut r.start,
+                2 => &mut r.find,
+                _ => &mut r.repl,
+            }),
+            FieldId::Relay(k) => self.relay_fields.get_mut(k as usize),
+        }
+    }
+
+    /// The open text box whose text lies under (x, y), where `h` is what the pointer hits there: the place it was
+    /// drawn at in the last frame. A menu or dialog over the box hits something else, so the box is not found.
+    fn field_under(&self, x: f32, y: f32, h: Hit) -> Option<FieldGeo> {
+        // (the text area, and the few pixels between it and the border)
+        let g = *self.field_geo.iter().rev().find(|g| g.r.inset(-6.0, 0.0).has(x, y))?;
+        let ok = match (g.id, h) {
+            (FieldId::Inline, Hit::Row(p, k)) => self.inline.as_ref().is_some_and(|f| f.pane == p && self.tab().panes.get(p).and_then(|pn| pn.rows().get(k)).is_some_and(|r| r.path == f.path)),
+            (FieldId::Path, Hit::Omni) => self.path_edit.is_some(),
+            (FieldId::Search, Hit::Omni) => self.pane().search.is_some(),
+            (FieldId::Palette, Hit::Block) => self.palette.is_some(),
+            (FieldId::Ren(k), Hit::Dlg(d)) => self.rename.is_some() && d == if k % 2 == 0 { 20 } else { 22 },
+            (FieldId::Relay(k), Hit::Set(s)) => s == 90 + k,
+            _ => false,
+        };
+        ok.then_some(g)
+    }
+
+    /// The button went down inside a text box: the caret goes under the pointer (Shift keeps the anchor), the second
+    /// press of a double-click takes the word, and the box owns the mouse until the button comes up.
+    fn field_press(&mut self, g: FieldGeo, x: f32, shift: bool, dbl: bool) {
+        let Some((text, scroll)) = self.field_by_id(g.id).map(|f| (f.text.clone(), f.scroll)) else { return };
+        let (at, lead) = self.gfx.hit_index(&text, crate::gfx::Font::Ui, g.size, 400, x - g.r.x + scroll);
+        if let Some(f) = self.field_by_id(g.id) {
+            f.click(at, shift, lead);
+            if dbl {
+                f.double_click(shift);
+            }
+        }
+        self.text_drag = Some(g);
+        self.caret_on = true;
+        self.field_follow(g);
+    }
+
+    /// Keep the caret of a box inside it (the same rule the box is drawn with, for the moves between two frames).
+    fn field_follow(&mut self, g: FieldGeo) {
+        let Some((text, caret, lead)) = self.field_by_id(g.id).map(|f| (f.text.clone(), f.caret, f.lead)) else { return };
+        let cx = self.gfx.caret_pos(&text, crate::gfx::Font::Ui, g.size, 400, caret, lead);
+        let tw = self.gfx.measure(&text, crate::gfx::Font::Ui, g.size, 400);
+        if let Some(f) = self.field_by_id(g.id) {
+            f.scroll = f.scroll_for(cx, tw, g.r.w - 2.0);
+        }
+    }
+
+    /// The pointer moved with the button down after a press in a text box.
+    fn field_drag(&mut self, x: f32) {
+        let Some(g) = self.text_drag else { return };
+        let Some((text, scroll)) = self.field_by_id(g.id).map(|f| (f.text.clone(), f.scroll)) else {
+            self.field_drag_end();
+            return;
+        };
+        if x < g.r.x || x > g.r.r() {
+            // past an end of the box: the selection grows by one character and the text scrolls under it, on every
+            // mouse move and on a timer while the pointer rests there (what the EDIT control does)
+            let left = x < g.r.x;
+            let edge = self.gfx.hit_index(&text, crate::gfx::Font::Ui, g.size, 400, scroll + if left { 0.0 } else { g.r.w }).0;
+            if let Some(f) = self.field_by_id(g.id) {
+                f.drag_out(edge, left);
+            }
+            self.timer(T_FIELD, 50);
+        } else {
+            let (at, lead) = self.gfx.hit_index(&text, crate::gfx::Font::Ui, g.size, 400, x - g.r.x + scroll);
+            if let Some(f) = self.field_by_id(g.id) {
+                f.drag(at, lead);
+            }
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_FIELD);
+            }
+        }
+        self.field_follow(g);
+        self.caret_on = true;
+        self.invalidate();
+    }
+
+    fn field_tick(&mut self) {
+        match self.text_drag {
+            Some(g) if self.mx < g.r.x || self.mx > g.r.r() => self.field_drag(self.mx),
+            _ => unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_FIELD);
+            },
+        }
+    }
+
+    pub fn field_drag_end(&mut self) {
+        if let Some(g) = self.text_drag.take() {
+            if let Some(f) = self.field_by_id(g.id) {
+                f.end_drag();
+            }
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_FIELD);
+            }
+        }
+    }
+
+    fn edit_menu_open(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.items.first().is_some_and(|it| it.act == Act::EditUndo))
+    }
+
+    /// The menu of a text box: the EDIT control's own entries, greyed the way it greys them.
+    fn edit_menu(&mut self, id: FieldId, x: f32, y: f32) {
+        let hwnd = self.hwnd;
+        let Some(f) = self.field_by_id(id) else { return };
+        let (sel, undo, all) = (f.has_sel(), f.can_undo(), f.all_selected() || f.text.is_empty());
+        let paste = crate::dnd::clipboard_text(hwnd).is_some_and(|s| !s.is_empty());
+        let item = |label: &str, glyph: u32, act: Act, keys: &str, on: bool, sep: bool| {
+            let mut it = MItem::new(label, glyph, act).keys(keys);
+            it.enabled = on;
+            it.sep = sep;
+            it
+        };
+        let items = vec![
+            item("Undo", 0xE7A7, Act::EditUndo, "Ctrl+Z", undo, false),
+            item("Cut", 0xE8C6, Act::EditCut, "Ctrl+X", sel, true),
+            item("Copy", 0xE8C8, Act::EditCopy, "Ctrl+C", sel, false),
+            item("Paste", 0xE77F, Act::EditPaste, "Ctrl+V", paste, false),
+            item("Delete", 0xE74D, Act::EditDelete, "Del", sel, false),
+            item("Select all", 0xE8B3, Act::EditSelectAll, "Ctrl+A", !all, true),
+        ];
+        self.sub = None;
+        self.menu_gen += 1;
+        self.menu_field = id;
+        self.menu = Some(CtxMenu { x, y, items, paths: vec![], bg: true, seq: self.menu_gen, loading: false, shell: vec![], apps: vec![], at: Instant::now() });
+    }
+
+    /// An entry of the text menu was picked.
+    fn edit_act(&mut self, a: Act) {
+        let (id, hwnd) = (self.menu_field, self.hwnd);
+        let bad = if id == FieldId::Inline { NAME_BAD } else { "" };
+        let Some(f) = self.field_by_id(id) else { return };
+        let before = f.text.clone();
+        let mut refused = false;
+        match a {
+            Act::EditUndo => {
+                f.undo();
+            }
+            Act::EditCut => {
+                edit_key(hwnd, f, 0x58, true, false, bad);
+            }
+            Act::EditCopy => {
+                edit_key(hwnd, f, 0x43, true, false, bad);
+            }
+            Act::EditPaste => refused = edit_key(hwnd, f, 0x56, true, false, bad).1,
+            Act::EditDelete => f.delete_sel(),
+            _ => f.select_all(),
+        }
+        let changed = f.text != before;
+        match id {
+            FieldId::Inline if refused => {
+                self.inline_tip = Some(Instant::now());
+                self.timer(T_ANIM, 4100);
+            }
+            FieldId::Path if changed => self.path_suggest(),
+            FieldId::Search => {
+                self.search_focus = true;
+                if changed {
+                    self.search_typed();
+                }
+            }
+            _ => {}
+        }
+        self.caret_on = true;
+        self.invalidate();
     }
 
     // ------------------------------------------------------------------ keyboard
@@ -2260,6 +2537,12 @@ impl App {
     pub fn keyboard_menu(&mut self) {
         if self.pane().loc == Loc::Cleanup {
             self.cleanup_keyboard_menu();
+            return;
+        }
+        // while a name is being edited the menu is the box's own (Undo, Cut, Copy ...), under the box
+        if self.inline.is_some() && self.inline_rect.w > 0.0 {
+            let r = self.inline_rect;
+            self.edit_menu(FieldId::Inline, r.x + 12.0, r.b());
             return;
         }
         let (t, p) = (self.cur, self.tab().active);
@@ -2411,14 +2694,9 @@ impl App {
                     r.focus = 1 - r.focus.min(1);
                 }
                 _ => {
-                    if ctrl && vk == 0x56 {
-                        if let Some(s) = crate::dnd::clipboard_text(self.hwnd)
-                            && let Some(f) = self.field_mut()
-                        {
-                            f.insert(&s);
-                        }
-                    } else if let Some(f) = self.field_mut() {
-                        f.key(vk, ctrl, shift);
+                    let hwnd = self.hwnd;
+                    if let Some(f) = self.field_mut() {
+                        edit_key(hwnd, f, vk, ctrl, shift, "");
                     }
                     rename_preview(self);
                 }
@@ -2436,8 +2714,9 @@ impl App {
                     p.sel = if vk == 0x26 { (p.sel + n - 1) % n } else { (p.sel + 1) % n };
                 }
                 _ => {
+                    let hwnd = self.hwnd;
                     if let Some(f) = self.field_mut() {
-                        f.key(vk, ctrl, shift);
+                        edit_key(hwnd, f, vk, ctrl, shift, "");
                     }
                     self.palette_fill();
                 }
@@ -2463,17 +2742,29 @@ impl App {
         }
         if self.inline.is_some() {
             match vk {
-                ESC => self.inline = None,
+                ESC => {
+                    self.field_drag_end();
+                    self.inline = None;
+                }
                 ENTER => {
                     self.commit_inline();
                 }
+                // Tab keeps the name and renames the next item, Shift+Tab the one before (Explorer)
+                TAB if !ctrl => self.inline_next(shift),
+                // Shift+F10: the box's own menu; Alt+Backspace: the EDIT control's old Undo key
+                0x79 if shift => self.keyboard_menu(),
+                0x08 if alt => {
+                    self.inline.as_mut().unwrap().field.undo();
+                }
                 _ => {
-                    if ctrl && vk == 0x56 {
-                        if let Some(s) = crate::dnd::clipboard_text(self.hwnd) {
-                            self.inline.as_mut().unwrap().field.insert(&s);
-                        }
-                    } else {
-                        self.inline.as_mut().unwrap().field.key(vk, ctrl, shift);
+                    // every other key belongs to the box: the editing keys of an EDIT control (see fmt::Field::key
+                    // and edit_key); F2 and the keys it does not know do nothing here, as in Explorer
+                    let hwnd = self.hwnd;
+                    let (_, refused) = edit_key(hwnd, &mut self.inline.as_mut().unwrap().field, vk, ctrl, shift, NAME_BAD);
+                    if refused {
+                        // a pasted \ / : * ? " < > | was left out: the same tip as when one is typed
+                        self.inline_tip = Some(Instant::now());
+                        self.timer(T_ANIM, 4100);
                     }
                 }
             }
@@ -2508,16 +2799,8 @@ impl App {
                     }
                 }
                 _ => {
-                    if ctrl && vk == 0x56 {
-                        if let Some(s) = crate::dnd::clipboard_text(self.hwnd) {
-                            self.path_edit.as_mut().unwrap().insert(&s);
-                        }
-                    } else if ctrl && vk == 0x43 {
-                        let s = self.path_edit.as_ref().unwrap().selected();
-                        crate::dnd::set_clipboard_text(self.hwnd, &s);
-                    } else {
-                        self.path_edit.as_mut().unwrap().key(vk, ctrl, shift);
-                    }
+                    let hwnd = self.hwnd;
+                    edit_key(hwnd, self.path_edit.as_mut().unwrap(), vk, ctrl, shift, "");
                     self.path_suggest();
                 }
             }
@@ -2574,7 +2857,8 @@ impl App {
                         return true;
                     }
                     if !(ctrl && matches!(vk, 0x4B | 0x54 | 0x57 | 0x4C)) {
-                        let used = self.pane_mut().search.as_mut().map(|s| s.field.key(vk, ctrl, shift)).unwrap_or(false);
+                        let hwnd = self.hwnd;
+                        let used = self.pane_mut().search.as_mut().map(|s| edit_key(hwnd, &mut s.field, vk, ctrl, shift, "").0).unwrap_or(false);
                         if used {
                             self.search_typed();
                             return true;
@@ -4389,6 +4673,35 @@ impl crate::dnd::Sink for App {
     }
 }
 
+/// Characters a file name cannot hold: typing or pasting one into the rename box shows the tip instead.
+const NAME_BAD: &str = "\\/:*?\"<>|";
+
+/// One key in a text box: the clipboard keys first (Ctrl+C / X / V, Ctrl+Insert, Shift+Insert, Shift+Delete with a
+/// selection, as in the EDIT control), then the box's own editing keys. `bad` = characters a paste leaves out.
+/// Returns (the key was used, a pasted character was left out).
+fn edit_key(hwnd: HWND, f: &mut Field, vk: u16, ctrl: bool, shift: bool, bad: &str) -> (bool, bool) {
+    let copy = ctrl && !shift && (vk == 0x43 || vk == 0x2D);
+    let cut = (ctrl && !shift && vk == 0x58) || (shift && !ctrl && vk == 0x2E && f.has_sel());
+    let paste = (ctrl && !shift && vk == 0x56) || (shift && !ctrl && vk == 0x2D);
+    if copy || cut {
+        if f.has_sel() {
+            crate::dnd::set_clipboard_text(hwnd, &f.selected());
+            if cut {
+                f.delete_sel();
+            }
+        }
+        return (true, false);
+    }
+    if paste {
+        let Some(s) = crate::dnd::clipboard_text(hwnd) else { return (true, false) };
+        let kept: String = s.chars().filter(|c| !bad.contains(*c)).collect();
+        let refused = kept.len() != s.len();
+        f.insert(&kept);
+        return (true, refused);
+    }
+    (f.key(vk, ctrl, shift), false)
+}
+
 // ---------------------------------------------------------------------- `wfm gui ...`
 pub(crate) fn parse_keys(s: &str) -> Option<(u16, bool, bool, bool)> {
     let (mut c, mut sh, mut alt) = (false, false, false);
@@ -4404,6 +4717,7 @@ pub(crate) fn parse_keys(s: &str) -> Option<(u16, bool, bool, bool)> {
             "tab" => vk = 0x09,
             "backspace" => vk = 0x08,
             "delete" | "del" => vk = 0x2E,
+            "insert" | "ins" => vk = 0x2D,
             "left" => vk = 0x25,
             "up" => vk = 0x26,
             "right" => vk = 0x27,
@@ -4712,26 +5026,30 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
         }
         "click" | "dblclick" | "rclick" | "hover" => {
             let mut it = arg.split_whitespace();
-            let (Some(x), Some(y)) = (it.next().and_then(num), it.next().and_then(num)) else { return err("click X Y (DIPs)") };
+            let (Some(x), Some(y)) = (it.next().and_then(num), it.next().and_then(num)) else { return err("click X Y [ctrl|shift] (DIPs)") };
+            // click X Y [ctrl|shift]: the keys held during the click
+            let (c, sh) = (arg.contains("ctrl"), arg.contains("shift"));
             a.mouse_move(x, y, false);
+            a.test_mods = Some((c, sh));
             match cmd {
                 "click" => {
-                    a.mouse_down(x, y, false, false, false);
+                    a.mouse_down(x, y, c, sh, false);
                     a.mouse_up(x, y);
                 }
                 "dblclick" => {
-                    a.mouse_down(x, y, false, false, false);
+                    a.mouse_down(x, y, c, sh, false);
                     a.mouse_up(x, y);
-                    a.mouse_down(x, y, false, false, true);
+                    a.mouse_down(x, y, c, sh, true);
                     a.mouse_up(x, y);
                 }
                 "rclick" => a.right_click(x, y),
                 _ => {}
             }
+            a.test_mods = None;
             ok()
         }
         "drag" => {
-            // drag X0 Y0 X1 Y1 [ctrl|shift]: a synthetic mouse drag inside this window only (no real cursor)
+            // drag X0 Y0 X1 Y1 [ctrl|shift] [dbl] [hold]: a synthetic mouse drag inside this window only (no real cursor)
             let v: Vec<f32> = arg.split_whitespace().filter_map(num).collect();
             if v.len() < 4 {
                 return err("drag X0 Y0 X1 Y1 [ctrl|shift]");
@@ -4740,6 +5058,11 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
             a.mouse_move(v[0], v[1], false);
             a.test_mods = Some((c, sh));
             a.mouse_down(v[0], v[1], c, sh, false);
+            if arg.contains("dbl") {
+                // the drag starts with the second press of a double-click (word selection in a text box)
+                a.mouse_up(v[0], v[1]);
+                a.mouse_down(v[0], v[1], c, sh, true);
+            }
             let steps = 12;
             for k in 1..=steps {
                 let f = k as f32 / steps as f32;
@@ -4920,6 +5243,53 @@ pub fn drop_toggle_click(h: Hit, by: Option<Hit>, anchor: Option<Rect>, hit_rect
     match (anchor, hit_rect) {
         (Some(a), Some(r)) => (a.x - r.x).abs() < 1.0 && (a.y - r.y).abs() < 1.0 && (a.w - r.w).abs() < 1.0,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod edit_key_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_keys_of_a_text_box() {
+        // the private clipboard of the tests: the owner's real clipboard is never touched
+        unsafe { std::env::set_var("WFILES_TEST_CLIP", "1") };
+        let h = HWND::default();
+        let mut f = Field::new("New Text Document.txt");
+        f.select(4, 8);
+        // Ctrl+C copies, the text stays
+        assert_eq!(edit_key(h, &mut f, 0x43, true, false, NAME_BAD), (true, false));
+        assert_eq!(f.text, "New Text Document.txt");
+        // Ctrl+X cuts
+        edit_key(h, &mut f, 0x58, true, false, NAME_BAD);
+        assert_eq!((f.text.as_str(), f.caret), ("New  Document.txt", 4));
+        // Ctrl+V and Shift+Insert paste
+        edit_key(h, &mut f, 0x56, true, false, NAME_BAD);
+        edit_key(h, &mut f, 0x2D, false, true, NAME_BAD);
+        assert_eq!(f.text, "New TextText Document.txt");
+        // Shift+Delete cuts a selection, and deletes one character when there is none
+        f.select(0, 4);
+        edit_key(h, &mut f, 0x2E, false, true, NAME_BAD);
+        assert_eq!(f.text, "TextText Document.txt");
+        edit_key(h, &mut f, 0x2E, false, true, NAME_BAD);
+        assert_eq!(f.text, "extText Document.txt");
+        // Ctrl+Insert copies; a paste into the rename box leaves out what a file name cannot hold and says so
+        crate::dnd::set_clipboard_text(h, "a/b:c*d?\"e<f>g|h\\i\r\n");
+        f.select_all();
+        assert_eq!(edit_key(h, &mut f, 0x56, true, false, NAME_BAD), (true, true));
+        assert_eq!(f.text, "abcdefghi");
+        // ... and one Ctrl+Z brings the old name back, selected
+        edit_key(h, &mut f, 0x5A, true, false, NAME_BAD);
+        assert_eq!((f.text.as_str(), f.sel_range()), ("extText Document.txt", (0, 20)));
+        // without a selection Ctrl+C and Ctrl+X leave the clipboard alone
+        f.key(0x24, false, false);
+        edit_key(h, &mut f, 0x43, true, false, "");
+        edit_key(h, &mut f, 0x58, true, false, "");
+        assert_eq!(crate::dnd::clipboard_text(h).as_deref(), Some("a/b:c*d?\"e<f>g|h\\i\r\n"));
+        // other boxes take every character
+        f.select_all();
+        assert_eq!(edit_key(h, &mut f, 0x56, true, false, ""), (true, false));
+        assert_eq!(f.text, "a/b:c*d?\"e<f>g|h\\i");
     }
 }
 

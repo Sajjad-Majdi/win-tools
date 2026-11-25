@@ -58,6 +58,8 @@ pub const T_TRIM: usize = 11;
 pub const T_RENAME: usize = 12;
 /// one-shot: a drag rests on another tab long enough to open it (as in Explorer)
 pub const T_DRAGTAB: usize = 13;
+/// while a selecting drag rests past an end of a text box: the text scrolls under it
+pub const T_FIELD: usize = 14;
 
 /// Results of background work, applied on the UI thread.
 pub enum Msg {
@@ -222,6 +224,13 @@ pub enum Act {
     SideEmptyBin,
     /// "More options ›" (the shell's other verbs, Send to)
     MoreMenu,
+    /// the menu of a text box (the box is App::menu_field), the EDIT control's own entries
+    EditUndo,
+    EditCut,
+    EditCopy,
+    EditPaste,
+    EditDelete,
+    EditSelectAll,
     None,
 }
 
@@ -377,6 +386,27 @@ pub struct Inline {
     pub field: Field,
 }
 
+/// The text boxes that take clicks, drags and the text menu like an EDIT control (masked boxes are `None`).
+/// `Ren`: the rename dialog's pattern (0), start (1), find (2) and replace (3) boxes; `Relay`: address (0), header (1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldId {
+    None,
+    Inline,
+    Path,
+    Search,
+    Palette,
+    Ren(u8),
+    Relay(u8),
+}
+
+/// Where a text box's text was drawn this frame (the text area, not the border) and its font size.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldGeo {
+    pub id: FieldId,
+    pub r: Rect,
+    pub size: f32,
+}
+
 pub struct DragIn {
     pub paths: Vec<PathBuf>,
     pub x: f32,
@@ -473,6 +503,10 @@ pub struct App {
     /// where the rename box was drawn this frame, and when it last refused a character (the tip under it)
     pub inline_rect: Rect,
     pub inline_tip: Option<Instant>,
+    /// the text boxes drawn this frame, the box a selecting drag is in, and the box the open text menu is for
+    pub field_geo: Vec<FieldGeo>,
+    pub text_drag: Option<FieldGeo>,
+    pub menu_field: FieldId,
     pub drag_in: Option<DragIn>,
     pub press: Option<(f32, f32, usize, usize)>,
     pub drag_scroll: Option<(usize, f32, f32)>,
@@ -737,6 +771,17 @@ impl App {
         unsafe {
             SetTimer(Some(self.hwnd), id, ms, None);
         }
+    }
+
+    /// Is the real pointer over the box a name is being renamed in? (for the I-beam cursor)
+    pub fn over_inline(&self) -> bool {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+            let _ = ScreenToClient(self.hwnd, &mut pt);
+        }
+        let s = self.scale();
+        self.inline_rect.has(pt.x as f32 / s, pt.y as f32 / s)
     }
 
     pub fn dark(&self) -> bool {
@@ -1883,6 +1928,9 @@ impl App {
             "dropdown": self.drop.as_ref().map(|d| d.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()),
             "path_edit": self.path_edit.as_ref().map(|f| f.text.clone()),
             "inline_rename": self.inline.as_ref().map(|f| f.field.text.clone()),
+            "inline_edit": self.inline.as_ref().map(|f| json!({"anchor": f.field.anchor, "caret": f.field.caret, "selected": f.field.selected(), "scroll": f.field.scroll, "can_undo": f.field.can_undo(), "rect": [self.inline_rect.x, self.inline_rect.y, self.inline_rect.w, self.inline_rect.h]})),
+            "path_sel": self.path_edit.as_ref().map(|f| json!([f.anchor, f.caret])),
+            "search_sel": self.pane().search.as_ref().map(|s| json!([s.field.anchor, s.field.caret])),
             "drag": self.drag_in.as_ref().map(|d| json!({"items": d.paths.len(), "lit": format!("{:?}", d.hl), "target": d.target, "dest": d.dest, "effect": d.effect})),
             "whatis": self.whatis.as_ref().map(|w| json!({"path": w.item.path, "answer": w.answer.as_ref().map(|a| match a { Ok(a) => json!({"what": a.what, "actions": a.actions}), Err(e) => json!({"error": e}) })})),
             "rename_rows": self.rename.as_ref().map(|r| r.rows.iter().map(|x| format!("{} -> {}", x.0, x.1)).collect::<Vec<_>>()),
@@ -2209,7 +2257,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                if app.marquee.is_some() || app.side_drag.is_some() {
+                if app.marquee.is_some() || app.side_drag.is_some() || app.text_drag.is_some() {
                     app.mouse_up(app.mx, app.my);
                 }
                 LRESULT(0)
@@ -2283,6 +2331,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_ACTIVATE => {
                 if (wp.0 & 0xFFFF) == 0 {
                     app.close_popups();
+                    // the window lost the keys: a rename in progress is kept, as in Explorer
+                    app.inline_blur();
                 } else if app.assoc_stale {
                     // back from Windows' app picker: a new default app brings its own file icons
                     app.assoc_stale = false;
@@ -2296,10 +2346,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         _ if app.side_drag.is_some() => IDC_SIZEWE,
                         _ if app.col_drag.is_some() => IDC_SIZEWE,
                         Hit::SideEdge | Hit::ColEdge(..) => IDC_SIZEWE,
+                        _ if app.text_drag.is_some() => IDC_IBEAM,
                         Hit::Omni => IDC_IBEAM,
                         _ if app.path_edit.is_some() && matches!(app.hover, Hit::OmniSearch) => IDC_IBEAM,
-                        // the name being renamed in place is a text field
-                        Hit::Row(p, i) if app.inline.as_ref().is_some_and(|f| f.pane == p && app.tabs[app.cur].panes.get(p).and_then(|pn| pn.rows().get(i)).is_some_and(|it| it.path == f.path)) => IDC_IBEAM,
+                        // the box a name is renamed in is a text field; the rest of its row keeps the arrow (Explorer)
+                        Hit::Row(..) if app.inline.is_some() && app.over_inline() => IDC_IBEAM,
                         // buttons and toggles show the hand (Sajjad, 2026-11-25); rows, menus, tabs and the sidebar keep the arrow, as in Explorer
                         Hit::ViewQuick(_) | Hit::ViewBtn | Hit::New | Hit::Back | Hit::Fwd | Hit::Up | Hit::TabAdd | Hit::TabScroll(_) | Hit::TabClose(_) | Hit::OmniClear
                         | Hit::Crumb(_) | Hit::Ask | Hit::AiOffer | Hit::Scope(_) | Hit::Filter(_) | Hit::Toast(_) | Hit::Dlg(_) | Hit::Set(_) | Hit::WhatIs(_)
@@ -2525,6 +2576,9 @@ pub fn run(o: Opts) -> i32 {
             inline: None,
             inline_rect: Rect::default(),
             inline_tip: None,
+            field_geo: vec![],
+            text_drag: None,
+            menu_field: FieldId::None,
             drag_in: None,
             press: None,
             drag_scroll: None,

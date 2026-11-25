@@ -864,33 +864,63 @@ impl Gfx {
         }
     }
 
-    /// x offset of the caret before UTF-16 index `idx` (handles mixed Persian / Latin text).
-    pub fn caret_x(&mut self, s: &str, font: Font, size: f32, weight: u32, idx: usize) -> f32 {
+    /// x of the caret at UTF-16 index `idx`. A caret stands at the far edge of the character before it, as in the
+    /// EDIT control (where the next letter of that run will appear); `lead` puts it at the near edge of the character
+    /// after it instead (a click there). The two differ only where Persian meets Latin.
+    pub fn caret_pos(&mut self, s: &str, font: Font, size: f32, weight: u32, idx: usize, lead: bool) -> f32 {
         let f = self.format(font, size, weight, Align::Left, false, false);
         let w: Vec<u16> = s.encode_utf16().collect();
+        if w.is_empty() {
+            return 0.0;
+        }
         unsafe {
             let Ok(layout) = self.dw.CreateTextLayout(&w, &f, 10000.0, 100.0) else { return 0.0 };
             let (mut x, mut y) = (0f32, 0f32);
             let mut m = DWRITE_HIT_TEST_METRICS::default();
-            let trailing = idx >= w.len() && !w.is_empty();
-            let pos = if trailing { w.len() - 1 } else { idx };
-            let _ = layout.HitTestTextPosition(pos as u32, trailing, &mut x, &mut y, &mut m);
+            let idx = idx.min(w.len());
+            let _ = if idx == 0 || (lead && idx < w.len()) { layout.HitTestTextPosition(idx as u32, false, &mut x, &mut y, &mut m) } else { layout.HitTestTextPosition(idx as u32 - 1, true, &mut x, &mut y, &mut m) };
             x
         }
     }
 
-    /// UTF-16 index nearest to x.
-    pub fn index_at(&mut self, s: &str, font: Font, size: f32, weight: u32, x: f32) -> usize {
+    /// The UTF-16 index nearest to x, and whether x was on the near half of the character at that index (false: on
+    /// the far half of the one before it).
+    pub fn hit_index(&mut self, s: &str, font: Font, size: f32, weight: u32, x: f32) -> (usize, bool) {
         let f = self.format(font, size, weight, Align::Left, false, false);
         let w: Vec<u16> = s.encode_utf16().collect();
+        if w.is_empty() {
+            return (0, false);
+        }
         unsafe {
-            let Ok(layout) = self.dw.CreateTextLayout(&w, &f, 10000.0, 100.0) else { return 0 };
+            let Ok(layout) = self.dw.CreateTextLayout(&w, &f, 10000.0, 100.0) else { return (0, false) };
             let mut trailing = windows::core::BOOL(0);
             let mut inside = windows::core::BOOL(0);
             let mut m = DWRITE_HIT_TEST_METRICS::default();
             let _ = layout.HitTestPoint(x, 5.0, &mut trailing, &mut inside, &mut m);
-            (m.textPosition + if trailing.as_bool() { m.length } else { 0 }) as usize
+            if trailing.as_bool() { ((m.textPosition + m.length) as usize, false) } else { (m.textPosition as usize, true) }
         }
+    }
+
+    /// The (x, width) pieces that the units a..b cover: more than one where Persian meets Latin.
+    pub fn sel_rects(&mut self, s: &str, font: Font, size: f32, weight: u32, a: usize, b: usize) -> Vec<(f32, f32)> {
+        let f = self.format(font, size, weight, Align::Left, false, false);
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let (a, b) = (a.min(w.len()), b.min(w.len()));
+        if a >= b {
+            return vec![];
+        }
+        unsafe {
+            let Ok(layout) = self.dw.CreateTextLayout(&w, &f, 10000.0, 100.0) else { return vec![] };
+            let mut ms = [DWRITE_HIT_TEST_METRICS::default(); 32];
+            let mut n = 0u32;
+            if layout.HitTestTextRange(a as u32, (b - a) as u32, 0.0, 0.0, Some(&mut ms), &mut n).is_ok() {
+                return ms[..(n as usize).min(32)].iter().map(|m| (m.left, m.width)).collect();
+            }
+        }
+        // (more pieces than the buffer holds: one bar from end to end)
+        let xa = self.caret_pos(s, font, size, weight, a, true);
+        let xb = self.caret_pos(s, font, size, weight, b, false);
+        vec![(xa.min(xb), (xb - xa).abs())]
     }
 
     pub fn glyph(&mut self, code: u32, r: Rect, size: f32, c: C) {

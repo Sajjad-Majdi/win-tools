@@ -79,13 +79,14 @@ Window (RustFileExplorer.exe must be running; every command answers with one lin
   gui pane 0|1 | gui preview | gui menu | gui whatis | gui rename | gui settings | gui palette [text]
   gui transfers | gui copy | gui cut | gui paste | gui delete | gui undo | gui newfolder <name>
   gui key <keys e.g. ctrl+shift+n> | gui keys <text> | gui type <text> | gui look [key value]
-  gui click X Y | gui rclick X Y | gui dblclick X Y | gui hover X Y | gui wheel X Y N
+  gui click X Y [ctrl|shift] | gui rclick X Y | gui dblclick X Y [shift] | gui hover X Y | gui wheel X Y N
   gui theme light|dark|system | gui size W H | gui shot <file.png> | gui quit
   gui shot-real <file.png>                capture the real window as Windows composes it (PrintWindow);
                                           start it with --offscreen so nothing shows on the screen
   gui capture <file.png>                  the window as DWM composes it WITH its backdrop and alpha
                                           (Windows.Graphics.Capture); prints the alpha of sample pixels
-  gui drag X0 Y0 X1 Y1 [ctrl|shift]       a mouse drag sent to the window only (no real cursor)
+  gui drag X0 Y0 X1 Y1 [ctrl|shift]       a mouse drag sent to the window only (no real cursor); dbl starts
+                                          it with a double-click (word selection in a text box)
   gui look [key value]                    show or change a Settings > Personalize value
   gui view-image <path>                   open the picture viewer (the list's pictures, or the folder's by name)
   gui view-state | view-key K | view-post K | view-click X Y | view-dblclick X Y | view-hover X Y

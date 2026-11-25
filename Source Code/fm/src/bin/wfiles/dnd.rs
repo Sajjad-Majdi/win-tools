@@ -287,9 +287,20 @@ pub fn set_clipboard_files(hwnd: HWND, paths: &[PathBuf], cut: bool) -> bool {
     }
 }
 
+/// Tests of the text boxes (WFILES_TEST_CLIP set) keep copied text inside the process: the hidden test desktop
+/// shares the real clipboard with the owner's screen, and a test must not overwrite what he copied.
+static TEST_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+fn test_clip() -> bool {
+    std::env::var_os("WFILES_TEST_CLIP").is_some()
+}
+
 pub fn set_clipboard_text(hwnd: HWND, s: &str) {
     use windows::Win32::System::DataExchange::*;
     use windows::Win32::System::Memory::*;
+    if test_clip() {
+        *TEST_CLIP.lock().unwrap() = Some(s.to_string());
+        return;
+    }
     let w = fmcore::util::wide(s);
     unsafe {
         if OpenClipboard(Some(hwnd)).is_err() {
@@ -309,6 +320,9 @@ pub fn set_clipboard_text(hwnd: HWND, s: &str) {
 pub fn clipboard_text(hwnd: HWND) -> Option<String> {
     use windows::Win32::System::DataExchange::*;
     use windows::Win32::System::Memory::*;
+    if test_clip() {
+        return TEST_CLIP.lock().unwrap().clone();
+    }
     unsafe {
         OpenClipboard(Some(hwnd)).ok()?;
         let r = GetClipboardData(13).ok().map(|h| {
