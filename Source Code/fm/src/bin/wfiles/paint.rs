@@ -254,6 +254,7 @@ impl App {
         self.h = ph as f32 / self.scale();
         self.hits.clear();
         self.name_w.clear();
+        self.inline_rect = Rect::default();
         // set again by the sidebar / rail when they are drawn (a hidden sidebar must not catch the wheel)
         self.side_area = Rect::default();
         let t = self.t.clone();
@@ -317,6 +318,7 @@ impl App {
         }
         moving |= self.hov_f.busy();
         moving |= self.press_f.busy();
+        moving |= self.drop_f.busy();
         moving |= self.menu_out.is_some() || self.drop_out.is_some();
         if moving && !self.shooting {
             self.anim();
@@ -491,28 +493,63 @@ impl App {
         let n = self.tabs.len();
         let caps_x = self.w - CAP_W * 3.0;
         let avail = (caps_x - 8.0 - 40.0 - 36.0).max(40.0);
-        let tw = (avail / n as f32).min(200.0).max(if avail / n as f32 >= 96.0 { 96.0 } else { 36.0 });
+        // Windows 11 Explorer: tabs shrink to a minimum width, then the strip scrolls (arrows at both ends) and the
+        // "+" stays put, so nothing ever runs under the caption buttons
+        const MIN_TAB_W: f32 = 72.0;
+        const ARROW_W: f32 = 24.0;
+        let overflow = MIN_TAB_W * n as f32 > avail;
+        let (sx0, sw) = if overflow { (8.0 + ARROW_W, avail - 2.0 * ARROW_W) } else { (8.0, avail) };
+        let tw = (sw / n as f32).clamp(MIN_TAB_W, 200.0);
+        self.tab_max = if overflow { (tw * n as f32 - sw).max(0.0) } else { 0.0 };
+        // bring the active tab into view when it (or the number of tabs) changed
+        if self.tab_seen != (self.cur, n) {
+            self.tab_seen = (self.cur, n);
+            if overflow {
+                let (a, b) = (tw * self.cur as f32, tw * (self.cur + 1) as f32);
+                if a < self.tab_scroll {
+                    self.tab_scroll = a;
+                } else if b > self.tab_scroll + sw {
+                    self.tab_scroll = b - sw;
+                }
+            }
+        }
+        self.tab_scroll = self.tab_scroll.clamp(0.0, self.tab_max);
+        let scroll = self.tab_scroll;
+        self.tab_strip = if overflow { Rect::new(sx0, 0.0, sw, TITLE_H) } else { Rect::new(8.0, 0.0, tw * n as f32, TITLE_H) };
+        let strip = Rect::new(sx0 - 3.0, 0.0, sw + 6.0, TITLE_H);
         let la = self.panel_alpha();
-        let mut x = 8.0;
         let mut tab_hits = vec![];
-        // every tab is one rounded rect with the same margin above and below inside the strip and a small gap between
-        // tabs, so corners never touch; icon, title and close button share one vertical centre
-        const TAB_M: f32 = 6.0;
+        // Windows 11 Explorer: the active tab is the toolbar's own surface rising into the title strip (same fill,
+        // rounded top corners, no bottom edge, small inverted curves where it meets the toolbar), so tab and toolbar
+        // read as one piece. Other tabs stay flat on the strip with a rounded hover. Icon, title and close button
+        // share one vertical centre on every tab, so nothing moves when the active tab changes.
+        const TAB_TOP: f32 = 8.0;
         const TAB_GAP: f32 = 4.0;
-        let ty = TAB_M;
-        let th = TITLE_H - 2.0 * TAB_M;
+        let th = TITLE_H - TAB_TOP - 2.0;
+        let cy = TAB_TOP + th / 2.0;
         let hov: Vec<f32> = (0..n).map(|i| self.hk(Hit::Tab(i)).max(self.hk(Hit::TabClose(i)))).collect();
-        for i in 0..n {
-            let r = Rect::new(x + TAB_GAP / 2.0, ty, tw - TAB_GAP, th);
+        // the active tab last: its feet lie over the gap to its neighbours
+        let order: Vec<usize> = (0..n).filter(|&i| i != self.cur).chain((self.cur < n).then_some(self.cur)).collect();
+        if overflow {
+            self.gfx.clip(strip);
+        }
+        for i in order {
+            let x = sx0 + tw * i as f32 - scroll;
+            if overflow && (x + tw < strip.x || x > strip.r()) {
+                continue;
+            }
             let active = i == self.cur;
-            let cy = r.cy();
+            let r = if active { Rect::new(x + TAB_GAP / 2.0, TAB_TOP, tw - TAB_GAP, TITLE_H - TAB_TOP) } else { Rect::new(x + TAB_GAP / 2.0, TAB_TOP, tw - TAB_GAP, th) };
             // the tab a tab menu is open for shows as hovered
             let hov_i = if self.menu.is_some() && self.menu_tab == Some(i) { 1.0 } else { hov[i] };
             if active {
-                self.gfx.fill_round(r, R_CTRL, t.bar.a(la));
-                self.gfx.stroke_round(r, R_CTRL, t.stroke.a(t.stroke.3 * 0.8), 1.0);
+                let (rad, foot) = (self.gfx.rad(R_CTRL), self.gfx.rad(6.0));
+                self.gfx.fill_path(&tab_shape(r, rad, foot, true), 0.0, 0.0, 1.0, t.bar.a(la));
+                let sr = Rect::new(r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 0.5);
+                self.gfx.stroke_path(&tab_shape(sr, rad, foot, false), 0.0, 0.0, 1.0, t.stroke.a(t.stroke.3 * 0.8), 1.0);
             } else {
                 self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hov_i));
+                self.drop_light(r, Hit::Tab(i), R_CTRL, t);
                 // a thin divider in the gap between two quiet tabs
                 if i > 0 && i - 1 != self.cur {
                     let q = 1.0 - hov[i].max(hov[i - 1]);
@@ -524,9 +561,9 @@ impl App {
             let tab = &self.tabs[i];
             let loc = tab.pane().loc.clone();
             let title = tab.title();
-            let small = tw < 80.0;
-            let ix = if small { r.x + (r.w - 16.0) / 2.0 } else { r.x + 10.0 };
-            let ir = Rect::new(ix, cy - 8.0, 16.0, 16.0);
+            // the icon stays where it is; the close button is on every tab while they are wide, and on the active and
+            // the hovered tab when they are narrow; the title takes what is left
+            let ir = Rect::new(r.x + 10.0, cy - 8.0, 16.0, 16.0);
             match loc {
                 Loc::Settings => self.gfx.glyph(0xE713, ir, 15.0, t.text2),
                 Loc::Cleanup => self.gfx.glyph(crate::cleanup_page::BROOM, ir, 15.0, t.text2),
@@ -535,27 +572,45 @@ impl App {
                 Loc::Folder(ref p) if p.parent().is_none() => ficons::draw(&self.gfx, t, Kind::Drive, ir),
                 _ => ficons::draw(&self.gfx, t, Kind::Folder, ir),
             }
-            if !small {
-                // close: a centred square button with its own small rounded hover
-                let cs = 20.0;
-                let cr = Rect::new(r.r() - 6.0 - cs, cy - cs / 2.0, cs, cs);
-                let tx = ir.r() + 8.0;
-                self.name_w.push((Hit::Tab(i), cr.x - 4.0 - tx));
-                self.gfx.text_mid(&title, Rect::new(tx, r.y, cr.x - 4.0 - tx, r.h), Font::Ui, 12.0, 400, Align::Left, if active { t.text } else { t.text2 });
-                let hk = self.hk(Hit::TabClose(i));
-                self.gfx.fill_round(cr, R_SMALL, t.hover.a(t.hover.3 * 1.4 * hk));
-                self.gfx.glyph(0xE711, cr, 10.0, if hk > 0.5 { t.text } else { t.text2 });
-                tab_hits.push((r, Hit::Tab(i)));
-                tab_hits.push((cr, Hit::TabClose(i)));
+            let wide = tw >= 96.0;
+            let show_close = wide || active || hov_i > 0.02;
+            let cs = 20.0;
+            let cr = Rect::new(r.r() - 6.0 - cs, cy - cs / 2.0, cs, cs);
+            let tx = ir.r() + 8.0;
+            let tail = if show_close { cr.x - 4.0 } else { r.r() - 8.0 };
+            if tail - tx >= 24.0 {
+                self.name_w.push((Hit::Tab(i), tail - tx));
+                self.gfx.text_mid(&title, Rect::new(tx, cy - th / 2.0, tail - tx, th), Font::Ui, 12.0, 400, Align::Left, if active { t.text } else { t.text2 });
             } else {
-                tab_hits.push((r, Hit::Tab(i)));
+                // no room for the name: the tooltip gives it
+                self.name_w.push((Hit::Tab(i), 0.0));
             }
-            x += tw;
+            // a hit rectangle never reaches under the scroll arrows
+            let clipped = |r: Rect| if overflow { let x0 = r.x.max(strip.x); let x1 = r.r().min(strip.r()); Rect::new(x0, r.y, (x1 - x0).max(0.0), r.h) } else { r };
+            tab_hits.push((clipped(r), Hit::Tab(i)));
+            if show_close {
+                let hk = self.hk(Hit::TabClose(i));
+                let fade = if wide || active { 1.0 } else { hov_i.min(1.0) };
+                self.gfx.fill_round(cr, R_SMALL, t.hover.a(t.hover.3 * 1.4 * hk));
+                let fg = if hk > 0.5 { t.text } else { t.text2 };
+                self.gfx.glyph(0xE711, cr, 10.0, fg.a(fg.3 * fade));
+                tab_hits.push((clipped(cr), Hit::TabClose(i)));
+            }
+        }
+        if overflow {
+            self.gfx.unclip();
         }
         for (r, h) in tab_hits {
             self.hit(r, h);
         }
-        let ar = Rect::new(x + 2.0, ty, th, th);
+        if overflow {
+            // scroll arrows at both ends of the strip
+            let (lo, hi) = (self.tab_scroll > 0.5, self.tab_scroll < self.tab_max - 0.5);
+            let ay = cy - 14.0;
+            self.icon_btn(Rect::new(8.0, ay, ARROW_W, 28.0), 0xE76B, 10.0, if lo { t.text2 } else { t.text_dis }, Hit::TabScroll(-1), R_CTRL, t);
+            self.icon_btn(Rect::new(sx0 + sw, ay, ARROW_W, 28.0), 0xE76C, 10.0, if hi { t.text2 } else { t.text_dis }, Hit::TabScroll(1), R_CTRL, t);
+        }
+        let ar = Rect::new(8.0 + if overflow { avail } else { tw * n as f32 } + 2.0, cy - 14.0, 28.0, 28.0);
         if ar.r() < caps_x - 4.0 {
             self.icon_btn(ar, 0xE710, 12.0, t.text2, Hit::TabAdd, R_CTRL, t);
         }
@@ -694,15 +749,24 @@ impl App {
         }
         let vr = Rect::new(nx, y, vw, 32.0);
         let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
+        // Settings and Clean up have no views: the button is dim, with no hover pill, tooltip or click
+        let off = cleanup || self.pane().loc == Loc::Settings;
         if narrow {
-            self.icon_btn(vr, g, 14.0, if cleanup { t.text_dis } else { t.text }, Hit::ViewBtn, R_CTRL, t);
+            if off {
+                self.gfx.glyph(g, vr, 14.0, t.text_dis);
+            } else {
+                self.icon_btn(vr, g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
+            }
         } else {
             let open = self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false);
-            self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
-            let off = cleanup || self.pane().loc == Loc::Settings;
+            if !off {
+                self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
+            }
             self.gfx.glyph(g, Rect::new(vr.x + 12.0, vr.y, 14.0, 32.0), 14.0, if off { t.text_dis } else { t.text });
             self.gfx.glyph(0xE70D, Rect::new(vr.x + 32.0, vr.y, 9.0, 32.0), 9.0, if off { t.text_dis } else { t.text2 });
-            self.hit(vr, Hit::ViewBtn);
+            if !off {
+                self.hit(vr, Hit::ViewBtn);
+            }
         }
         // omnibox
         let searching = self.pane().search.is_some();
@@ -735,7 +799,8 @@ impl App {
                 .as_ref()
                 .map(|s| {
                     let asking = s.busy && !s.note.is_empty();
-                    (self.ai_on && (asking || s.ai.is_some() || (empty && !s.busy && !s.field.text.trim().is_empty())), asking)
+                    // (a search on its way after an empty answer keeps the sparkle: no pop again per word)
+                    (self.ai_on && (asking || s.ai.is_some() || (empty && (!s.busy || s.quiet()) && !s.field.text.trim().is_empty())), asking)
                 })
                 .unwrap_or((false, false));
             if !armed {
@@ -829,6 +894,7 @@ impl App {
                 let w = widths[i].min((sr.x - 8.0 - x).max(30.0));
                 let r = Rect::new(x, cy, w, 26.0);
                 self.gfx.fill_round(r, R_SMALL, t.hover.a(t.hover.3 * self.hk(Hit::Crumb(i))));
+                self.drop_light(r, Hit::Crumb(i), R_SMALL, t);
                 self.gfx.text(&c.0, Rect::new(r.x + 6.0, r.y, r.w - 12.0, r.h), Font::Ui, 13.0, if i == last { 600 } else { 400 }, Align::Left, t.text);
                 self.hit(r, Hit::Crumb(i));
                 x += w;
@@ -1011,6 +1077,17 @@ impl App {
             self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * hk));
             self.gfx.fill_round(r, R_CTRL, t.press.a(t.press.3 * pk * 0.7));
         }
+        self.drop_light(r, h, R_CTRL, t);
+    }
+
+    /// The drop-target light of a place that files are dragged onto (fades in and out).
+    pub(crate) fn drop_light(&mut self, r: Rect, h: Hit, rad: f32, t: &Theme) {
+        let dk = self.drop_f.get(h);
+        if dk > 0.001 {
+            self.gfx.fill_round(r, rad, t.sel.a(t.sel.3 * dk));
+            self.gfx.fill_round(r, rad, t.accent.a(0.10 * dk));
+            self.gfx.stroke_round(r, rad, t.accent.a(dk), 1.5);
+        }
     }
 
     fn paint_rail(&mut self, t: &Theme) {
@@ -1038,10 +1115,21 @@ impl App {
         y -= self.rail_scroll;
         self.gfx.clip(area);
         let vis = |r: Rect| r.y >= area.y - 1.0 && r.b() <= area.b() + 1.0;
+        // a row cut by the edge of the area fades with the part that shows (never a sliver of half an icon)
+        let fade = |r: Rect| ((r.b().min(area.b()) - r.y.max(area.y)) / r.h).clamp(0.0, 1.0);
         let r = Rect::new(x, y, 40.0, 36.0);
         let sel = self.pane().loc == Loc::ThisPc;
-        self.nav_bg(r, sel, Hit::SideThisPc, t);
-        self.gfx.glyph(0xE7F8, r, 16.0, t.text2);
+        let f = fade(r);
+        if f > 0.02 {
+            if f < 0.99 {
+                self.gfx.opacity_layer(r.inset(-2.0, -2.0), f * f);
+            }
+            self.nav_bg(r, sel, Hit::SideThisPc, t);
+            self.gfx.glyph(0xE7F8, r, 16.0, t.text2);
+            if f < 0.99 {
+                self.gfx.pop_layer();
+            }
+        }
         if vis(r) {
             self.hit(r, Hit::SideThisPc);
         }
@@ -1051,11 +1139,20 @@ impl App {
                 let r = Rect::new(x, y, 40.0, 36.0);
                 let loc = Loc::Folder(d.root.clone().into());
                 let sel = self.side_selected(&loc);
-                self.nav_bg(r, sel, Hit::Side(side.len() + i), t);
-                let chip = Rect::new(r.cx() - 13.0, r.cy() - 10.0, 26.0, 20.0);
-                self.gfx.fill_round(chip, R_SMALL, t.layer2);
-                self.gfx.stroke_round(chip, R_SMALL, t.stroke, 1.0);
-                self.gfx.text(d.root.trim_end_matches('\\'), chip, Font::Ui, 12.0, 600, Align::Center, t.text2);
+                let f = fade(r);
+                if f > 0.02 {
+                    if f < 0.99 {
+                        self.gfx.opacity_layer(r.inset(-2.0, -2.0), f * f);
+                    }
+                    self.nav_bg(r, sel, Hit::Side(side.len() + i), t);
+                    let chip = Rect::new(r.cx() - 13.0, r.cy() - 10.0, 26.0, 20.0);
+                    self.gfx.fill_round(chip, R_SMALL, t.layer2);
+                    self.gfx.stroke_round(chip, R_SMALL, t.stroke, 1.0);
+                    self.gfx.text(d.root.trim_end_matches('\\'), chip, Font::Ui, 12.0, 600, Align::Center, t.text2);
+                    if f < 0.99 {
+                        self.gfx.pop_layer();
+                    }
+                }
                 if vis(r) {
                     self.hit(r, Hit::Side(side.len() + i));
                 }
@@ -1069,14 +1166,23 @@ impl App {
             for (i, (_, glyph, color, loc)) in side.iter().enumerate() {
                 let r = Rect::new(x, y, 40.0, 36.0);
                 let sel = self.side_selected(loc);
-                self.nav_bg(r, sel, Hit::Side(i), t);
-                if *glyph == 0 {
-                    let p = loc.path().map(|p| p.to_path_buf()).unwrap_or_default();
-                    let (a, m) = self.dir_attrs(&p);
-                    self.item_icon_a(&p, "", true, a, m, Kind::Folder, Rect::new(r.cx() - 8.0, r.cy() - 8.0, 16.0, 16.0), t);
-                } else {
-                    let c = if *color == 0 { t.text2 } else { C::hex(*color) };
-                    self.gfx.glyph(*glyph, r, 16.0, c);
+                let f = fade(r);
+                if f > 0.02 {
+                    if f < 0.99 {
+                        self.gfx.opacity_layer(r.inset(-2.0, -2.0), f * f);
+                    }
+                    self.nav_bg(r, sel, Hit::Side(i), t);
+                    if *glyph == 0 {
+                        let p = loc.path().map(|p| p.to_path_buf()).unwrap_or_default();
+                        let (a, m) = self.dir_attrs(&p);
+                        self.item_icon_a(&p, "", true, a, m, Kind::Folder, Rect::new(r.cx() - 8.0, r.cy() - 8.0, 16.0, 16.0), t);
+                    } else {
+                        let c = if *color == 0 { t.text2 } else { C::hex(*color) };
+                        self.gfx.glyph(*glyph, r, 16.0, c);
+                    }
+                    if f < 0.99 {
+                        self.gfx.pop_layer();
+                    }
                 }
                 if vis(r) {
                     self.hit(r, Hit::Side(i));
@@ -1172,7 +1278,8 @@ impl App {
     fn paint_strip(&mut self, s: Rect, p: usize, t: &Theme) {
         let pane = &self.tabs[self.cur].panes[p];
         let Some(se) = pane.search.as_ref() else { return };
-        let (pc, ft, fs, fd, total, busy) = (se.pc, se.ftype, se.fsize, se.fdate, se.total, se.busy);
+        // busy after an empty answer: the strip stays as it was (no "Searching..." flash per typed word)
+        let (pc, ft, fs, fd, total, busy) = (se.pc, se.ftype, se.fsize, se.fdate, se.total, se.busy && !se.quiet());
         let note = se.note.clone();
         let ai = se.ai.clone();
         let here = pane.loc.title();
@@ -1369,7 +1476,7 @@ impl App {
             } else if loading {
                 String::new()
             } else if pane_searching {
-                if self.tabs[cur].panes[p].search.as_ref().map(|s| s.busy).unwrap_or(false) { String::new() } else { "No results".into() }
+                if self.tabs[cur].panes[p].search.as_ref().map(|s| s.busy && !s.quiet()).unwrap_or(false) { String::new() } else { "No results".into() }
             } else {
                 if self.tabs[cur].panes[p].loc == Loc::RecycleBin { "The Recycle Bin is empty".into() } else { "This folder is empty".into() }
             };
@@ -1379,7 +1486,7 @@ impl App {
                 ""
             } else if pane_searching {
                 let s = self.tabs[cur].panes[p].search.as_ref();
-                if s.map(|s| s.busy).unwrap_or(true) {
+                if s.map(|s| s.busy && !s.quiet()).unwrap_or(true) {
                     ""
                 } else if self.ai_on && s.map(|s| s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false) {
                     // under "No results": plain words work, then the big "Search with AI" button (Sajjad, 2026-11-23)
@@ -1400,7 +1507,7 @@ impl App {
                 self.gfx.text(hint, Rect::new(list.x, list.y + 64.0, list.w, 20.0), Font::Ui, 12.0, 400, Align::Center, t.text3.a(0.8));
             }
             // nothing by name: describe it in your own words with AI Search (or turn AI on first)
-            let no_hits = pane_searching && self.tabs[cur].panes[p].search.as_ref().map(|s| !s.busy && s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false);
+            let no_hits = pane_searching && self.tabs[cur].panes[p].search.as_ref().map(|s| (!s.busy || s.quiet()) && s.ai.is_none() && !s.field.text.trim().is_empty()).unwrap_or(false);
             if no_hits && error.is_none() && !loading {
                 // AI on: one big "Search with AI" button (Enter does the same); AI off: offer to turn it on
                 if self.ai_on {
@@ -1478,11 +1585,10 @@ impl App {
             let h = Hit::Row(p, i);
             let is_sel = sel.contains(&it.path);
             let (hk, pk) = (self.hk(h), self.pk(h));
-            let target = drop_target.as_ref() == Some(&it.path);
-            if target {
-                self.gfx.fill_round(r, rad, t.sel);
-                self.gfx.stroke_round(r, rad, t.accent, 1.5);
-            } else if is_sel {
+            // a folder that files are dragged onto: an accent fill and ring that fade in and out (Explorer)
+            let dk = if self.shooting && drop_target.as_ref() == Some(&it.path) { 1.0 } else { self.drop_f.get(h) };
+            let target = dk > 0.5;
+            if is_sel && !target {
                 sel_fill(self, i, r, &it.path);
                 if grid || pc {
                     self.gfx.stroke_round(r, rad, t.sel_stroke.a(if slide.is_some() { 0.0 } else { 1.0 }), 1.0);
@@ -1494,6 +1600,11 @@ impl App {
             if !target {
                 self.gfx.fill_round(r, rad, t.hover.a(t.hover.3 * hk * if is_sel { 0.6 } else { 1.0 }));
                 self.gfx.fill_round(r, rad, t.press.a(t.press.3 * pk * 0.8));
+            }
+            if dk > 0.001 {
+                self.gfx.fill_round(r, rad, t.sel.a(t.sel.3 * dk));
+                self.gfx.fill_round(r, rad, t.accent.a(0.10 * dk));
+                self.gfx.stroke_round(r, rad, t.accent.a(dk), 1.5);
             }
             if focus == Some(i) {
                 self.gfx.stroke_round(r, rad, t.accent, 1.0);
@@ -1526,7 +1637,15 @@ impl App {
                 } else {
                     self.item_icon_a(&it.path, &it.name, it.is_dir, it.attrs, it.modified, it.kind, Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0), t);
                 }
-                self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, r.y + 108.0, 128.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
+                if let Some((_, f)) = inline.as_ref().filter(|x| x.0 == it.path) {
+                    // rename in place: the label becomes an edit box (F2, or a slow second click on the name)
+                    let fr = Rect::new(r.x + 2.0, r.y + 110.0, r.w - 4.0, 26.0);
+                    self.inline_rect = fr;
+                    self.field_box(fr, true, t);
+                    self.field_text(f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 12.5, true, t, &[]);
+                } else {
+                    self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, r.y + 108.0, 128.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
+                }
             } else {
                 let rh = r.h;
                 self.item_icon_a(&it.path, &it.name, it.is_dir, it.attrs, it.modified, it.kind, Rect::new(r.x + 10.0, r.cy() - isz / 2.0, isz, isz), t);
@@ -1536,6 +1655,7 @@ impl App {
                 let name = self.display_name(it);
                 if let Some((_, f)) = inline.as_ref().filter(|x| x.0 == it.path) {
                     let fr = Rect::new(nx - 6.0, r.y + (rh - 26.0) / 2.0, nw + 6.0, 26.0);
+                    self.inline_rect = fr;
                     self.field_box(fr, true, t);
                     self.field_text(f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 13.0, true, t, &[]);
                 } else if pane_searching {
@@ -1692,6 +1812,29 @@ impl App {
                 x += w + 14.0;
             }
         }
+        // Explorer's two view toggles at the bottom right: Details and Grid, the one in use lit; the View menu at the
+        // top keeps every view (only where a view applies: not This PC, Settings, Clean up or search results)
+        let mut right = r.r() - 8.0;
+        let pane = self.pane();
+        if !matches!(pane.loc, Loc::Settings | Loc::Cleanup | Loc::ThisPc) && !pane.searching() {
+            // two separate view buttons (Sajjad, 2026-11-26: back from the segmented button to this first look)
+            let view = self.tab().view;
+            for (k, glyph, on) in [(1u8, 0xF0E2u32, view == View::Grid), (0u8, 0xE8FDu32, view == View::Details)] {
+                let br = Rect::new(right - 28.0, y + 3.0, 28.0, 24.0);
+                let h = Hit::ViewQuick(k);
+                let (hk, pk) = (self.hk(h), self.pk(h));
+                if on {
+                    self.gfx.fill_round(br, R_SMALL, t.navsel);
+                    self.gfx.fill_round(Rect::new(br.cx() - 6.0, br.b() - 3.0, 12.0, 2.0), 1.0, t.accent);
+                }
+                self.gfx.fill_round(br, R_SMALL, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(br, R_SMALL, t.press.a(t.press.3 * pk * 0.7));
+                self.gfx.glyph(glyph, br, 14.0, if on { t.text } else { t.text2 });
+                self.hit(br, h);
+                right -= 30.0;
+            }
+            right -= 6.0;
+        }
         // copy queue item
         let (active, title, frac, clashes, paused) = {
             let q = self.jobs.0.lock().unwrap();
@@ -1711,7 +1854,7 @@ impl App {
             let pw = self.gfx.measure(&pct, Font::Ui, 12.0, 400);
             let cw = if clashes > 0 { 30.0 } else { 0.0 };
             let w = 10.0 + 14.0 + 8.0 + lw + 8.0 + if active { 56.0 + 8.0 + pw + 4.0 } else { 0.0 } + cw + 10.0;
-            let xr = Rect::new(r.r() - 8.0 - w, y + 3.0, w, 24.0);
+            let xr = Rect::new(right - w, y + 3.0, w, 24.0);
             if self.xfer_open {
                 self.gfx.fill_round(xr, R_SMALL, t.press);
             } else if self.hov(Hit::Xfer) {
@@ -2255,7 +2398,7 @@ impl App {
             (0xE7B3, "Show hidden files", "", self.ui.hidden, 6),
             (0xE74D, "Ask before delete", "Delete goes to the Recycle Bin and can be undone", self.ui.ask_delete, 7),
         ];
-        let r = Rect::new(rx, y, colw, 38.0 + 4.0 * 48.0 + 52.0 + 4.0);
+        let r = Rect::new(rx, y, colw, 38.0 + 4.0 * 48.0 + 52.0 + 48.0 + 4.0);
         self.set_card(r, t);
         self.gfx.text("Files and folders", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
         let mut ry = r.y + 38.0;
@@ -2265,6 +2408,13 @@ impl App {
             self.toggle(Rect::new(r.r() - 16.0 - 40.0, ry, 40.0, h), *on, Hit::Set(*id), t);
             ry += h;
         }
+        // where a double-clicked picture opens: the built-in viewer (default) or the Windows default app
+        self.set_row(r.x, ry, r.w, 48.0, 0xE91B, "Open pictures in", "", false, t);
+        let pw = 214.0f32.min(r.w * 0.5);
+        let full = crate::input::PICTURE_OPENERS[if self.ui.viewer { 0 } else { 1 }];
+        let label = if self.ui.viewer && self.gfx.measure(full, Font::Ui, 13.0, 400) > pw - 50.0 { "Built-in viewer" } else { full };
+        self.dropdown(Rect::new(r.r() - 16.0 - pw, ry + 8.0, pw, 32.0), label, Hit::Set(35), t, Font::Ui);
+        ry += 48.0;
         self.paint_cleanup_hidden(Rect::new(r.x, ry, r.w, 48.0), t);
         // the longer column decides how far Settings scrolls
         self.settings_h = r.b().max(left_end - 12.0) + 16.0 + scroll - c.y;
@@ -2312,6 +2462,7 @@ impl App {
     }
 
     fn paint_overlays(&mut self, t: &Theme) {
+        self.paint_name_tip(t);
         if self.toast.is_some() {
             self.paint_toast(t);
         }
@@ -2383,6 +2534,25 @@ impl App {
         }
     }
 
+    /// Explorer's tip under a rename box that refused a character: names cannot hold \ / : * ? " < > |
+    fn paint_name_tip(&mut self, t: &Theme) {
+        let Some(at) = self.inline_tip else { return };
+        if self.inline.is_none() || self.inline_rect.w <= 0.0 || (at.elapsed().as_secs_f32() > 4.0 && !self.shooting) {
+            return;
+        }
+        let msg = "A file name can't contain any of the following characters:";
+        let chars = "\\ / : * ? \" < > |";
+        let w = (self.gfx.measure(msg, Font::Ui, 12.0, 400).max(self.gfx.measure(chars, Font::Ui, 12.0, 600)) + 46.0).min(self.w - 16.0);
+        let fr = self.inline_rect;
+        let x = fr.x.min(self.w - w - 8.0).max(8.0);
+        let y = if fr.b() + 6.0 + 52.0 < self.h - 8.0 { fr.b() + 6.0 } else { fr.y - 6.0 - 52.0 };
+        let r = Rect::new(x, y, w, 52.0);
+        self.card(r, R_MENU, t, false);
+        self.gfx.glyph(0xE7BA, Rect::new(r.x + 10.0, r.y + 6.0, 16.0, 18.0), 12.0, t.danger);
+        self.gfx.text(msg, Rect::new(r.x + 30.0, r.y + 5.0, w - 36.0, 20.0), Font::Ui, 12.0, 400, Align::Left, t.text);
+        self.gfx.text(chars, Rect::new(r.x + 30.0, r.y + 26.0, w - 36.0, 20.0), Font::Ui, 12.0, 600, Align::Left, t.text);
+    }
+
     fn paint_toast(&mut self, t: &Theme) {
         let Some(to) = self.toast.as_ref() else { return };
         let age = to.at.elapsed().as_secs_f32();
@@ -2405,8 +2575,11 @@ impl App {
         }
         let w = fixed + tw + bw;
         let x0 = if self.w - w - 16.0 < m.x + 24.0 { 8.0f32.max(self.w - w - 8.0) } else { m.x + 24.0 };
-        // while a rename box is open the toast goes to the top, so it never covers the box
-        let y = if self.inline.is_some() { TOP + 12.0 - (1.0 - k) * 12.0 } else { self.h - 42.0 - 48.0 + (1.0 - k) * 12.0 };
+        // it sits at the bottom, or at the top when that would cover the rename box (or its tip)
+        let bottom = self.h - 42.0 - 48.0;
+        let ib = self.inline_rect;
+        let covers = |y: f32| self.inline.is_some() && ib.w > 0.0 && y < ib.b() + 52.0 && y + 48.0 > ib.y - 8.0 && x0 < ib.r() + 8.0 && x0 + w > ib.x - 8.0;
+        let y = if covers(bottom) { TOP + 12.0 - (1.0 - k) * 12.0 } else { bottom + (1.0 - k) * 12.0 };
         let r = Rect::new(x0, y, w, 48.0);
         self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.clamp(0.05, 1.0));
         self.card(r, R_MENU, t, false);
@@ -2432,7 +2605,7 @@ impl App {
 
     pub fn menu_rect(&self) -> Option<Rect> {
         let m = self.menu.as_ref()?;
-        let mut h = 8.0 + if m.bg { 0.0 } else { 47.0 };
+        let mut h = 8.0 + if m.bg { 0.0 } else { QUICK_H + 1.0 };
         for it in &m.items {
             h += 32.0 + if it.sep { 9.0 } else { 0.0 };
         }
@@ -2478,6 +2651,12 @@ impl App {
                 let col = if c == u32::MAX { self.windows_accent() } else { C::hex(c) };
                 self.gfx.ellipse(ib.cx(), ib.cy(), 7.5, col, true, 1.0);
                 self.gfx.ellipse(ib.cx(), ib.cy(), 7.5, t.text.a(0.18), false, 1.0);
+            }
+            // every row of the context menu and its submenus has an icon: the shell's own, else ours, else a glyph
+            // that fits the words (print, star, rotate, history, Bluetooth, documents ...), else a neutral one
+            let ctx_row = matches!(h, Hit::MenuItem(_) | Hit::SubItem(_));
+            let mut drawn = it.swatch.is_some();
+            if drawn {
             } else if let Some(icon) = it.icon.clone() {
                 // the shell entry's own icon, drawn at 16 DIP like ours
                 let key = std::path::PathBuf::from(format!("menuicon:{}:{}", it.label, icon.width));
@@ -2495,11 +2674,14 @@ impl App {
                 };
                 if let Some(b) = bmp {
                     self.gfx.bitmap(&b, ib, if it.enabled { 1.0 } else { 0.4 });
+                    drawn = true;
                 }
-            } else if it.glyph != 0 {
-                self.gfx.glyph(it.glyph, Rect::new(ir.x + 10.0, ir.y, 16.0, ir.h), 16.0, fg);
             }
-            let tx = if any_icon { ir.x + 38.0 } else { ir.x + 12.0 };
+            if !drawn && (it.glyph != 0 || ctx_row) {
+                let g = if it.glyph != 0 { it.glyph } else { menu_glyph(it.shell.as_deref().unwrap_or(""), &it.label) };
+                self.gfx.glyph(g, Rect::new(ir.x + 10.0, ir.y, 16.0, ir.h), 16.0, if it.enabled { t.text2 } else { t.text_dis });
+            }
+            let tx = if any_icon || ctx_row { ir.x + 38.0 } else { ir.x + 12.0 };
             let kw = if it.keys.is_empty() { 0.0 } else { self.gfx.measure(&it.keys, Font::Ui, 12.0, 400) + 4.0 };
             self.gfx.text(&it.label, Rect::new(tx, ir.y, ir.r() - tx - kw - 30.0, ir.h), Font::Ui, 13.0, if it.bold { 600 } else { 400 }, Align::Left, fg);
             let app_row = it.pin.is_some();
@@ -2575,13 +2757,29 @@ impl App {
         self.hit(r, Hit::Block);
         let mut y = r.y + 4.0;
         if !bg {
-            let qs = [(0u8, 0xE8C6u32), (1, 0xE8C8), (2, 0xE8AC), (3, 0xE74D)];
-            let slot = (r.w - 20.0) / 4.0;
-            for (i, (id, g)) in qs.iter().enumerate() {
-                let br = Rect::new(r.x + 10.0 + slot * i as f32 + (slot - 40.0) / 2.0, y + 4.0, 40.0, 36.0);
-                self.icon_btn(br, *g, 16.0, t.text, Hit::MenuQuick(*id), R_CTRL, t);
+            // Cut, Copy, Rename, Delete: four equal cells with the label under the icon and thin dividers between
+            // them; the whole cell is the button (hover and press light all of it)
+            let qs = [(0u8, 0xE8C6u32, "Cut"), (1, 0xE8C8, "Copy"), (2, 0xE8AC, "Rename"), (3, 0xE74D, "Delete")];
+            let (x0, w) = (r.x + 4.0, r.w - 8.0);
+            let cw = w / 4.0;
+            let ch = QUICK_H - 6.0;
+            for (i, (id, g, label)) in qs.iter().enumerate() {
+                let cell = Rect::new(x0 + cw * i as f32, y, cw, ch);
+                let h = Hit::MenuQuick(*id);
+                let (hk, pk) = (self.hk(h), self.pk(h));
+                let inner = cell.inset(2.0, 0.0);
+                self.gfx.fill_round(inner, R_CTRL, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(inner, R_CTRL, t.press.a(t.press.3 * pk * 0.8));
+                if i > 0 {
+                    // a divider fades where a neighbouring cell is lit
+                    let q = 1.0 - hk.max(self.hk(Hit::MenuQuick(qs[i - 1].0)));
+                    self.gfx.fill(Rect::new(cell.x - 0.5, cell.y + 10.0, 1.0, ch - 20.0), t.divider.a(t.divider.3 * q));
+                }
+                self.gfx.glyph(*g, Rect::new(cell.x, cell.y + 9.0, cell.w, 18.0), 16.0, t.text);
+                self.gfx.text(label, Rect::new(cell.x + 2.0, cell.y + 30.0, cell.w - 4.0, 16.0), Font::Ui, 11.5, 400, Align::Center, t.text2);
+                self.hit(cell, h);
             }
-            y += 46.0;
+            y += QUICK_H;
             self.gfx.fill(Rect::new(r.x, y - 1.0, r.w, 1.0), t.divider);
             y += 4.0;
         }
@@ -3038,12 +3236,15 @@ impl App {
         bx -= ow;
         self.button(Rect::new(bx, hr.y + 12.0, ow, 32.0), open_label, 0, Btn::Accent, Hit::Pv(1), t);
         bx -= 12.0;
-        let ww = self.gfx.measure("Open with", Font::Ui, 13.0, 400) + 12.0 + 9.0 + 6.0 + 12.0;
-        bx -= ww;
-        let owr = Rect::new(bx, hr.y + 12.0, ww, 32.0);
-        self.button(owr, "", 0, Btn::Std, Hit::Pv(2), t);
-        self.gfx.text("Open with", Rect::new(owr.x + 12.0, owr.y, ww - 24.0, owr.h), Font::Ui, 13.0, 400, Align::Left, t.text);
-        self.gfx.glyph(0xE70D, Rect::new(owr.r() - 21.0, owr.y, 9.0, owr.h), 9.0, t.text2);
+        // a folder has no apps to open it with
+        if !is_dir {
+            let ww = self.gfx.measure("Open with", Font::Ui, 13.0, 400) + 12.0 + 9.0 + 6.0 + 12.0;
+            bx -= ww;
+            let owr = Rect::new(bx, hr.y + 12.0, ww, 32.0);
+            self.button(owr, "", 0, Btn::Std, Hit::Pv(2), t);
+            self.gfx.text("Open with", Rect::new(owr.x + 12.0, owr.y, ww - 24.0, owr.h), Font::Ui, 13.0, 400, Align::Left, t.text);
+            self.gfx.glyph(0xE70D, Rect::new(owr.r() - 21.0, owr.y, 9.0, owr.h), 9.0, t.text2);
+        }
         if data.as_ref().map(|d| d.kind == PvKind::Text).unwrap_or(false) {
             let cw = 12.0 + 14.0 + 8.0 + self.gfx.measure("Copy", Font::Ui, 13.0, 400) + 12.0;
             bx -= 12.0 + cw;
@@ -3134,7 +3335,9 @@ impl App {
                     self.item_icon(&path, &name, is_dir, ficons::kind_of(&name, is_dir), Rect::new(body.cx() - 48.0, body.cy() - 48.0, 96.0, 96.0), t);
                 }
                 if d.kind == PvKind::Other {
-                    let hint = if matches!(fmcore::util::ext_of(&name).as_str(), "exe" | "msi" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs") {
+                    let hint = if is_dir {
+                        "A folder. Open shows what is inside it."
+                    } else if matches!(fmcore::util::ext_of(&name).as_str(), "exe" | "msi" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs") {
                         "A program: no preview. Run starts it."
                     } else {
                         "No preview for this type. Open opens it in its app."
@@ -3177,10 +3380,11 @@ impl App {
     fn paint_ghost(&mut self, t: &Theme) {
         let Some(d) = self.drag_in.as_ref() else { return };
         let (x, y, n, eff) = (d.x, d.y, d.paths.len(), d.effect);
-        if eff == 0 {
+        // the source's own drag image is drawn by the shell, with "Move to ..." under it: no second card
+        if eff == 0 || d.image {
             return;
         }
-        let target = d.target.clone().or_else(|| self.pane().dir()).map(|p| folder_title(&p)).unwrap_or_default();
+        let target = d.dest.clone().or_else(|| self.pane().dir()).map(|p| folder_title(&p)).unwrap_or_default();
         let verb = if eff == 2 { "Move to " } else { "Copy to " };
         let vw = self.gfx.measure(verb, Font::Ui, 12.5, 400);
         let tw = self.gfx.measure(&target, Font::Ui, 12.5, 600);
@@ -3198,3 +3402,103 @@ impl App {
     }
 }
 
+/// Outline of the active tab: rounded top corners, straight sides down to the toolbar and small inverted curves
+/// ("feet") where it meets it, so the tab and the toolbar read as one surface (Windows 11 Explorer). `closed` fills
+/// it; open, it is the outline without a bottom edge.
+fn tab_shape(r: Rect, rad: f32, foot: f32, closed: bool) -> Vec<crate::gfx::P> {
+    use crate::gfx::P;
+    // cubic bezier handle of a quarter circle
+    const K: f32 = 0.5523;
+    let (x0, x1, top, bot) = (r.x, r.r(), r.y, r.b());
+    let mut v = vec![
+        P::M(x0 - foot, bot),
+        P::B(x0 - foot + K * foot, bot, x0, bot - foot + K * foot, x0, bot - foot),
+        P::L(x0, top + rad),
+        P::B(x0, top + rad - K * rad, x0 + rad - K * rad, top, x0 + rad, top),
+        P::L(x1 - rad, top),
+        P::B(x1 - rad + K * rad, top, x1, top + rad - K * rad, x1, top + rad),
+        P::L(x1, bot - foot),
+        P::B(x1, bot - foot + K * foot, x1 + foot - K * foot, bot, x1 + foot, bot),
+    ];
+    if closed {
+        v.push(P::Z);
+    }
+    v
+}
+
+/// Height of the context menu's Cut / Copy / Rename / Delete cells (with the divider under them).
+const QUICK_H: f32 = 62.0;
+
+/// A glyph for a menu row that brought no icon of its own (shell verbs such as Print, Add to Favorites, Rotate,
+/// Restore previous versions, Send to > Bluetooth / Documents, and anything unknown), in the style of the app's
+/// other menu glyphs (Segoe Fluent Icons). Looks at the verb and the words of the row.
+pub fn menu_glyph(verb: &str, label: &str) -> u32 {
+    let v = verb.to_lowercase();
+    let t = label.to_lowercase();
+    // a group row "Send to > Documents": the entry's own words decide
+    let last = t.rsplit('\u{203A}').next().unwrap_or(&t).trim().to_string();
+    let has = |k: &str| v.contains(k) || last.contains(k);
+    if last.starts_with("loading") {
+        0xE895 // sync
+    } else if last.starts_with("nothing") {
+        0xE946 // info
+    } else if has("print") || has("fax") {
+        0xE749 // print
+    } else if has("favorite") || has("favourite") || has("star") {
+        0xE734 // star
+    } else if has("rotate") && (has("left") || has("counter") || has("ccw")) {
+        0xE7A7 // turn left
+    } else if has("rotate") {
+        0xE7A6 // turn right
+    } else if has("previous version") || has("history") || has("restore") {
+        0xE81C // history (clock)
+    } else if has("bluetooth") {
+        0xE702 // bluetooth
+    } else if has("document") {
+        0xE8A5 // document
+    } else if has("background") || has("wallpaper") || has("lock screen") {
+        0xE91B // picture
+    } else if has("desktop") {
+        0xE7F4 // screen
+    } else if has("zip") || has("compress") || has("archive") || has("extract") || has("7-zip") || has("rar") {
+        0xE7B8 // package
+    } else if has("mail") {
+        0xE715 // mail
+    } else if has("scan") || has("defender") || has("virus") || has("runas") || has("administrator") {
+        0xEA18 // shield
+    } else if has("share") || has("give access") {
+        0xE72D // share
+    } else if has("cast") || has("play to") {
+        0xE7F4 // screen
+    } else if has("edit") {
+        0xE70F // pen
+    } else if has("unpin") {
+        0xE77A // unpin
+    } else if has("pin") {
+        0xE718 // pin
+    } else if has("troubleshoot") || has("compatib") {
+        0xE90F // repair
+    } else if has("play") || has("playlist") || has("media") {
+        0xE768 // play
+    } else if has("encrypt") || has("lock") || has("password") || has("protect") {
+        0xE72E // lock
+    } else if has("usb") || has("removable") {
+        0xE88E // usb drive
+    } else if last.contains(":)") || has("drive") {
+        0xEDA2 // drive
+    } else if has("folder") || has("library") {
+        0xE8B7 // folder
+    } else if has("copy") || has("move") {
+        0xE8C8 // copy
+    } else if has("new") || has("create") {
+        0xE710 // add
+    } else if has("open") || has("run") || has("launch") || has("start") {
+        0xE8A7 // open in window
+    } else if has("properties") || has("info") || has("details") {
+        0xE946 // info
+    } else if has("send") {
+        0xE724 // send
+    } else {
+        0xEA86 // puzzle: a verb some extension added
+    }
+}

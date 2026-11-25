@@ -18,12 +18,17 @@ impl App {
         let show_hidden = self.ui.hidden;
         let tab_id = self.tab().id;
         let p = self.tab().active;
+        // a search still waiting for the pause after typing would replace this answer
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(self.hwnd), T_SEARCH);
+        }
         let Some(s) = self.pane_mut().search.as_mut() else { return };
         let words = s.field.text.trim().to_string();
         if words.is_empty() {
             return;
         }
         let seq = s.next_request();
+        s.asked = fold_words(&words);
         s.busy = true;
         s.note = "Asking AI\u{2026}".into();
         // the scope, rules and filters of this search, without its words
@@ -31,7 +36,8 @@ impl App {
         let base = s.query_with(&here, &sp);
         s.field.text = text;
         let whole = s.pc || here.is_empty();
-        let junk_ok = s.junk;
+        s.scope_junk = !whole && here.iter().any(|d| crate::rank::junk(d));
+        let junk_ok = s.junk || s.scope_junk;
         self.invalidate();
         self.spawn_search(tab_id, p, move || match run(&words, &base, &sp, whole, show_hidden, junk_ok) {
             Ok((items, note)) => Msg::Found { tab: tab_id, pane: p, seq, res: Ok((items.len() as u32, items.clone())), rows: items, ai: Some(note) },

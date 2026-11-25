@@ -527,7 +527,7 @@ impl Gfx {
     }
 
     /// Corner radius after the corner style (square keeps a 1 px softening only on big radii).
-    fn rad(&self, rad: f32) -> f32 {
+    pub fn rad(&self, rad: f32) -> f32 {
         if self.corner >= 1.0 { rad } else { (rad * self.corner).min(rad).max(if rad > 3.0 { 1.0 } else { 0.0 }) }
     }
 
@@ -962,5 +962,77 @@ impl Gfx {
 
     pub fn target_id(&self) -> usize {
         self.over.as_ref().or(self.base.as_ref()).map(|r| r.as_raw() as usize).unwrap_or(0)
+    }
+
+    /// The GPU device this window draws with, handed to another window of the process (the picture viewer) so it
+    /// does not load a second one. None when this window draws on the CPU.
+    pub fn shared_device(&self) -> Option<std::sync::mpsc::Receiver<Option<Dev>>> {
+        let d = self.dev.clone()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send(Some(Dev(d)));
+        Some(rx)
+    }
+
+    /// Give back GPU memory of released bitmaps now: Direct2D's caches are cleared and the device's pending
+    /// destructions run (a closing window would otherwise leave them to whenever the shared device flushes next).
+    /// `caches` = also Direct2D's own caches (when the window closes).
+    pub fn release_memory(&self, caches: bool) {
+        unsafe {
+            if caches
+                && let Some(c) = &self.comp
+                && let Ok(d) = c.dc.GetDevice()
+            {
+                d.ClearResources(0);
+            }
+            if let Some(d) = &self.dev {
+                if let Ok(ctx) = d.GetImmediateContext() {
+                    ctx.Flush();
+                }
+                if let Ok(d3) = d.cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice3>() {
+                    d3.Trim();
+                }
+            }
+        }
+    }
+
+    /// Biggest bitmap side the current target can hold (pictures are decoded no bigger).
+    pub fn max_bitmap(&self) -> u32 {
+        if self.over.is_none() && self.base.is_none() {
+            return 8192;
+        }
+        unsafe { self.rt().GetMaximumBitmapSize() }
+    }
+
+    /// Turn by `deg` (clockwise) around (cx, cy), on top of the current transform. Undo with `pop_xf`.
+    pub fn push_rotate(&self, cx: f32, cy: f32, deg: f32) {
+        use windows_numerics::Matrix3x2 as M;
+        let mut cur = M::identity();
+        unsafe { self.rt().GetTransform(&mut cur) };
+        self.xf.borrow_mut().push(cur);
+        let (s, c) = deg.to_radians().sin_cos();
+        // rotation around (cx, cy): translate to the origin, rotate, translate back
+        let l = M { M11: c, M12: s, M21: -s, M22: c, M31: cx - cx * c + cy * s, M32: cy - cx * s - cy * c };
+        let m = M {
+            M11: l.M11 * cur.M11 + l.M12 * cur.M21,
+            M12: l.M11 * cur.M12 + l.M12 * cur.M22,
+            M21: l.M21 * cur.M11 + l.M22 * cur.M21,
+            M22: l.M21 * cur.M12 + l.M22 * cur.M22,
+            M31: l.M31 * cur.M11 + l.M32 * cur.M21 + cur.M31,
+            M32: l.M31 * cur.M12 + l.M32 * cur.M22 + cur.M32,
+        };
+        unsafe { self.rt().SetTransform(&m) };
+    }
+
+    /// A photo drawn into `dst` with high-quality cubic filtering (clean when a big picture is shown small); plain
+    /// linear filtering on a target without a device context. `smooth` = false: nearest pixels (deep zoom).
+    pub fn photo(&self, bmp: &ID2D1Bitmap, dst: Rect, opacity: f32, smooth: bool) {
+        unsafe {
+            if let Ok(dc) = self.rt().cast::<ID2D1DeviceContext>() {
+                let mode = if smooth { D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC } else { D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
+                dc.DrawBitmap(bmp, Some(&dst.d2()), opacity, mode, None, None);
+            } else {
+                self.rt().DrawBitmap(bmp, Some(&dst.d2()), opacity, if smooth { D2D1_BITMAP_INTERPOLATION_MODE_LINEAR } else { D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR }, None);
+            }
+        }
     }
 }

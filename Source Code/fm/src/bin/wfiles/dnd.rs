@@ -1,53 +1,191 @@
 //! OLE drag and drop: the window is a drop target (files from Explorer, other apps, or our own panes) and a drag
-//! source (DoDragDrop with the shell's own data object from fmcore::dnd).
+//! source (SHDoDragDrop with the shell's own data object from fmcore::dnd, so the shell draws the drag image: the
+//! items' icons / thumbnails with a count badge, as Explorer does). Over our window the shell's drag image helper
+//! keeps drawing that image and we write the "Move to <folder>" line under it (DropDescription).
+use std::cell::RefCell;
 use std::path::PathBuf;
 use windows::Win32::Foundation::*;
-use windows::Win32::System::Com::IDataObject;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::*;
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::core::{BOOL, HRESULT, Ref, Result, implement};
+use windows::Win32::UI::Shell::{CLSID_DragDropHelper, DROPDESCRIPTION, DROPIMAGE_COPY, DROPIMAGE_INVALID, DROPIMAGE_MOVE, DROPIMAGE_NONE, DROPIMAGETYPE, IDropTargetHelper, SHDoDragDrop};
+use windows::core::{BOOL, HRESULT, Ref, Result, implement, w};
 
-/// What the window does with drag events (runs on the UI thread).
+/// What the window does with drag events (runs on the UI thread). Effects: 0 none, 1 copy, 2 move; `allowed` is
+/// what the source permits (the same bits).
 pub trait Sink {
-    fn drag_enter(&mut self, paths: Vec<PathBuf>, x: i32, y: i32, keys: u32) -> u32;
-    fn drag_over(&mut self, x: i32, y: i32, keys: u32) -> u32;
+    fn drag_enter(&mut self, paths: Vec<PathBuf>, x: i32, y: i32, keys: u32, allowed: u32, image: bool) -> u32;
+    fn drag_over(&mut self, x: i32, y: i32, keys: u32, allowed: u32) -> u32;
     fn drag_leave(&mut self);
-    fn drop_files(&mut self, x: i32, y: i32, keys: u32) -> u32;
+    fn drop_files(&mut self, x: i32, y: i32, keys: u32, allowed: u32) -> u32;
+    /// the name of the folder a drop goes to now ("Move to <name>")
+    fn drop_name(&self) -> String;
 }
 
 pub type SinkFn = fn(isize) -> Option<&'static mut dyn Sink>;
+
+#[derive(Default)]
+struct TargetState {
+    helper: Option<IDropTargetHelper>,
+    helper_tried: bool,
+    data: Option<IDataObject>,
+    /// the description last written (effect, folder name): written again only when it changes
+    said: Option<(u32, String)>,
+}
 
 #[implement(IDropTarget)]
 pub struct Target {
     hwnd: isize,
     get: SinkFn,
+    st: RefCell<TargetState>,
+}
+
+impl Target {
+    fn helper(&self) -> Option<IDropTargetHelper> {
+        let mut st = self.st.borrow_mut();
+        if !st.helper_tried {
+            st.helper_tried = true;
+            st.helper = unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok() };
+        }
+        st.helper.clone()
+    }
+
+    /// "Move to <folder>" / "Copy to <folder>" under the drag image (only when it changed).
+    fn describe(&self, effect: u32) {
+        let name = if effect == 0 { String::new() } else { (self.get)(self.hwnd).map(|s| s.drop_name()).unwrap_or_default() };
+        let data = {
+            let mut st = self.st.borrow_mut();
+            let now = Some((effect, name.clone()));
+            if st.said == now {
+                return;
+            }
+            st.said = now;
+            st.data.clone()
+        };
+        let Some(d) = data else { return };
+        let (kind, msg) = match effect {
+            2 => (DROPIMAGE_MOVE, "Move to %1"),
+            1 => (DROPIMAGE_COPY, "Copy to %1"),
+            _ => (DROPIMAGE_NONE, ""),
+        };
+        set_description(&d, kind, msg, &name);
+    }
+
+    /// The drag left or ended: no description of ours stays on the source's data object.
+    fn forget(&self) {
+        let data = {
+            let mut st = self.st.borrow_mut();
+            st.said = None;
+            st.data.take()
+        };
+        if let Some(d) = data {
+            set_description(&d, DROPIMAGE_INVALID, "", "");
+        }
+    }
 }
 
 impl IDropTarget_Impl for Target_Impl {
     fn DragEnter(&self, data: Ref<'_, IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        let paths = data.as_ref().and_then(|d| fmcore::dnd::paths_from_data_object(d).ok()).unwrap_or_default();
+        let allowed = unsafe { (*effect).0 };
+        let d = data.as_ref().cloned();
+        let paths = d.as_ref().and_then(|d| fmcore::dnd::paths_from_data_object(d).ok()).unwrap_or_default();
+        let image = d.as_ref().map(has_drag_image).unwrap_or(false);
         let e = match (self.get)(self.hwnd) {
-            Some(s) if !paths.is_empty() => s.drag_enter(paths, pt.x, pt.y, keys.0),
+            Some(s) if !paths.is_empty() => s.drag_enter(paths, pt.x, pt.y, keys.0, allowed, image),
             _ => 0,
         };
         unsafe { *effect = DROPEFFECT(e) };
+        {
+            let mut st = self.st.borrow_mut();
+            st.data = d.clone();
+            st.said = None;
+        }
+        self.describe(e);
+        if let (Some(h), Some(d)) = (self.helper(), d.as_ref()) {
+            unsafe {
+                let _ = h.DragEnter(HWND(self.hwnd as *mut _), d, &POINT { x: pt.x, y: pt.y }, DROPEFFECT(e));
+            }
+        }
         Ok(())
     }
     fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        let e = (self.get)(self.hwnd).map(|s| s.drag_over(pt.x, pt.y, keys.0)).unwrap_or(0);
+        let allowed = unsafe { (*effect).0 };
+        let e = (self.get)(self.hwnd).map(|s| s.drag_over(pt.x, pt.y, keys.0, allowed)).unwrap_or(0);
         unsafe { *effect = DROPEFFECT(e) };
+        self.describe(e);
+        if let Some(h) = self.helper() {
+            unsafe {
+                let _ = h.DragOver(&POINT { x: pt.x, y: pt.y }, DROPEFFECT(e));
+            }
+        }
         Ok(())
     }
     fn DragLeave(&self) -> Result<()> {
         if let Some(s) = (self.get)(self.hwnd) {
             s.drag_leave();
         }
+        if let Some(h) = self.helper() {
+            unsafe {
+                let _ = h.DragLeave();
+            }
+        }
+        self.forget();
         Ok(())
     }
-    fn Drop(&self, _data: Ref<'_, IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        let e = (self.get)(self.hwnd).map(|s| s.drop_files(pt.x, pt.y, keys.0)).unwrap_or(0);
+    fn Drop(&self, data: Ref<'_, IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        let allowed = unsafe { (*effect).0 };
+        let e = (self.get)(self.hwnd).map(|s| s.drop_files(pt.x, pt.y, keys.0, allowed)).unwrap_or(0);
         unsafe { *effect = DROPEFFECT(e) };
+        if let (Some(h), Some(d)) = (self.helper(), data.as_ref()) {
+            unsafe {
+                let _ = h.Drop(d, &POINT { x: pt.x, y: pt.y }, DROPEFFECT(e));
+            }
+        }
+        self.forget();
         Ok(())
+    }
+}
+
+/// The source put a drag image on the data object (the shell's helpers do: Explorer, SHDoDragDrop, browsers).
+fn has_drag_image(d: &IDataObject) -> bool {
+    unsafe {
+        let cf = RegisterClipboardFormatW(w!("DragImageBits"));
+        let fmt = FORMATETC { cfFormat: cf as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+        cf != 0 && d.QueryGetData(&fmt) == S_OK
+    }
+}
+
+/// Write the DropDescription the drag image shows under itself (`%1` in `msg` becomes `insert`, drawn in bold).
+fn set_description(d: &IDataObject, kind: DROPIMAGETYPE, msg: &str, insert: &str) {
+    unsafe {
+        let cf = RegisterClipboardFormatW(w!("DropDescription"));
+        if cf == 0 {
+            return;
+        }
+        // DROPDESCRIPTION is packed: written as bytes (type, then two NUL-terminated 260-char strings)
+        let mut b = vec![0u8; size_of::<DROPDESCRIPTION>()];
+        b[..4].copy_from_slice(&kind.0.to_le_bytes());
+        for (off, s) in [(4usize, msg), (4 + 520, insert)] {
+            for (i, u) in s.encode_utf16().take(259).enumerate() {
+                b[off + i * 2..off + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+            }
+        }
+        let Ok(h) = GlobalAlloc(GHND, b.len()) else { return };
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return;
+        }
+        std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+        let _ = GlobalUnlock(h);
+        let fmt = FORMATETC { cfFormat: cf as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+        let med = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: h }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
+        // with fRelease the data object owns the memory on success; on failure it is still ours
+        if d.SetData(&fmt, &med, true).is_err() {
+            let _ = GlobalFree(Some(h));
+        }
     }
 }
 
@@ -73,7 +211,7 @@ impl IDropSource_Impl for Source_Impl {
 pub fn register(hwnd: HWND, get: SinkFn) {
     unsafe {
         let _ = OleInitialize(None);
-        let t: IDropTarget = Target { hwnd: hwnd.0 as isize, get }.into();
+        let t: IDropTarget = Target { hwnd: hwnd.0 as isize, get, st: RefCell::new(TargetState::default()) }.into();
         let _ = RegisterDragDrop(hwnd, &t);
     }
 }
@@ -84,15 +222,23 @@ pub fn revoke(hwnd: HWND) {
     }
 }
 
-/// Drag these files out (modal until the drop). Returns the effect (1 copy, 2 move, 4 link, 0 none).
-pub fn drag_out(paths: &[PathBuf]) -> u32 {
+/// Drag these files out (modal until the drop). The shell makes the drag image and the default drop source (which
+/// shows drop descriptions such as Explorer's "Move to Documents"). Returns the effect (1 copy, 2 move, 4 link, 0 none).
+pub fn drag_out(hwnd: HWND, paths: &[PathBuf]) -> u32 {
     let Ok(data) = fmcore::dnd::data_object(paths) else { return 0 };
-    let src: IDropSource = Source.into();
-    let mut eff = DROPEFFECT(0);
-    unsafe {
-        let _ = DoDragDrop(&data, &src, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &mut eff);
+    let effects = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+    match unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, effects) } {
+        Ok(e) => e.0,
+        Err(_) => {
+            // no shell helper (should not happen): plain OLE drag with the default cursors
+            let src: IDropSource = Source.into();
+            let mut eff = DROPEFFECT(0);
+            unsafe {
+                let _ = DoDragDrop(&data, &src, effects, &mut eff);
+            }
+            eff.0
+        }
     }
-    eff.0
 }
 
 /// Files on the clipboard (CF_HDROP) and whether they were cut (Preferred DropEffect = move).

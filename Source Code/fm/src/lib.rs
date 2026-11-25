@@ -47,6 +47,7 @@ pub mod menu;
 pub mod models;
 pub mod namespace;
 pub mod ops;
+pub mod picture;
 pub mod pins;
 pub mod pipe;
 pub mod recycle;

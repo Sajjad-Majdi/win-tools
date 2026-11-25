@@ -43,7 +43,7 @@ windows = { version = "0.61", features = [
   "Win32_Networking_WinHttp", "Win32_System_Variant", "Win32_Storage_Xps", "Win32_Security_Cryptography",
   "Foundation", "Data_Pdf", "Graphics", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11",
   "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_System_WinRT",
-  "Win32_System_WinRT_Graphics_Capture", "Win32_System_WinRT_Direct3D11", "Win32_Graphics_DirectComposition", "Storage", "Storage_Streams", "Graphics_Imaging", "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_WinRT_Graphics_Capture", "Win32_System_WinRT_Direct3D11", "Win32_Graphics_DirectComposition", "Storage", "Storage_Streams", "Storage_Search", "System", "Graphics_Imaging", "Win32_UI_Shell_PropertiesSystem",
 ] }
 
 [profile.release]

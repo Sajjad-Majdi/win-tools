@@ -26,6 +26,7 @@ mod preview;
 mod rank;
 mod sicons;
 mod theme;
+mod viewer;
 
 fn main() {
     std::panic::set_hook(Box::new(|info| {
@@ -63,7 +64,12 @@ fn main() {
             Some(p) => format!("tab new {p}"),
             None => "tab new".into(),
         };
+        // this process got the foreground right from the click that started it; pass it on to the running window
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+        }
         if fmcore::pipe::send(&cmd).is_ok() {
+            let _ = fmcore::pipe::send("activate");
             return;
         }
     }

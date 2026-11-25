@@ -140,6 +140,12 @@ pub struct Search {
     /// the words of the last finished query, and of the one on its way (for filtering locally while typing)
     pub done_words: String,
     pub pending_words: String,
+    /// the words (spaces folded) of the last search asked for, plain or AI: an edit that leaves them as they are (a
+    /// space, a caret move) asks nothing
+    pub asked: String,
+    /// the last plain answer found nothing: while the next answer is on its way that empty answer stays on screen as
+    /// it is ("No results" and the AI Search button do not blink off and on per word)
+    pub was_empty: bool,
     pub field: Field,
     pub pc: bool,
     pub ftype: usize,
@@ -153,6 +159,8 @@ pub struct Search {
     /// every match Everything gave (ranked into `items`), "Include system & temp", and the opened "N more" rows
     pub all: Vec<Item>,
     pub junk: bool,
+    /// the searched folder is itself a system / temp place (inside AppData or Temp): everything under it is shown
+    pub scope_junk: bool,
     pub open: HashSet<String>,
     /// the user's own places (ranking), lower case with a trailing backslash
     pub own: Vec<String>,
@@ -303,7 +311,7 @@ pub const DATES: [(&str, &str); 6] = [("Any", ""), ("Today", "dm:today"), ("This
 
 impl Search {
     pub fn new(text: &str, pc: bool) -> Search {
-        Search { ai: None, done_words: String::new(), pending_words: String::new(), field: Field::new(text), pc, ftype: 0, fsize: 0, fdate: 0, items: vec![], total: 0, seq: 0, busy: false, note: String::new(), all: vec![], junk: false, open: HashSet::new(), own: vec![] }
+        Search { ai: None, done_words: String::new(), pending_words: String::new(), asked: String::new(), was_empty: false, field: Field::new(text), pc, ftype: 0, fsize: 0, fdate: 0, items: vec![], total: 0, seq: 0, busy: false, note: String::new(), all: vec![], junk: false, scope_junk: false, open: HashSet::new(), own: vec![] }
     }
     pub fn next_request(&mut self) -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -311,9 +319,17 @@ impl Search {
         self.seq = NEXT.fetch_add(1, Ordering::Relaxed);
         self.seq
     }
+    /// Busy, but showing the last (empty) answer unchanged: no "Searching..." and no blank list for the new words.
+    /// Not after a Backspace: fewer letters can find what more letters did not, so that answer is stale.
+    pub fn quiet(&self) -> bool {
+        let (new, old) = (self.pending_words.to_lowercase(), self.done_words.to_lowercase());
+        let shorter = new.len() < old.len() && old.starts_with(&new);
+        self.busy && self.was_empty && self.note.is_empty() && self.ai.is_none() && !shorter
+    }
+
     /// Rank `all` into the rows shown (after a toggle or an opened "N more" row).
     pub fn rearrange(&mut self) {
-        self.items = crate::rank::arrange(&self.all, self.field.text.trim(), &self.own, self.junk, &self.open, fmcore::util::now_ft());
+        self.items = crate::rank::arrange(&self.all, self.field.text.trim(), &self.own, self.junk || self.scope_junk, &self.open, fmcore::util::now_ft());
     }
 
     /// The Everything query for the current words, scope and filters. `here` holds every real folder behind the
@@ -436,6 +452,7 @@ impl Pane {
                 search.note.clear();
                 search.pending_words.clear();
                 search.done_words.clear();
+                search.asked.clear();
                 search.seq = 0;
             }
             Some(Box::new(SearchView {
@@ -886,5 +903,28 @@ mod real_rules_timing {
                 println!("{w:>9} {name}: {:?} ({})", t0.elapsed(), r.map(|r| r.total.to_string()).unwrap_or_else(|e| e));
             }
         }
+    }
+}
+
+/// Search words with every run of spaces folded to one (what Everything sees: "a  b " = "a b").
+pub fn fold_words(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+    #[test]
+    fn empty_answer_stays_on_screen_only_for_more_letters() {
+        let mut s = Search::new("zzz", false);
+        s.busy = true;
+        s.was_empty = true;
+        s.done_words = "zzzx".into();
+        // a Backspace: fewer letters can find what more letters did not
+        s.pending_words = "zzz".into();
+        assert!(!s.quiet());
+        // one more letter on an empty answer: nothing new can appear, the list stays as it is
+        s.done_words = "zz".into();
+        assert!(s.quiet());
     }
 }

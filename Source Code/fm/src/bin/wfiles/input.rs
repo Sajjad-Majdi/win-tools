@@ -12,6 +12,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// Settings > Files and folders > Open pictures in
+pub const PICTURE_OPENERS: [&str; 2] = ["Rust File Explorer viewer", "Default app"];
+
 pub const STYLES: [&str; 4] = ["Lowercase, words joined by -", "Lowercase, words joined by _", "Title Case With Spaces", "camelCase"];
 
 const VK_F: u16 = 0x46;
@@ -90,8 +93,11 @@ impl App {
             Hit::Fwd => "Forward (Alt+Right)".to_string(),
             Hit::Up => "Up (Alt+Up)".to_string(),
             Hit::TabAdd => "New tab (Ctrl+T)".to_string(),
+            Hit::TabScroll(d) => (if d < 0 { "Scroll tabs left" } else { "Scroll tabs right" }).to_string(),
             Hit::TabClose(_) => "Close tab (Ctrl+W)".to_string(),
             Hit::ViewBtn => "View".to_string(),
+            Hit::ViewQuick(0) => "Details (Ctrl+Shift+1)".to_string(),
+            Hit::ViewQuick(_) => "Grid (Ctrl+Shift+3)".to_string(),
             Hit::New => "New (Ctrl+Shift+N: folder)".to_string(),
             Hit::OmniClear => "Clear".to_string(),
             Hit::OmniSearch => "Search (Ctrl+F)".to_string(),
@@ -172,10 +178,25 @@ impl App {
             refresh = true;
             if j.state == jobs::State::Done {
                 let verb = if j.kind == jobs::Kind::Move { "Moved" } else { "Copied" };
-                let n = j.srcs.len();
+                // only what was really done counts: identical items that were skipped (a move into its own folder, a
+                // copy over the same file) are not "copied"
+                let n = j.srcs.len().saturating_sub(j.identical);
                 let place = folder_title(&j.dest);
-                let skipped = if j.identical > 0 { format!(" ({} identical skipped)", j.identical) } else { String::new() };
-                self.toast(&format!("{verb} {n} item{} to ", if n == 1 { "" } else { "s" }), &format!("{place}{skipped}"), !j.journal.is_empty());
+                if n == 0 {
+                    let what = if j.srcs.len() == 1 { "it is" } else { "they are" };
+                    self.toast(&format!("Nothing {}: {what} already in ", verb.to_lowercase()), &place, false);
+                } else {
+                    let skipped = if j.identical > 0 { format!(" ({} identical skipped)", j.identical) } else { String::new() };
+                    self.toast(&format!("{verb} {n} item{} to ", if n == 1 { "" } else { "s" }), &format!("{place}{skipped}"), !j.journal.is_empty());
+                }
+                // a copy made next to its original ("name - Copy") is the new selection
+                if j.kind == jobs::Kind::Copy
+                    && let Some(first) = j.results.first()
+                    && self.pane().dir().is_some_and(|d| fmcore::util::path_eq(&d, &j.dest))
+                    && j.srcs.iter().any(|s| s.parent().is_some_and(|p| fmcore::util::path_eq(p, &j.dest)))
+                {
+                    self.pane_mut().want = Some(first.clone());
+                }
                 self.toast_job = Some(j.id);
             } else if let jobs::State::Failed(e) = &j.state {
                 self.toast_err(&format!("Could not finish: {e}"));
@@ -208,7 +229,27 @@ impl App {
                 }
                 T_SEARCH => {
                     let _ = KillTimer(Some(self.hwnd), T_SEARCH);
-                    self.start_search();
+                    self.search_due();
+                }
+                T_RENAME => {
+                    let _ = KillTimer(Some(self.hwnd), T_RENAME);
+                    // the slow second click was not part of a double-click: rename, if that item is still the one
+                    // selected and nothing else took the keys meanwhile
+                    if let Some(path) = self.rename_due.take()
+                        && self.inline.is_none()
+                        && self.rename.is_none()
+                        && self.menu.is_none()
+                        && self.drag_in.is_none()
+                        && self.pane().sel.len() == 1
+                        && self.pane().sel.contains(&path)
+                    {
+                        self.inline_rename(path);
+                        self.invalidate();
+                    }
+                }
+                T_DRAGTAB => {
+                    let _ = KillTimer(Some(self.hwnd), T_DRAGTAB);
+                    self.drag_rest_on_tab();
                 }
                 T_TOAST => {
                     if let Some(t) = &self.toast {
@@ -301,8 +342,28 @@ impl App {
             self.go(Loc::Folder(PathBuf::from(l.target)));
             return;
         }
+        // pictures: the built-in viewer, stepping through this list's pictures in the order shown (Settings can send
+        // them to the Windows default app instead)
+        if self.ui.viewer && fmcore::picture::is_picture(&it.ext()) {
+            let (list, idx) = self.picture_list(&it.path);
+            crate::viewer::open(self, list, idx);
+            return;
+        }
         let p = it.path.clone();
-        if let Err(e) = fmcore::shell::open_file(&p) {
+        // pictures, videos and songs get their folder neighbours in the list's order (arrow keys in Photos)
+        let (col, desc) = self.pane().sort;
+        let prop = match col {
+            SortCol::Name => "System.ItemNameDisplay",
+            SortCol::Date => "System.DateModified",
+            SortCol::Size => "System.Size",
+            SortCol::Type => "System.ItemTypeText",
+        };
+        let r = if fmcore::shell::neighbor_kinds(&it.ext()).is_some() && matches!(self.pane().loc, Loc::Folder(_)) {
+            fmcore::shell::open_with_neighbors(&p, prop, desc)
+        } else {
+            fmcore::shell::open_file(&p)
+        };
+        if let Err(e) = r {
             self.toast_err(&e);
         }
     }
@@ -314,10 +375,65 @@ impl App {
                 self.open_item(&it, new_tab);
             }
         } else {
-            for it in sel.into_iter().filter(|i| !i.is_dir).take(20) {
+            // several pictures: one viewer that steps through just them (in the list's order)
+            let pics: Vec<PathBuf> = if self.ui.viewer { sel.iter().filter(|i| !i.is_dir && i.recycled.is_none() && fmcore::picture::is_picture(&i.ext())).map(|i| i.path.clone()).collect() } else { vec![] };
+            if !pics.is_empty() {
+                crate::viewer::open(self, pics.clone(), 0);
+            }
+            for it in sel.into_iter().filter(|i| !i.is_dir && !pics.contains(&i.path)).take(20) {
                 self.open_item(&it, false);
             }
         }
+    }
+
+    /// The pictures the viewer steps through when `path` is opened: the active pane's pictures in the order they are
+    /// shown (sort, filter, search results) when `path` is one of its rows, else the pictures of its folder by name.
+    pub fn picture_list(&self, path: &Path) -> (Vec<PathBuf>, usize) {
+        let ok = |i: &Item| !i.is_dir && i.recycled.is_none() && !i.path.to_string_lossy().starts_with("::") && fmcore::picture::is_picture(&i.ext());
+        let rows: Vec<PathBuf> = self.pane().rows().iter().filter(|i| ok(i)).map(|i| i.path.clone()).collect();
+        if let Some(i) = rows.iter().position(|p| fmcore::util::path_eq(p, path)) {
+            return (rows, i);
+        }
+        let mut list: Vec<(String, PathBuf)> = path
+            .parent()
+            .and_then(|d| fmcore::list::list_dir(d, self.ui.hidden).ok().map(|v| (d.to_path_buf(), v)))
+            .map(|(d, v)| v.into_iter().filter(|e| !e.is_dir() && fmcore::picture::is_picture(&e.ext())).map(|e| (e.name.clone(), d.join(&e.name))).collect())
+            .unwrap_or_default();
+        list.sort_by(|a, b| fmcore::list::natural_cmp(&a.0, &b.0));
+        let list: Vec<PathBuf> = list.into_iter().map(|x| x.1).collect();
+        match list.iter().position(|p| fmcore::util::path_eq(p, path)) {
+            Some(i) => (list, i),
+            None => (vec![path.to_path_buf()], 0),
+        }
+    }
+
+    /// The viewer's "Show in folder": the picture's folder in this window with the picture selected, window in front.
+    pub fn reveal_picture(&mut self, p: &Path) {
+        let Some(dir) = p.parent().map(|d| d.to_path_buf()) else { return };
+        let here = self.pane().dir().is_some_and(|d| fmcore::util::path_eq(&d, &dir)) && !self.pane().searching();
+        if here && self.pane().rows().iter().any(|r| fmcore::util::path_eq(&r.path, p)) {
+            self.select_path(p);
+            let (t, pn) = (self.cur, self.tab().active);
+            if let Some(i) = self.pane().focus {
+                self.scroll_to(t, pn, i);
+            }
+        } else {
+            if self.pane().searching() {
+                self.end_search();
+            }
+            self.go(Loc::Folder(dir));
+            self.pane_mut().want = Some(p.to_path_buf());
+        }
+        unsafe {
+            let h = self.hwnd;
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, if self.offscreen || std::env::var("WFILES_TEST").is_ok() { SW_SHOWNOACTIVATE } else { SW_RESTORE });
+            }
+            if !self.offscreen && std::env::var("WFILES_TEST").is_err() {
+                let _ = SetForegroundWindow(h);
+            }
+        }
+        self.invalidate();
     }
 
     /// Run an action on the current selection (pill, menu, keys, palette, IPC).
@@ -575,10 +691,10 @@ impl App {
         let n = self.tabs.len();
         let mut items = vec![MItem::new("New tab", 0xE710, Act::TabNew).keys("Ctrl+T"), MItem::new("Duplicate tab", 0xE8C8, Act::TabDuplicate)];
         items.push(MItem::new("Close tab", 0xE711, Act::TabClose).keys("Ctrl+W").sep());
-        let mut o = MItem::new("Close other tabs", 0xE8BB, Act::TabCloseOthers);
+        let mut o = MItem::new("Close other tabs", 0xE711, Act::TabCloseOthers);
         o.enabled = n > 1;
         items.push(o);
-        let mut r = MItem::new("Close tabs to the right", 0xE72A, Act::TabCloseRight);
+        let mut r = MItem::new("Close tabs to the right", 0xE711, Act::TabCloseRight);
         r.enabled = i + 1 < n;
         items.push(r);
         self.menu = Some(CtxMenu { x, y, items, paths: vec![], bg: true, seq: self.menu_gen, loading: false, shell: vec![], apps: vec![], at: Instant::now() });
@@ -786,8 +902,9 @@ impl App {
 
     pub fn save_ui(&self) {
         let mut cfg = fmcore::pins::config();
-        cfg["ui"] = json!({"theme": self.look.theme, "folder_sizes": self.ui.sizes, "extensions": self.ui.ext, "hidden": self.ui.hidden, "ask_delete": self.ui.ask_delete, "scope_pc": self.ui.scope_pc});
+        cfg["ui"] = json!({"theme": self.look.theme, "folder_sizes": self.ui.sizes, "extensions": self.ui.ext, "hidden": self.ui.hidden, "ask_delete": self.ui.ask_delete, "scope_pc": self.ui.scope_pc, "picture_viewer": self.ui.viewer});
         let _ = fmcore::pins::save_config(&cfg);
+        crate::viewer::sync(self);
     }
 
     /// The default-app button on an "Open with" row: Windows' own dialog, where "Always" makes the Windows default
@@ -885,6 +1002,11 @@ impl App {
         let (t, p) = (self.cur, self.tab().active);
         let grid = self.tab().view == View::Grid && !self.pane().searching();
         let cols = if grid { paint::grid_cols(pane_geoms(self, t)[p].list) as i32 } else { 1 };
+        // PageUp / PageDown: the rows on screen less one (the last one stays in view), as in Explorer
+        let page = {
+            let (_, h, view_h) = paint::row_geom(self, t, p, 0);
+            if h > 1.0 { (((view_h / h).floor() as i32 - 1).max(1)) * cols } else { 10 }
+        };
         let pane = self.pane_mut();
         let n = pane.rows().len() as i32;
         if n == 0 {
@@ -893,8 +1015,8 @@ impl App {
         let step = match d {
             100 => -n,
             200 => n,
-            300 => -10,
-            400 => 10,
+            300 => -page,
+            400 => page,
             -2 => -cols,
             2 => cols,
             x => x,
@@ -963,24 +1085,45 @@ impl App {
             self.invalidate();
             return;
         }
+        // a test drag (`wfm gui drag`) in progress: the same drop logic as a real drag, inside this window
+        if down && self.drag_in.as_ref().map(|d| d.internal).unwrap_or(false) {
+            let keys = self.test_keys();
+            self.drag_move(x, y, keys, 3);
+            return;
+        }
+        // the drag starts after the system's drag distance (4 px by default), as in Explorer
+        let (dx, dy) = unsafe { (GetSystemMetrics(SM_CXDRAG).max(2) as f32 / self.scale(), GetSystemMetrics(SM_CYDRAG).max(2) as f32 / self.scale()) };
         if down
             && !self.press_ws
             && let Some((x0, y0, p, i)) = self.press
-            && ((x - x0).abs() > 5.0 || (y - y0).abs() > 5.0)
+            && ((x - x0).abs() > dx || (y - y0).abs() > dy)
         {
             self.press = None;
+            self.slow_click = None;
+            self.press_collapse = false;
             let pane = &self.tab().panes[p];
             let it = pane.rows().get(i).cloned();
             if let Some(it) = it {
                 let paths = if pane.sel.contains(&it.path) { pane.selected_paths() } else { vec![it.path.clone()] };
-                if !paths.is_empty() && it.recycled.is_none() {
+                if !paths.is_empty() && it.recycled.is_none() && !it.path.to_string_lossy().starts_with("::") {
+                    self.tip = None;
+                    if self.synthetic {
+                        // no OLE for a test: it would follow the real mouse button and cursor
+                        self.dragging_out = true;
+                        self.drag_in = Some(DragIn { paths, x, y, target: None, dest: None, effect: 0, image: false, hl: Hit::None, hl_at: Instant::now(), internal: true });
+                        let keys = self.test_keys();
+                        self.drag_move(x, y, keys, 3);
+                        return;
+                    }
                     unsafe {
                         let _ = ReleaseCapture();
                     }
                     self.dragging_out = true;
-                    let _ = crate::dnd::drag_out(&paths);
+                    let _ = crate::dnd::drag_out(self.hwnd, &paths);
                     self.dragging_out = false;
                     self.drag_in = None;
+                    self.drop_f.only(None);
+                    self.anim();
                     self.timer(T_RELIST, 300);
                 }
             }
@@ -1018,9 +1161,32 @@ impl App {
         }
     }
 
-    pub fn mouse_up(&mut self, _x: f32, _y: f32) {
+    pub fn mouse_up(&mut self, x: f32, y: f32) {
         if self.side_drag.take().is_some() || self.col_drag.take().is_some() {
             self.save_look();
+        }
+        // a test drag ends: drop here (OLE does this for a real drag)
+        if self.drag_in.as_ref().map(|d| d.internal).unwrap_or(false) {
+            let keys = self.test_keys();
+            self.drag_drop(x, y, keys, 3);
+            self.dragging_out = false;
+        }
+        // a slow second click on the selected item's name, released where it was pressed: rename once the
+        // double-click time has passed without a second click (a real double-click opens instead)
+        if let Some((path, x0, y0)) = self.slow_click.take()
+            && self.press.is_some()
+            && (x - x0).abs() <= 3.0
+            && (y - y0).abs() <= 3.0
+        {
+            self.rename_due = Some(path);
+            self.timer(T_RENAME, unsafe { GetDoubleClickTime() } + 20);
+        }
+        // a click (no drag) on one item of several selected leaves only that item selected (Explorer)
+        if std::mem::take(&mut self.press_collapse)
+            && !self.press_ws
+            && let Some((_, _, p, i)) = self.press
+        {
+            self.select_row(p, i, false, false);
         }
         if self.marquee.take().is_some() {
             unsafe {
@@ -1156,8 +1322,19 @@ impl App {
         self.invalidate();
     }
 
+    /// Move a too-long tab strip by `dx` pixels (arrows, wheel over the tabs).
+    pub fn scroll_tabs(&mut self, dx: f32) {
+        self.tab_scroll = (self.tab_scroll + dx).clamp(0.0, self.tab_max);
+        self.invalidate();
+    }
+
     pub fn wheel(&mut self, x: f32, y: f32, d: f32) {
         self.tip = None;
+        // the wheel over a tab strip that does not fit moves the tabs
+        if self.tab_max > 0.0 && self.tab_strip.has(x, y) && self.menu.is_none() && self.drop.is_none() {
+            self.scroll_tabs(-d / 120.0 * 72.0);
+            return;
+        }
         // the icon rail scrolls on a short window
         // the sidebar (expanded, rail or overlay) scrolls with momentum when it is taller than the window
         if self.side_area.has(x, y) && self.rail_max > 0.0 && self.menu.is_none() && self.drop.is_none() {
@@ -1256,6 +1433,14 @@ impl App {
 
     pub fn mouse_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool, dbl: bool) {
         self.tip = None;
+        // any press cancels a slow-click rename that is still waiting (a double-click must open, not rename)
+        if self.rename_due.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_RENAME);
+            }
+        }
+        self.slow_click = None;
+        self.press_collapse = false;
         // a click beside the sidebar overlay closes it
         if self.side_overlay() && (x > self.look.side_w || y < TOP) {
             self.side_open = false;
@@ -1265,6 +1450,9 @@ impl App {
             }
         }
         let h = self.hit_at(x, y);
+        if !matches!(h, Hit::Row(..)) {
+            self.last_click = None;
+        }
         self.pressed = h;
         self.press_ws = false;
         if !matches!(h, Hit::None | Hit::Block | Hit::ListBg(_)) {
@@ -1360,6 +1548,7 @@ impl App {
                 self.whatis = None;
             }
             Hit::TabClose(i) => self.close_tab(i),
+            Hit::TabScroll(d) => self.scroll_tabs(d as f32 * (self.tab_strip.w * 0.6).max(72.0)),
             Hit::TabAdd => {
                 self.new_tab(Loc::ThisPc); // a new tab starts at This PC (Sajjad, 2026-11-19)
             }
@@ -1399,6 +1588,12 @@ impl App {
             Hit::New if self.pane().loc.path().is_some() => self.act(Act::NewMenu),
             Hit::Sug(i) => self.sug_take(i, true),
             Hit::ViewBtn if !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) => self.act(Act::ViewMenu),
+            Hit::ViewQuick(k) => {
+                // the two view toggles at the bottom right of the status bar (Explorer's Details / Large icons)
+                self.tab_mut().view = if k == 0 { View::Details } else { View::Grid };
+                let p = self.tab().active;
+                self.tab_mut().panes[p].shown_at = Instant::now();
+            }
             Hit::Side(i) => self.side_click(i),
             Hit::SideThisPc => self.go(Loc::ThisPc),
             Hit::SideSettings => self.open_settings(),
@@ -1446,7 +1641,9 @@ impl App {
                 if self.pane().loc == Loc::Settings {
                     return;
                 }
+                let path = self.tab().panes[p].rows().get(i).map(|x| x.path.clone());
                 if dbl {
+                    self.last_click = None;
                     if let Some(it) = self.tab().panes[p].rows().get(i).cloned() {
                         self.open_item(&it, ctrl);
                     }
@@ -1455,9 +1652,23 @@ impl App {
                     self.tab_mut().panes[p].kb = false;
                     self.press = Some((x, y, p, i));
                     self.press_ws = true;
+                    self.last_click = path.map(|pp| (pp, Instant::now()));
                 } else {
-                    let path = self.tab().panes[p].rows().get(i).map(|x| x.path.clone());
                     let already = path.as_ref().map(|x| self.tab().panes[p].sel.contains(x)).unwrap_or(false);
+                    let single = self.tab().panes[p].sel.len() == 1;
+                    // Explorer's slow double-click: the one selected item's name clicked again after the double-click
+                    // time (and within 1.5 s of the click before) is renamed once this click ends without a drag
+                    let dbl_ms = unsafe { GetDoubleClickTime() } as u128;
+                    let slow = !ctrl
+                        && !shift
+                        && already
+                        && single
+                        && self.inline.is_none()
+                        && self.last_click.as_ref().zip(path.as_ref()).is_some_and(|((lp, at), pp)| lp == pp && (dbl_ms..=1500).contains(&at.elapsed().as_millis()))
+                        && self.on_name(p, i, x, y);
+                    self.slow_click = if slow { path.clone().map(|pp| (pp, x, y)) } else { None };
+                    // a plain press on one of several selected items keeps them all (for a drag); a click leaves one
+                    self.press_collapse = already && !ctrl && !shift && !single;
                     if !(already && !ctrl && !shift) {
                         self.select_row(p, i, ctrl, shift);
                     } else {
@@ -1465,6 +1676,7 @@ impl App {
                     }
                     self.tab_mut().panes[p].kb = false;
                     self.press = Some((x, y, p, i));
+                    self.last_click = if ctrl || shift { None } else { path.map(|pp| (pp, Instant::now())) };
                 }
             }
             Hit::ListBg(p) => {
@@ -1658,6 +1870,32 @@ impl App {
         let tw = self.gfx.measure(&name, crate::gfx::Font::Ui, fs, 400);
         let cp = crate::paint::col_pos(self, r, nx);
         x > nx + tw.min(cp.name.1) + 8.0
+    }
+
+    /// Is (x, y) on the name text of item i (details / list: the drawn name; grid: the label under the tile)? Drives,
+    /// This PC tiles, Recycle Bin items and search markers have no name to rename.
+    fn on_name(&mut self, p: usize, i: usize, x: f32, y: f32) -> bool {
+        let t = self.cur;
+        if crate::paint::is_pc(self, t, p) || self.tabs[t].panes[p].loc == Loc::RecycleBin {
+            return false;
+        }
+        let Some(it) = self.tabs[t].panes[p].rows().get(i).cloned() else { return false };
+        if it.recycled.is_some() || it.kind == crate::ficons::Kind::Drive || it.path.to_string_lossy().starts_with("::") {
+            return false;
+        }
+        let g = pane_geoms(self, t)[p];
+        let r0 = crate::paint::item_rect(self, t, p, i);
+        let r = Rect::new(r0.x, g.list.y + r0.y - self.tabs[t].panes[p].scroll, r0.w, r0.h);
+        if self.tabs[t].view == View::Grid && !self.tabs[t].panes[p].searching() {
+            return Rect::new(r.x + 4.0, r.y + 104.0, r.w - 8.0, 42.0).has(x, y);
+        }
+        let small = self.tabs[t].view == View::List && !self.tabs[t].panes[p].searching();
+        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        let nx = r.x + 10.0 + isz + 10.0;
+        let name = self.display_name(&it);
+        let tw = self.gfx.measure(&name, crate::gfx::Font::Ui, self.look.text(), 400);
+        let cp = crate::paint::col_pos(self, r, nx);
+        x >= nx - 2.0 && x <= nx + tw.min(cp.name.1) + 2.0
     }
 
     /// Double-click on a header divider: the column fits its widest cell.
@@ -1968,6 +2206,9 @@ impl App {
         } else if let Some(i) = self.inline.as_mut() {
             if !"\\/:*?\"<>|".contains(c) {
                 i.field.insert(&s);
+            } else {
+                self.inline_tip = Some(Instant::now());
+                self.timer(T_ANIM, 4100);
             }
         } else if let Some(f) = self.path_edit.as_mut() {
             f.insert(&s);
@@ -1977,7 +2218,7 @@ impl App {
             if let Some(se) = self.pane_mut().search.as_mut() {
                 se.field.insert(&s);
             }
-            self.start_search();
+            self.search_typed();
         } else if c != ' ' {
             // typing in the list selects the next item whose name starts with the typed letters (Ctrl+F searches)
             self.type_ahead(c);
@@ -2329,13 +2570,13 @@ impl App {
                         {
                             se.field.insert(&s);
                         }
-                        self.start_search();
+                        self.search_typed();
                         return true;
                     }
                     if !(ctrl && matches!(vk, 0x4B | 0x54 | 0x57 | 0x4C)) {
                         let used = self.pane_mut().search.as_mut().map(|s| s.field.key(vk, ctrl, shift)).unwrap_or(false);
                         if used {
-                            self.start_search();
+                            self.search_typed();
                             return true;
                         }
                     }
@@ -2445,6 +2686,14 @@ impl App {
         let sel = self.sel_items();
         let paths: Vec<PathBuf> = sel.iter().map(|i| i.path.clone()).collect();
         let recycle = self.pane().loc == Loc::RecycleBin;
+        // a pinned folder tile on This PC is a sidebar entry: it gets the sidebar's menu (no Rename / Delete)
+        if !bg && sel.len() == 1 && sel[0].kind == crate::ficons::Kind::Folder && crate::paint::is_pc(self, self.cur, self.tab().active) {
+            let at = self.side.iter().position(|(_, _, _, l)| matches!(l, Loc::Folder(d) if fmcore::util::path_eq(d, &sel[0].path)));
+            if let Some(i) = at {
+                self.side_menu(i, x, y);
+                return;
+            }
+        }
         let mut items = vec![];
         if bg || paths.is_empty() {
             let folder = self.pane().loc.path().is_some();
@@ -2471,7 +2720,7 @@ impl App {
             if folder {
                 items.push(MItem::new("Open in Terminal", 0xE756, Act::Terminal).keys("Ctrl+`").sep());
                 items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
-                items.push(MItem::new("Pin to sidebar", 0xE718, Act::Pin));
+                items.push(pin_item(self.pane().loc.path().map(|p| p.to_path_buf()).as_deref()));
                 items.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
             }
             let _ = recycle;
@@ -2483,7 +2732,7 @@ impl App {
             o.bold = true;
             items.push(o);
             items.push(MItem::new("Open in new tab", 0xE8A7, Act::OpenNewTab).keys("Ctrl+Enter"));
-            items.push(MItem::new("Pin to sidebar", 0xE718, Act::Pin));
+            items.push(pin_item(Some(&sel[0].path)));
             items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
             let removable = self.drives.iter().any(|d| fmcore::util::path_eq(std::path::Path::new(&d.root), &sel[0].path) && d.kind == "removable");
             if removable {
@@ -2538,7 +2787,7 @@ impl App {
             items.push(MItem::new("Compress to zip", 0xF012, Act::Zip));
         }
         if one && sel[0].is_dir {
-            items.push(MItem::new("Pin to sidebar", 0xE718, Act::Pin));
+            items.push(pin_item(Some(&sel[0].path)));
         }
         // the shell's other verbs and Send to, in their own submenu (the menu keeps one fixed height)
         let mut mo = MItem::new("More options", 0xE712, Act::MoreMenu).sep();
@@ -2644,15 +2893,15 @@ impl App {
             }
             DropKind::Sort => {
                 let (col, desc) = self.pane().sort;
-                for (i, (l, c)) in [("Name", SortCol::Name), ("Date modified", SortCol::Date), ("Size", SortCol::Size)].iter().enumerate() {
-                    let mut m = MItem::new(l, 0, Act::None);
+                for (i, (l, g, c)) in [("Name", 0xE8D2u32, SortCol::Name), ("Date modified", 0xE787, SortCol::Date), ("Type", 0xE8EC, SortCol::Type), ("Size", 0xE9A6, SortCol::Size)].iter().enumerate() {
+                    let mut m = MItem::new(l, *g, Act::None);
                     m.value = 10 + i as i64;
                     m.checked = col == *c;
                     v.push(m);
                 }
                 // the order as two checked choices (not a label that shows the state)
-                for (k, l) in ["Ascending", "Descending"].iter().enumerate() {
-                    let mut d = MItem::new(l, 0, Act::None);
+                for (k, (l, g)) in [("Ascending", 0xE74Au32), ("Descending", 0xE74B)].iter().enumerate() {
+                    let mut d = MItem::new(l, *g, Act::None);
                     d.sep = k == 0;
                     d.value = 20 + k as i64;
                     d.checked = desc == (k == 1);
@@ -2750,6 +2999,10 @@ impl App {
                     m.shell = Some(d.root.clone());
                     v.push(m);
                 }
+                // any other folder: Windows' own folder picker
+                let mut m = MItem::new("Choose location...", 0xE838, Act::None).sep();
+                m.value = 99;
+                v.push(m);
             }
             DropKind::More | DropKind::Shell => {}
             DropKind::Look(k) => v = self.look_items(k),
@@ -2838,7 +3091,7 @@ impl App {
                 if it.value >= 20 {
                     pane.sort.1 = it.value == 21;
                 } else {
-                    let col = [SortCol::Name, SortCol::Date, SortCol::Size][(it.value - 10) as usize];
+                    let col = [SortCol::Name, SortCol::Date, SortCol::Type, SortCol::Size][(it.value - 10) as usize];
                     pane.sort = (col, pane.sort.1);
                 }
                 pane.sort_items();
@@ -2909,6 +3162,19 @@ impl App {
                     r.digits = it.value as usize;
                 }
                 rename_preview(self);
+            }
+            DropKind::CopyTo | DropKind::MoveTo if it.value == 99 => {
+                // the picker is modal: it runs on its own thread, the copy / move starts when a folder is chosen
+                if !paths.is_empty() {
+                    let (q, hw) = (self.jobs.clone(), self.hwnd.0 as isize);
+                    let kind = if kind == DropKind::MoveTo { jobs::Kind::Move } else { jobs::Kind::Copy };
+                    self.spawn(move || {
+                        if let Some(dest) = pick_folder(hw, if kind == jobs::Kind::Move { "Move to" } else { "Copy to" }) {
+                            jobs::add(&q, kind, paths, dest);
+                        }
+                        Msg::Refresh
+                    });
+                }
             }
             DropKind::CopyTo | DropKind::MoveTo => {
                 if let Some(dest) = &it.shell
@@ -3214,7 +3480,7 @@ impl App {
             }
             93 => self.save_relay(),
             // Personalize: dropdowns
-            20..=26 | 33 | 34 => {
+            20..=26 | 33 | 34 | 35 => {
                 let r = self.hits.iter().find(|h| h.1 == Hit::Set(k)).map(|h| h.0).unwrap_or_default();
                 self.open_drop(DropKind::Look(k), r, r.w.max(170.0));
             }
@@ -3343,6 +3609,7 @@ impl App {
             24 => (SIZES3.iter().map(|s| s.to_string()).collect(), lk.icons as usize),
             25 => (CORNERS.iter().map(|s| s.to_string()).collect(), lk.square as usize),
             34 => (STRENGTHS.iter().map(|s| s.to_string()).collect(), lk.strength as usize),
+            35 => (PICTURE_OPENERS.iter().map(|s| s.to_string()).collect(), if self.ui.viewer { 0 } else { 1 }),
             26 => {
                 let ws = SIDEBAR_WIDTHS;
                 let cur = if lk.side_collapsed { 0 } else { ws.iter().position(|w| (w.1 - lk.side_w).abs() < 1.0).unwrap_or(usize::MAX) };
@@ -3384,6 +3651,13 @@ impl App {
 
     fn look_pick(&mut self, k: u8, it: &MItem) {
         let i = it.value as usize;
+        if k == 35 {
+            // Files and folders > Open pictures in (fm.json, not look.json)
+            self.ui.viewer = i == 0;
+            self.save_ui();
+            self.invalidate();
+            return;
+        }
         match k {
             20 => self.look.backdrop = i as u8,
             21 => self.look.transparency = i as u8,
@@ -3579,6 +3853,30 @@ impl App {
 }
 
 /// "my.report.zip" -> "my.report"; "a.tar.gz" -> "a" (double archive extensions go together).
+/// Windows' folder picker (modal: call it off the UI thread). `owner` is the window it belongs to.
+fn pick_folder(owner: isize, title: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+    use windows::Win32::UI::Shell::{FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let o = d.GetOptions().ok()?;
+        d.SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let t = fmcore::util::wide(title);
+        let _ = d.SetTitle(windows::core::PCWSTR(t.as_ptr()));
+        d.Show(Some(HWND(owner as *mut _))).ok()?;
+        let name = d.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path.map(PathBuf::from)
+    }
+}
+
+/// The menu row that pins a folder to the sidebar, or unpins it when it is pinned already (Act::Pin toggles).
+fn pin_item(p: Option<&Path>) -> MItem {
+    let pinned = p.map(|p| fmcore::pins::pins().iter().any(|x| fmcore::util::path_eq(Path::new(&x.path), p))).unwrap_or(false);
+    if pinned { MItem::new("Unpin from sidebar", 0xE77A, Act::Pin) } else { MItem::new("Pin to sidebar", 0xE718, Act::Pin) }
+}
+
 pub fn archive_stem(name: &str) -> String {
     let low = name.to_lowercase();
     for two in [".tar.gz", ".tar.xz", ".tar.bz2"] {
@@ -3879,47 +4177,112 @@ pub fn rename_preview(a: &mut App) {
 
 
 // ---------------------------------------------------------------------- drag and drop into the window
-impl crate::dnd::Sink for App {
-    fn drag_enter(&mut self, paths: Vec<PathBuf>, x: i32, y: i32, keys: u32) -> u32 {
-        self.drag_in = Some(DragIn { paths, x: 0.0, y: 0.0, target: None, effect: 0 });
-        self.drag_over(x, y, keys)
-    }
-    fn drag_over(&mut self, x: i32, y: i32, keys: u32) -> u32 {
-        let mut pt = POINT { x, y };
-        unsafe {
-            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
-        }
-        let s = self.scale();
-        let (fx, fy) = (pt.x as f32 / s, pt.y as f32 / s);
-        let h = self.hit_at(fx, fy);
-        let mut target: Option<PathBuf> = None;
-        let mut dest: Option<PathBuf> = None;
+/// `a` is `base` or inside it (case-insensitive, whole folder names).
+fn path_within(a: &Path, base: &Path) -> bool {
+    let a = a.to_string_lossy().to_lowercase();
+    let b = base.to_string_lossy().to_lowercase();
+    let (a, b) = (a.trim_end_matches('\\'), b.trim_end_matches('\\'));
+    a == b || (a.len() > b.len() && a.starts_with(b) && a.as_bytes()[b.len()] == b'\\')
+}
+
+impl App {
+    /// What a drop at (x, y) (DIPs) meets: the target that lights up (folder row / tile, sidebar place, tab, address
+    /// crumb) with its folder, and where the files would go (the lit folder, else the pane's own folder).
+    fn drop_place(&self, x: f32, y: f32) -> (Hit, Option<PathBuf>, Option<PathBuf>) {
+        let h = self.hit_at(x, y);
+        let lit = |p: PathBuf| (h, Some(p.clone()), Some(p));
+        let none = (Hit::None, None, None);
         match h {
             Hit::Row(p, i) => {
-                let it = self.tab().panes[p].rows().get(i).cloned();
-                if let Some(it) = it.filter(|i| i.is_dir) {
-                    target = Some(it.path.clone());
-                    dest = Some(it.path);
+                let pane = &self.tab().panes[p];
+                match pane.rows().get(i) {
+                    Some(it) if it.is_dir && it.recycled.is_none() && !it.path.to_string_lossy().starts_with("::") => lit(it.path.clone()),
+                    // a file: into the folder shown (search results are spread over many folders: nowhere)
+                    _ if !pane.searching() => (Hit::None, None, pane.dir()),
+                    _ => none,
+                }
+            }
+            Hit::ListBg(p) | Hit::PaneHead(p) | Hit::Header(p, _) | Hit::ColEdge(p, _) | Hit::Scroll(p) => {
+                let pane = &self.tab().panes[p];
+                (Hit::None, None, if pane.searching() { None } else { pane.dir() })
+            }
+            Hit::Side(i) if i != usize::MAX => {
+                let (sn, dn) = (self.side.len(), self.drives.len());
+                let p = if i < sn {
+                    self.side[i].3.path().map(|p| p.to_path_buf())
+                } else if i < sn + dn {
+                    Some(PathBuf::from(&self.drives[i - sn].root))
                 } else {
-                    dest = self.tab().panes[p].dir();
-                }
+                    self.recent.get(i - sn - dn).map(|r| PathBuf::from(&r.target)).filter(|p| p.is_dir())
+                };
+                p.map(lit).unwrap_or(none)
             }
-            Hit::ListBg(p) | Hit::PaneHead(p) => dest = self.tab().panes[p].dir(),
-            Hit::Side(i) if i < self.side.len() => {
-                if let Loc::Folder(p) = &self.side[i].3 {
-                    dest = Some(p.clone());
-                    target = Some(p.clone());
-                }
+            // a tab lights even without a folder (This PC): resting on it opens it
+            Hit::Tab(i) | Hit::TabClose(i) => {
+                let d = self.tabs.get(i).and_then(|t| t.pane().dir());
+                (Hit::Tab(i), d.clone(), d)
             }
-            _ => {}
+            Hit::Crumb(i) => match self.crumbs_pub().get(i) {
+                Some((_, Loc::Folder(p))) => lit(p.clone()),
+                _ => none,
+            },
+            _ => none,
         }
+    }
+
+    /// Near the top or bottom edge of a list while dragging: scroll it (Explorer does), a step per drag event.
+    fn drag_edge_scroll(&mut self, x: f32, y: f32) {
+        let t = self.cur;
+        let geoms = pane_geoms(self, t);
+        for (p, g) in geoms.iter().enumerate() {
+            let l = g.list;
+            if x < l.x || x > l.r() || l.h < 90.0 || y < l.y || y > l.b() {
+                continue;
+            }
+            const ZONE: f32 = 32.0;
+            let step = if y < l.y + ZONE {
+                -(4.0 + 14.0 * (l.y + ZONE - y) / ZONE)
+            } else if y > l.b() - ZONE {
+                4.0 + 14.0 * (y - (l.b() - ZONE)) / ZONE
+            } else {
+                0.0
+            };
+            if step != 0.0 {
+                let max = (content_h(self, t, p) - l.h).max(0.0);
+                let pane = &mut self.tabs[t].panes[p];
+                let s = (pane.scroll + step).clamp(0.0, max);
+                if s != pane.scroll {
+                    pane.scroll = s;
+                    pane.sf.set(s);
+                    self.invalidate();
+                }
+            }
+        }
+    }
+
+    /// Files are dragged at (x, y) DIPs (from another app, our own drag, or a test drag): light the target and pick
+    /// the effect by Explorer's rule (Shift moves, Ctrl copies, else move on the same drive and copy across drives),
+    /// within what the source allows. Returns 0 none, 1 copy, 2 move.
+    pub fn drag_move(&mut self, x: f32, y: f32, keys: u32, allowed: u32) -> u32 {
+        if self.drag_in.is_none() {
+            return 0;
+        }
+        let (hl, target, dest) = self.drop_place(x, y);
+        self.drag_edge_scroll(x, y);
+        let cur = self.cur;
         let Some(d) = self.drag_in.as_mut() else { return 0 };
-        d.x = fx;
-        d.y = fy;
+        d.x = x;
+        d.y = y;
+        let mut rest_on_tab = false;
+        if d.hl != hl {
+            d.hl = hl;
+            d.hl_at = Instant::now();
+            rest_on_tab = matches!(hl, Hit::Tab(i) if i != cur);
+        }
         d.target = target;
-        let ok = dest.as_ref().map(|dd| !d.paths.iter().any(|p| fmcore::util::path_eq(p, dd) || p.parent().map(|pp| fmcore::util::path_eq(pp, dd)).unwrap_or(false) && keys & 0x8 == 0)).unwrap_or(false);
-        // Explorer's rule: Shift = move, Ctrl = copy, else move on the same drive and copy across drives
-        d.effect = if !ok {
+        d.dest = dest.clone();
+        let ok = dest.as_ref().map(|dd| !d.paths.iter().any(|p| path_within(dd, p) || p.parent().map(|pp| fmcore::util::path_eq(pp, dd)).unwrap_or(false) && keys & 0x8 == 0)).unwrap_or(false);
+        let want = if !ok {
             0
         } else if keys & 0x4 != 0 {
             2
@@ -3930,38 +4293,104 @@ impl crate::dnd::Sink for App {
         } else {
             1
         };
-        let e = d.effect;
+        // the source decides what is possible (a read-only source may allow only copy)
+        let e = if want == 0 || want & allowed != 0 {
+            want
+        } else if allowed & 1 != 0 {
+            1
+        } else if allowed & 2 != 0 {
+            2
+        } else {
+            0
+        };
+        d.effect = e;
+        if rest_on_tab {
+            self.timer(T_DRAGTAB, 650);
+        }
+        self.drop_f.only((hl != Hit::None).then_some(hl));
+        self.anim();
         self.invalidate();
         e
     }
-    fn drag_leave(&mut self) {
-        self.drag_in = None;
-        self.invalidate();
-    }
-    fn drop_files(&mut self, x: i32, y: i32, keys: u32) -> u32 {
-        let e = self.drag_over(x, y, keys);
+
+    /// The drag ends over the window at (x, y): queue the copy / move into the target folder.
+    pub fn drag_drop(&mut self, x: f32, y: f32, keys: u32, allowed: u32) -> u32 {
+        let e = self.drag_move(x, y, keys, allowed);
+        self.drag_end();
         let Some(d) = self.drag_in.take() else { return 0 };
         if e == 0 {
             return 0;
         }
-        let dest = d.target.clone().or_else(|| {
-            let h = self.hit_at(d.x, d.y);
-            match h {
-                Hit::Row(p, _) | Hit::ListBg(p) | Hit::PaneHead(p) => self.tab().panes[p].dir(),
-                _ => self.pane().dir(),
-            }
-        });
-        if let Some(dest) = dest {
+        if let Some(dest) = d.dest {
             jobs::add(&self.jobs, if e == 2 { jobs::Kind::Move } else { jobs::Kind::Copy }, d.paths, dest);
         }
+        e
+    }
+
+    /// The drag left the window or ended: the lit target fades out.
+    fn drag_end(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_DRAGTAB);
+        }
+        self.drop_f.only(None);
+        self.anim();
         self.invalidate();
-        // we did the move ourselves through the queue: tell the source it was a copy so it deletes nothing
+    }
+
+    /// A drag rested on another tab: open it (its folders become drop targets).
+    pub fn drag_rest_on_tab(&mut self) {
+        if let Some(Hit::Tab(i)) = self.drag_in.as_ref().map(|d| d.hl)
+            && i != self.cur
+            && i < self.tabs.len()
+        {
+            self.select_tab(i);
+            self.invalidate();
+        }
+    }
+
+    /// Screen pixels to window DIPs.
+    fn screen_dip(&self, x: i32, y: i32) -> (f32, f32) {
+        let mut pt = POINT { x, y };
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+        }
+        let s = self.scale();
+        (pt.x as f32 / s, pt.y as f32 / s)
+    }
+
+    /// Ctrl / Shift of a test drag as OLE key bits (MK_CONTROL 0x8, MK_SHIFT 0x4, left button 0x1).
+    fn test_keys(&self) -> u32 {
+        let (c, s) = self.key_mods();
+        1 | if c { 0x8 } else { 0 } | if s { 0x4 } else { 0 }
+    }
+}
+
+impl crate::dnd::Sink for App {
+    fn drag_enter(&mut self, paths: Vec<PathBuf>, x: i32, y: i32, keys: u32, allowed: u32, image: bool) -> u32 {
+        self.drag_in = Some(DragIn { paths, x: 0.0, y: 0.0, target: None, dest: None, effect: 0, image, hl: Hit::None, hl_at: Instant::now(), internal: false });
+        self.drag_over(x, y, keys, allowed)
+    }
+    fn drag_over(&mut self, x: i32, y: i32, keys: u32, allowed: u32) -> u32 {
+        let (fx, fy) = self.screen_dip(x, y);
+        self.drag_move(fx, fy, keys, allowed)
+    }
+    fn drag_leave(&mut self) {
+        self.drag_in = None;
+        self.drag_end();
+    }
+    fn drop_files(&mut self, x: i32, y: i32, keys: u32, allowed: u32) -> u32 {
+        let (fx, fy) = self.screen_dip(x, y);
+        let e = self.drag_drop(fx, fy, keys, allowed);
+        // we did the move ourselves through the queue: tell another app's drag it was a copy so it deletes nothing
         if e == 2 && !self.dragging_out { 1 } else { e }
+    }
+    fn drop_name(&self) -> String {
+        self.drag_in.as_ref().and_then(|d| d.dest.as_ref()).map(|p| folder_title(p)).unwrap_or_default()
     }
 }
 
 // ---------------------------------------------------------------------- `wfm gui ...`
-fn parse_keys(s: &str) -> Option<(u16, bool, bool, bool)> {
+pub(crate) fn parse_keys(s: &str) -> Option<(u16, bool, bool, bool)> {
     let (mut c, mut sh, mut alt) = (false, false, false);
     let mut vk = 0u16;
     for part in s.to_lowercase().split('+') {
@@ -3984,6 +4413,8 @@ fn parse_keys(s: &str) -> Option<(u16, bool, bool, bool)> {
             "pageup" => vk = 0x21,
             "pagedown" => vk = 0x22,
             "`" => vk = 0xC0,
+            "plus" | "=" => vk = 0xBB,
+            "minus" | "-" => vk = 0xBD,
             "," => vk = 0xBC,
             f if f.starts_with('f') && f.len() > 1 && f[1..].parse::<u16>().is_ok() => vk = 0x6F + f[1..].parse::<u16>().unwrap(),
             k if k.len() == 1 => vk = k.chars().next().unwrap().to_ascii_uppercase() as u16,
@@ -4008,6 +4439,32 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
     let num = |s: &str| s.parse::<f32>().ok();
     let r = match cmd {
         "state" => return a.state_json().to_string(),
+        // hits [FILTER]: the clickable places of the last frame (DIPs), for tests that click or drag by name
+        "hits" => {
+            let v: Vec<_> = a.hits.iter().map(|(r, h)| (format!("{h:?}"), r)).filter(|(n, _)| arg.is_empty() || n.contains(arg)).map(|(n, r)| json!({"hit": n, "x": r.x, "y": r.y, "w": r.w, "h": r.h})).collect();
+            return json!({"ok": true, "hits": v}).to_string();
+        }
+        // a second RustFileExplorer.exe start (a folder opened from the desktop, Win+E ...) hands its folder over and
+        // then asks for the window: restored and in front, never left minimized behind other windows
+        "activate" => {
+            unsafe {
+                use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+                let h = a.hwnd;
+                let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
+                if !SetForegroundWindow(h).as_bool() {
+                    // the starting process allowed us, but Windows may still refuse: join the foreground thread's input
+                    let ft = GetWindowThreadProcessId(GetForegroundWindow(), None);
+                    let me = GetCurrentThreadId();
+                    if ft != 0 && ft != me {
+                        let _ = AttachThreadInput(me, ft, true);
+                        let _ = BringWindowToTop(h);
+                        let _ = SetForegroundWindow(h);
+                        let _ = AttachThreadInput(me, ft, false);
+                    }
+                }
+            }
+            ok()
+        }
         "open" | "go" => {
             let p = PathBuf::from(arg.trim_matches('"'));
             if let Some(l) = crate::model::special_loc(arg) {
@@ -4424,6 +4881,7 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
             }
             ok()
         }
+        c if c.starts_with("view-") => return crate::viewer::ipc(a, c, arg),
         _ => err("unknown gui command (see: wfm help)"),
     };
     a.invalidate();

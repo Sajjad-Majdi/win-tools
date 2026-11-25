@@ -311,7 +311,12 @@ pub fn load(path: &Path, is_dir: bool) -> Data {
             if matches!(kind, Kind::Video) && d.img.as_ref().map(|i| i.0 > 200).unwrap_or(false) {
                 d.kind = PvKind::Image;
             }
-            d.meta = if is_dir { format!("Folder · {when}") } else { format!("{label} · {} · {when}", crate::fmt::size(size)) };
+            d.meta = if is_dir {
+                // what is inside, counted up to a limit (a folder can hold millions)
+                let n = std::fs::read_dir(path).map(|r| r.take(10_000).count()).unwrap_or(0);
+                let inside = if n == 0 { "empty".to_string() } else if n >= 10_000 { "10,000+ items".to_string() } else { format!("{n} item{}", if n == 1 { "" } else { "s" }) };
+                format!("Folder · {inside} · {when}")
+            } else { format!("{label} · {} · {when}", crate::fmt::size(size)) };
         }
     }
     d

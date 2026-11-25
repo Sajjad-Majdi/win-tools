@@ -54,6 +54,10 @@ pub const EMPTY_DIR: u64 = u64::MAX;
 pub const T_TIP: usize = 10;
 /// one-shot: give start-up pages back once the window has settled
 pub const T_TRIM: usize = 11;
+/// one-shot: a slow second click on a selected item's name starts the rename (unless a double-click came first)
+pub const T_RENAME: usize = 12;
+/// one-shot: a drag rests on another tab long enough to open it (as in Explorer)
+pub const T_DRAGTAB: usize = 13;
 
 /// Results of background work, applied on the UI thread.
 pub enum Msg {
@@ -86,6 +90,8 @@ pub enum Msg {
     KeyTest(Result<(), String>),
     OpenWith { path: PathBuf, apps: Vec<fmcore::shell::Handler> },
     AiFlags { ai: bool },
+    /// the picture viewer's "Show in folder": the picture's folder here, the picture selected, this window in front
+    ViewerReveal(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -102,6 +108,8 @@ pub enum Hit {
     Tab(usize),
     TabClose(usize),
     TabAdd,
+    /// the arrows of a tab strip that is too long for the title bar (-1 left, 1 right)
+    TabScroll(i8),
     Min,
     Max,
     Close,
@@ -147,6 +155,8 @@ pub enum Hit {
     Scroll(usize),
     /// an address bar suggestion
     Sug(usize),
+    /// the status bar's view toggles at the bottom right (0 Details, 1 Grid)
+    ViewQuick(u8),
     Block,
 }
 
@@ -371,8 +381,18 @@ pub struct DragIn {
     pub paths: Vec<PathBuf>,
     pub x: f32,
     pub y: f32,
+    /// the folder under the pointer that lights up (a folder row / tile, sidebar place, tab, address crumb)
     pub target: Option<PathBuf>,
+    /// where a drop goes now (the lit folder, else the pane's own folder)
+    pub dest: Option<PathBuf>,
     pub effect: u32,
+    /// the source gave a drag image (the shell draws it, with our "Move to ..." line): no card of our own
+    pub image: bool,
+    /// what is lit, and since when (resting on another tab opens it)
+    pub hl: Hit,
+    pub hl_at: Instant,
+    /// a test drag inside this window (`wfm gui drag`): no OLE, the mouse handlers drive it
+    pub internal: bool,
 }
 
 #[derive(Clone)]
@@ -382,6 +402,8 @@ pub struct UiSettings {
     pub hidden: bool,
     pub ask_delete: bool,
     pub scope_pc: bool,
+    /// pictures open in the built-in viewer (else in the Windows default app)
+    pub viewer: bool,
 }
 
 pub struct SetState {
@@ -431,6 +453,11 @@ pub struct App {
     /// rows and tabs drawn this frame with the width their name had (for tooltips of cut names)
     pub name_w: Vec<(Hit, f32)>,
     pub menu_side: Option<Loc>,
+    /// tab strip that does not fit: scrolled by this much, the most it can scroll, where it shows, and the (active tab, tab count) last brought into view
+    pub tab_scroll: f32,
+    pub tab_max: f32,
+    pub tab_strip: Rect,
+    pub tab_seen: (usize, usize),
     pub path_edit: Option<Field>,
     pub search_focus: bool,
     pub menu: Option<CtxMenu>,
@@ -443,6 +470,9 @@ pub struct App {
     pub whatis: Option<WhatIs>,
     pub toast: Option<Toast>,
     pub inline: Option<Inline>,
+    /// where the rename box was drawn this frame, and when it last refused a character (the tip under it)
+    pub inline_rect: Rect,
+    pub inline_tip: Option<Instant>,
     pub drag_in: Option<DragIn>,
     pub press: Option<(f32, f32, usize, usize)>,
     pub drag_scroll: Option<(usize, f32, f32)>,
@@ -509,6 +539,15 @@ pub struct App {
     /// hover and press amounts (eased)
     pub hov_f: crate::motion::Fades<Hit>,
     pub press_f: crate::motion::Fades<Hit>,
+    /// drop-target light of a folder row / tile, sidebar place, tab or crumb while files are dragged over it
+    pub drop_f: crate::motion::Fades<Hit>,
+    /// slow double-click rename: the last plain click on a row (item, when), the press that may rename (item, x,
+    /// y), and the rename waiting for the double-click time to pass
+    pub last_click: Option<(PathBuf, Instant)>,
+    pub slow_click: Option<(PathBuf, f32, f32)>,
+    pub rename_due: Option<PathBuf>,
+    /// a plain press on one item of a multiple selection: a click (no drag) leaves only that item selected
+    pub press_collapse: bool,
     /// menus that are closing (painted fading out, without hits)
     pub menu_out: Option<(CtxMenu, Instant)>,
     pub drop_out: Option<(DropMenu, bool, Instant)>,
@@ -690,6 +729,7 @@ impl App {
         self.mica = on;
         self.gfx.set_alpha(on);
         self.gfx.set_see_through(self.look.see_through());
+        crate::viewer::sync(self);
         self.invalidate();
     }
 
@@ -789,6 +829,7 @@ impl App {
         self.t = theme::make(dark, custom, self.tint(), self.look.strength);
         self.gfx.corner = if self.look.square { 0.0 } else { 1.0 };
         set_dark_frame(self.hwnd, dark);
+        crate::viewer::sync(self);
         self.invalidate();
     }
 
@@ -1231,7 +1272,44 @@ impl App {
         v
     }
 
+    /// The search box text changed by typing, pasting or deleting. Asks again only when the words changed (a space or
+    /// a caret move asks nothing). With AI Search on, a sentence (3+ words), or words typed onto an AI answer or onto
+    /// a search that found nothing, wait for a short pause first; the list below keeps its last answer meanwhile, so
+    /// describing a file in your own words does not make the results blink on every word. Plain file-name typing
+    /// still asks at once on every key.
+    pub fn search_typed(&mut self) {
+        let ai_on = self.ai_on;
+        let Some(s) = self.pane().search.as_ref() else { return };
+        let words = fold_words(&s.field.text);
+        if !words.is_empty() && words == s.asked {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_SEARCH);
+            }
+            self.invalidate();
+            return;
+        }
+        let calm = ai_on && !words.is_empty() && (s.ai.is_some() || s.was_empty || words.split(' ').count() >= 3);
+        if calm {
+            self.timer(T_SEARCH, 350);
+        } else {
+            self.start_search();
+        }
+        self.invalidate();
+    }
+
+    /// The pause after typing is over: search, unless the words are the ones already asked for.
+    pub fn search_due(&mut self) {
+        let Some(s) = self.pane().search.as_ref() else { return };
+        let words = fold_words(&s.field.text);
+        if words.is_empty() || words != s.asked {
+            self.start_search();
+        }
+    }
+
     pub fn start_search(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_SEARCH);
+        }
         let here = self.sources(self.pane().dir());
         let own = self.own_places();
         let sp = self.sp.clone();
@@ -1241,10 +1319,18 @@ impl App {
         let Some(s) = self.pane_mut().search.as_mut() else { return };
         let seq = s.next_request();
         let words = s.field.text.trim().to_string();
+        // "Show them for this search" holds for that search only: other words bring the hint row back
+        if !s.asked.is_empty() && !fold_words(&words).starts_with(&s.asked) {
+            s.junk = sp.junk;
+        }
+        // a search inside a system / temp folder (AppData, Temp) shows what is there: the hint row would hide it all
+        s.scope_junk = !(s.pc || here.is_empty()) && here.iter().any(|d| crate::rank::junk(d));
+        s.asked = fold_words(&words);
         if words.is_empty() {
             s.items.clear();
             s.all.clear();
             s.total = 0;
+            s.was_empty = false;
             self.invalidate();
             return;
         }
@@ -1265,6 +1351,7 @@ impl App {
                 s.done_words = words;
                 s.open.clear();
                 s.rearrange();
+                s.was_empty = s.items.is_empty();
                 let pn = self.pane_mut();
                 pn.scroll = 0.0;
                 pn.sel.clear();
@@ -1277,7 +1364,7 @@ impl App {
         s.busy = true;
         s.own = own.clone();
         s.open.clear();
-        let (junk, open) = (s.junk, s.open.clone());
+        let (junk, open) = (s.junk || s.scope_junk, s.open.clone());
         let mut q = s.query_with(&here, &sp);
         // a whole-PC search follows Settings > Search (a ticked-out folder's own row is dropped after the query)
         let whole = s.pc || here.is_empty();
@@ -1487,12 +1574,14 @@ impl App {
                         s.all = items;
                         s.items = rows;
                         s.note.clear();
+                        s.was_empty = s.ai.is_none() && s.items.is_empty();
                     }
                     Err(e) => {
                         s.items.clear();
                         s.all.clear();
                         s.total = 0;
                         s.note = e;
+                        s.was_empty = false;
                     }
                 }
                 let pn = &mut self.tabs[t].panes[p];
@@ -1593,6 +1682,7 @@ impl App {
             Msg::Toast { text, undo } => self.toast(&text, "", undo),
             Msg::ToastErr(e) => self.toast_err(&e),
             Msg::Refresh => self.refresh_all(),
+            Msg::ViewerReveal(p) => self.reveal_picture(&p),
             Msg::EvStatus { running, total } => {
                 self.set.ev_running = Some(running);
                 self.set.ev_total = total;
@@ -1793,6 +1883,7 @@ impl App {
             "dropdown": self.drop.as_ref().map(|d| d.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()),
             "path_edit": self.path_edit.as_ref().map(|f| f.text.clone()),
             "inline_rename": self.inline.as_ref().map(|f| f.field.text.clone()),
+            "drag": self.drag_in.as_ref().map(|d| json!({"items": d.paths.len(), "lit": format!("{:?}", d.hl), "target": d.target, "dest": d.dest, "effect": d.effect})),
             "whatis": self.whatis.as_ref().map(|w| json!({"path": w.item.path, "answer": w.answer.as_ref().map(|a| match a { Ok(a) => json!({"what": a.what, "actions": a.actions}), Err(e) => json!({"error": e}) })})),
             "rename_rows": self.rename.as_ref().map(|r| r.rows.iter().map(|x| format!("{} -> {}", x.0, x.1)).collect::<Vec<_>>()),
             "rename_problem": self.rename.as_ref().and_then(|r| r.problem.clone()),
@@ -1808,6 +1899,8 @@ impl App {
             "cleanup": self.cleanup_status(),
             "first_paint_ms": self.first_paint_ms, "first_list_ms": self.first_list_ms,
             "last_error": self.last_error,
+            "viewer": crate::viewer::state(),
+            "picture_viewer": self.ui.viewer,
         })
     }
 }
@@ -2205,6 +2298,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         Hit::SideEdge | Hit::ColEdge(..) => IDC_SIZEWE,
                         Hit::Omni => IDC_IBEAM,
                         _ if app.path_edit.is_some() && matches!(app.hover, Hit::OmniSearch) => IDC_IBEAM,
+                        // the name being renamed in place is a text field
+                        Hit::Row(p, i) if app.inline.as_ref().is_some_and(|f| f.pane == p && app.tabs[app.cur].panes.get(p).and_then(|pn| pn.rows().get(i)).is_some_and(|it| it.path == f.path)) => IDC_IBEAM,
+                        // buttons and toggles show the hand (Sajjad, 2026-11-25); rows, menus, tabs and the sidebar keep the arrow, as in Explorer
+                        Hit::ViewQuick(_) | Hit::ViewBtn | Hit::New | Hit::Back | Hit::Fwd | Hit::Up | Hit::TabAdd | Hit::TabScroll(_) | Hit::TabClose(_) | Hit::OmniClear
+                        | Hit::Crumb(_) | Hit::Ask | Hit::AiOffer | Hit::Scope(_) | Hit::Filter(_) | Hit::Toast(_) | Hit::Dlg(_) | Hit::Set(_) | Hit::WhatIs(_)
+                        | Hit::PlaceChk(_) | Hit::PlaceExp(_) | Hit::Xfer | Hit::XferHead(_) | Hit::Job(..) | Hit::Clash(..) | Hit::SameChoice(_)
+                        | Hit::Pv(_) | Hit::Cleanup(_) => IDC_HAND,
                         _ => IDC_ARROW,
                     };
                     SetCursor(LoadCursorW(None, cur).ok());
@@ -2234,6 +2334,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // one process, one message loop: the picture viewer closes with the main window
+                crate::viewer::close();
                 app.stop_cleanup_review();
                 // remember where we were (start page "Last session"), the tabs and the window's place
                 if let Some(p) = app.pane().loc.path() {
@@ -2315,6 +2417,7 @@ pub fn run(o: Opts) -> i32 {
             ask_delete: ui["ask_delete"].as_bool().unwrap_or(false),
             // search starts in the current folder unless the user picked This PC
             scope_pc: ui["scope_pc"].as_bool().unwrap_or(false),
+            viewer: ui["picture_viewer"].as_bool().unwrap_or(true),
         };
         let look = crate::look::Look::load();
         let dark = o.theme.unwrap_or(match look.theme {
@@ -2404,6 +2507,10 @@ pub fn run(o: Opts) -> i32 {
             sug_seq: 0,
             name_w: vec![],
             menu_side: None,
+            tab_scroll: 0.0,
+            tab_max: 0.0,
+            tab_strip: Rect::default(),
+            tab_seen: (usize::MAX, 0),
             path_edit: None,
             search_focus: false,
             menu: None,
@@ -2416,6 +2523,8 @@ pub fn run(o: Opts) -> i32 {
             whatis: None,
             toast: None,
             inline: None,
+            inline_rect: Rect::default(),
+            inline_tip: None,
             drag_in: None,
             press: None,
             drag_scroll: None,
@@ -2469,6 +2578,11 @@ pub fn run(o: Opts) -> i32 {
             look,
             hov_f: crate::motion::Fades::new(crate::motion::FAST, crate::motion::NORMAL),
             press_f: crate::motion::Fades::new(60.0, crate::motion::NORMAL),
+            drop_f: crate::motion::Fades::new(crate::motion::FAST, crate::motion::NORMAL),
+            last_click: None,
+            slow_click: None,
+            rename_due: None,
+            press_collapse: false,
             menu_out: None,
             drop_out: None,
             ai_armed: None,

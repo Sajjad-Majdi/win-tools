@@ -63,6 +63,119 @@ pub fn open_file(path: &Path) -> Res<()> {
     open(path)
 }
 
+const PICTURES: &[&str] = &[
+    "jpg", "jpeg", "jfif", "png", "gif", "bmp", "webp", "heic", "heif", "avif", "tif", "tiff", "ico", "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2",
+    "mp4", "mov", "mkv", "avi", "wmv", "webm", "m4v", "3gp",
+];
+const SOUNDS: &[&str] = &["mp3", "m4a", "wav", "flac", "aac", "ogg", "wma", "opus"];
+
+/// The file types a photo or music app may step through after opening `ext` (pictures and videos together, as
+/// Explorer does); None for other files.
+pub fn neighbor_kinds(ext: &str) -> Option<&'static [&'static str]> {
+    let e = ext.trim_start_matches('.').to_lowercase();
+    if PICTURES.contains(&e.as_str()) {
+        Some(PICTURES)
+    } else if SOUNDS.contains(&e.as_str()) {
+        Some(SOUNDS)
+    } else {
+        None
+    }
+}
+
+/// Open a picture, video or song with its default app AND hand that app the other files of its folder (same kind,
+/// in the order the list shows: `sort_prop` is a property name such as "System.ItemNameDisplay"), so Photos and
+/// players step through them with the arrow keys, as when Explorer opens them. Runs on its own thread; when the
+/// Windows launcher refuses (or the type has no neighbours), the plain open runs instead.
+pub fn open_with_neighbors(path: &Path, sort_prop: &str, descending: bool) -> Res<()> {
+    open_with_neighbors_wait(path, sort_prop, descending, false)
+}
+
+/// [`open_with_neighbors`]; `wait` = block until the app is launched (the CLI, which exits right after).
+/// Neighbour lists handed to the app that opened a picture or video (see open_with_neighbors_wait).
+struct Held(#[allow(dead_code)] windows::Storage::Search::StorageFileQueryResult);
+// only held and dropped, always from multithreaded-apartment threads (the object is agile)
+unsafe impl Send for Held {}
+static NEIGHBOURS: std::sync::Mutex<Vec<Held>> = std::sync::Mutex::new(Vec::new());
+
+pub fn open_with_neighbors_wait(path: &Path, sort_prop: &str, descending: bool, wait: bool) -> Res<()> {
+    let path = abs(path);
+    if !path.is_file() {
+        return Err(format!("not found: {}", path.display()));
+    }
+    let Some(kinds) = neighbor_kinds(&ext_of(&path.to_string_lossy())) else {
+        return open(&path);
+    };
+    let Some(dir) = path.parent().map(|d| d.to_path_buf()) else {
+        return open(&path);
+    };
+    let prop = sort_prop.to_string();
+    let t = std::thread::spawn(move || {
+        // The app that opens the file (Photos) reads the neighbour list from OUR process, later, when the user presses an
+        // arrow key. So the query must outlive this call: it lives in the multithreaded apartment (no message pump
+        // needed, kept alive for the whole process by CoIncrementMTAUsage) and is held in NEIGHBOURS below. Before
+        // (2026-11-24) an STA thread dropped it at once and Photos showed only the one file.
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoIncrementMTAUsage, CoInitializeEx, CoUninitialize};
+        static MTA: std::sync::Once = std::sync::Once::new();
+        MTA.call_once(|| {
+            let _ = unsafe { CoIncrementMTAUsage() };
+        });
+        let inited = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let launched = (|| -> windows::core::Result<bool> {
+            use windows::Storage::Search::{FolderDepth, QueryOptions, SortEntry};
+            use windows::Storage::{StorageFile, StorageFolder};
+            use windows::core::HSTRING;
+            let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))?.get()?;
+            let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(dir.as_os_str()))?.get()?;
+            let q = QueryOptions::new()?;
+            q.SetFolderDepth(FolderDepth::Shallow)?;
+            let types = q.FileTypeFilter()?;
+            for k in kinds {
+                types.Append(&HSTRING::from(format!(".{k}")))?;
+            }
+            if std::env::var("WFM_NB_NOSORT").is_err() {
+                let order = q.SortOrder()?;
+                order.Clear()?;
+                order.Append(&SortEntry { PropertyName: HSTRING::from(prop.as_str()), AscendingOrder: !descending })?;
+            }
+            if std::env::var("WFM_NB_DEFAULT").is_ok() {
+                // test: the system's own default query options for this kind
+                let _ = q;
+            }
+            let neighbours = folder.CreateFileQueryWithOptions(&q)?;
+            if std::env::var("WFM_DEBUG_LAUNCH").is_ok() {
+                let n = neighbours.GetFilesAsyncDefaultStartAndCount().and_then(|op| op.get()).map(|v| v.Size().unwrap_or(0));
+                eprintln!("neighbors query: {n:?} files, indexer {:?}", folder.GetIndexedStateAsync().and_then(|o| o.get()));
+            }
+            let opts = windows::System::LauncherOptions::new()?;
+            opts.SetNeighboringFilesQuery(&neighbours)?;
+            let ok = windows::System::Launcher::LaunchFileWithOptionsAsync(&file, &opts)?.get()?;
+            if ok {
+                // keep the last few lists alive (one per opened picture; older ones go)
+                let mut keep = NEIGHBOURS.lock().unwrap_or_else(|e| e.into_inner());
+                keep.push(Held(neighbours));
+                let n = keep.len();
+                if n > 8 {
+                    keep.drain(..n - 8);
+                }
+            }
+            Ok(ok)
+        })();
+        if std::env::var("WFM_DEBUG_LAUNCH").is_ok() {
+            eprintln!("neighbors launch: {launched:?}");
+        }
+        if !matches!(launched, Ok(true)) {
+            let _ = open(&path);
+        }
+        if inited {
+            unsafe { CoUninitialize() };
+        }
+    });
+    if wait {
+        let _ = t.join();
+    }
+    Ok(())
+}
+
 /// The current default app of a file type: (friendly name, program path); empty strings when unknown.
 pub fn default_app(ext: &str) -> (String, String) {
     use windows::Win32::UI::Shell::{ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR, ASSOCSTR_EXECUTABLE, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW};

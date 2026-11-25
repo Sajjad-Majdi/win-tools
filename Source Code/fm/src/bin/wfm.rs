@@ -51,6 +51,7 @@ Change (every change can be undone with `wfm undo`)
 
 Open
   open <path> [--verb VERB]               default app (VERB: edit, print, runas, ...)
+  open <file> --neighbors [--desc]        picture/video/song: the app also gets the folder's others (arrow keys)
   open --select <path>                    like `explorer /select,`: prints the folder and the item to select
   openwith <path> [--all]                 the apps that can open it (the Windows default is marked)
   openwith <path> <app>                   open it with one of them (also: --app NAME; old name: open-with)
@@ -63,6 +64,8 @@ Open
 Live
   watch <dir> [--recursive] [--timeout SEC] [--count N]   JSON lines of changes until Ctrl+C
   thumb <path> --out <png> [--size 256] [--icon|--thumbnail-only]
+  picture <path> [--out <png>] [--max N]  decode a picture as the viewer does (WIC, EXIF orientation applied):
+                                          size, orientation, frames, time; --out writes the upright pixels
 
 Agents: Save / Open dialogs
   dialog list [--desktop NAME] [--verbose]
@@ -84,6 +87,10 @@ Window (RustFileExplorer.exe must be running; every command answers with one lin
                                           (Windows.Graphics.Capture); prints the alpha of sample pixels
   gui drag X0 Y0 X1 Y1 [ctrl|shift]       a mouse drag sent to the window only (no real cursor)
   gui look [key value]                    show or change a Settings > Personalize value
+  gui view-image <path>                   open the picture viewer (the list's pictures, or the folder's by name)
+  gui view-state | view-key K | view-post K | view-click X Y | view-dblclick X Y | view-hover X Y
+  gui view-wheel X Y N [ctrl] | view-drag X0 Y0 X1 Y1 | view-hits [f] | view-size W H | view-shot FILE [--hover]
+  gui view-close                          (the viewer's state is also in gui state, key viewer)
   default status                          which parts open in Rust File Explorer: folders, drives, Win+E,
                                           This PC (set/restore only from Settings, or:
                                           default set --yes / default restore --yes; --root TESTKEY for tests)
@@ -217,6 +224,7 @@ fn run(a: &Args) -> R {
         "reveal" => cmd_reveal(a),
         "watch" => cmd_watch(a),
         "thumb" => cmd_thumb(a),
+        "picture" => cmd_picture(a),
         "dialog" => cmd_dialog(a),
         "bin" | "recycle-bin" => cmd_bin(a),
         "cleanup" => cmd_cleanup(a),
@@ -731,7 +739,15 @@ fn cmd_open(a: &Args) -> R {
     }
     let p = a.arg(1, "open needs a path")?;
     let verb = a.opt("--verb").unwrap_or("open");
-    shell::open_verb(Path::new(p), verb, "").map_err(fail)?;
+    if a.flag("--neighbors") {
+        // pictures/videos/songs: the app gets the folder's other files of that kind, by name (arrow keys in Photos)
+        shell::open_with_neighbors_wait(Path::new(p), "System.ItemNameDisplay", a.flag("--desc"), true).map_err(fail)?;
+        // the app reads the list from this process later: stay alive a while (--keep seconds, default 120)
+        let keep = a.opt("--keep").and_then(|s| s.parse::<u64>().ok()).unwrap_or(120);
+        std::thread::sleep(std::time::Duration::from_secs(keep));
+    } else {
+        shell::open_verb(Path::new(p), verb, "").map_err(fail)?;
+    }
     Ok(Out { v: json!({"ok": true, "path": abs(p).to_string_lossy(), "verb": verb}), text: format!("opened {}\n", abs(p).display()) })
 }
 
@@ -806,6 +822,22 @@ fn cmd_thumb(a: &Args) -> R {
     let out = abs(out);
     let (w, h) = thumb::thumbnail_png(Path::new(p), &out, size, kind).map_err(fail)?;
     Ok(Out { v: json!({"ok": true, "out": out.to_string_lossy(), "width": w, "height": h}), text: format!("wrote {} ({w}x{h})\n", out.display()) })
+}
+
+fn cmd_picture(a: &Args) -> R {
+    let p = a.arg(1, "picture needs a path")?;
+    let max = a.num("--max")?.unwrap_or(16384) as u32;
+    let t0 = Instant::now();
+    let d = fmcore::picture::decode(Path::new(p), max, 80_000_000, false).map_err(fail)?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut v = json!({"ok": true, "path": abs(p).to_string_lossy(), "width": d.width, "height": d.height, "full_width": d.full_w, "full_height": d.full_h, "orientation": d.orientation, "frames": d.frames, "ms": (ms * 10.0).round() / 10.0});
+    if let Some(out) = a.opt("--out") {
+        let out = abs(out);
+        thumb::save_png(&thumb::Image { width: d.width, height: d.height, bgra: d.bgra }, &out).map_err(fail)?;
+        v["out"] = json!(out.to_string_lossy());
+    }
+    let text = format!("{}x{} (original {}x{}), orientation {}, {} frame(s), {:.0} ms\n", d.width, d.height, d.full_w, d.full_h, d.orientation, d.frames, ms);
+    Ok(Out { v, text })
 }
 
 fn dialog_json(d: &dialog::FileDialog) -> Value {
