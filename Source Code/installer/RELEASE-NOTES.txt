@@ -1,4 +1,19 @@
-Rust Task Manager and Rust File Explorer 0.2.5: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.6: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.6
+- Rust File Explorer: its own picture viewer. Opening a picture shows every picture of the folder in the list order:
+  arrow keys, mouse wheel and a filmstrip step through them; zoom, pan, rotate, full screen, delete with Undo,
+  and "Open in default app". Settings > Files and folders > "Open pictures in" switches back to the Windows app.
+- Rust File Explorer: drag and drop with the Windows drag image; a slow second click on a name renames it.
+- Rust File Explorer: tabs sit in the title bar like Explorer and scroll with arrows when there are many.
+- Rust File Explorer: every menu row has an icon; Cut, Copy, Rename and Delete sit in a labelled top row.
+- Rust File Explorer: Copy to / Move to end with "Choose location...", the Sort menu has Type, pinned folders show
+  "Unpin from sidebar", and Details/Grid buttons sit at the right of the status bar.
+- Rust File Explorer: when it is the default file manager, folders open in it from everywhere, and the menu offers
+  "Open in Windows File Explorer".
+- Rust File Explorer fixes: search inside Temp or AppData shows its results, PageUp/PageDown move a full page,
+  the copy toast says when nothing was copied, a rename shows which characters are not allowed, and the Space
+  preview of a folder shows its item count.
 
 New in 0.2.5
 - Rust File Explorer: AI Review sends several requests at once, so it finishes several times faster.
