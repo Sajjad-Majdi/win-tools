@@ -95,6 +95,15 @@ Window (RustFileExplorer.exe must be running; every command answers with one lin
   default status                          which parts open in Rust File Explorer: folders, drives, Win+E,
                                           This PC (set/restore only from Settings, or:
                                           default set --yes / default restore --yes; --root TESTKEY for tests)
+  default probe --yes                     opens a test folder every common way (ShellExecute verbs, class
+                                          Folder, explorer.exe, SHOpenFolderAndSelectItems, Control Panel ...)
+                                          and reports which app got it; closes every window it opened
+  props <path> [--set NAME --value TEXT]  file properties as Explorer's Details pane shows them (* = can be
+                                          changed); --set changes one, e.g. --set System.Music.Artist
+                                          --value 'A; B' (empty TEXT removes it)
+  explorer                                the open Windows Explorer tabs: location, selection, active
+  explorer check <folder> [--parent]      would RustFileExplorer.exe hand this folder back to the Explorer
+                                          window in front? (--parent: also require Explorer as parent)
   ev <words...> [--top N]                 Everything IPC query (no es.exe), with timing
 
 Notes
@@ -105,7 +114,7 @@ Notes
 /// Flags that take a value.
 const WITH_VALUE: &[&str] = &[
     "--sort", "--top", "--in", "--ext", "--size", "--modified", "--conflict", "--pattern", "--to", "--name", "--verb", "--app", "--timeout", "--count",
-    "--out", "--path", "--hwnd", "--desktop", "--limit", "--engine", "--invoke", "--select",
+    "--out", "--path", "--hwnd", "--desktop", "--limit", "--engine", "--invoke", "--select", "--set", "--value",
 ];
 
 struct Out {
@@ -199,6 +208,8 @@ fn run(a: &Args) -> R {
     match cmd {
         "gui" => cmd_gui(a),
         "default" => cmd_default(a),
+        "explorer" => cmd_explorer(a),
+        "props" => cmd_props(a),
         "ev" => cmd_ev(a),
         "ev-raw" => cmd_ev_raw(a),
         "help" | "-h" | "/?" => Ok(Out { v: json!({"ok": true, "help": HELP}), text: HELP.into() }),
@@ -394,6 +405,44 @@ fn cmd_find(a: &Args) -> R {
     }
     let engine = if found.engine == "everything" { "Everything".to_string() } else { format!("folder walk of {}", q.in_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| abs(".").display().to_string())) };
     t += &format!("{} results ({} ms, engine: {engine}{})\n", hits.len(), ms, if found.complete { "" } else { ", stopped early: more may exist" });
+    Ok(Out { v, text: t })
+}
+
+/// props <path> [--set NAME --value TEXT]: properties through the Windows property system.
+fn cmd_props(a: &Args) -> R {
+    let p = PathBuf::from(a.arg(1, "props needs a path")?);
+    if let Some(k) = a.opt("--set") {
+        fmcore::props::set(&p, k, a.opt("--value").unwrap_or("")).map_err(fail)?;
+    }
+    let v = fmcore::props::read(&p).map_err(fail)?;
+    let mut t = String::new();
+    for x in &v {
+        t += &format!("{} {:<14} {}  ({})\n", if x.writable { "*" } else { " " }, x.label, x.value, x.key);
+    }
+    Ok(Out { v: json!({"ok": true, "props": v.iter().map(|x| json!({"key": x.key, "label": x.label, "value": x.value, "raw": x.raw, "writable": x.writable})).collect::<Vec<_>>()}), text: t })
+}
+
+/// explorer | explorer check <folder> [--parent]: Windows Explorer tabs (read only) and the hand-back decision.
+fn cmd_explorer(a: &Args) -> R {
+    if a.pos.get(1).map(|s| s.as_str()) == Some("find") {
+        let p = a.arg(2, "explorer find needs a folder")?;
+        let lines = fmcore::explorer::find_shell_window(p);
+        return Ok(Out { v: json!({"ok": true, "lines": lines}), text: lines.join("
+") + "
+" });
+    }
+    if a.pos.get(1).map(|s| s.as_str()) == Some("check") {
+        let p = a.arg(2, "explorer check needs a folder")?;
+        let v = fmcore::explorer::check(p, a.flag("--parent"));
+        return Ok(Out { v: json!({"ok": true, "verdict": format!("{v:?}")}), text: format!("{v:?}\n") });
+    }
+    let tabs = fmcore::explorer::list().map_err(fail)?;
+    let mut t = String::new();
+    for x in &tabs {
+        t += &format!("{:#x} {} {}  [{} selected]\n", x.hwnd, if x.active { "*" } else { " " }, if x.location.is_empty() { "(virtual)" } else { &x.location }, x.selected.len());
+    }
+    t += &format!("{} Explorer tab(s)\n", tabs.len());
+    let v = json!({"ok": true, "tabs": tabs.iter().map(|x| json!({"hwnd": x.hwnd, "tab": x.tab, "active": x.active, "location": x.location, "selected": x.selected})).collect::<Vec<_>>()});
     Ok(Out { v, text: t })
 }
 
@@ -1090,7 +1139,23 @@ fn cmd_default(a: &Args) -> R {
             v["ok"] = json!(true);
             Ok(Out { v, text: format!("done\n{t}") })
         }
-        _ => Err(usage("default status|set|restore [--yes] [--root TESTKEY] [--exe PATH]")),
+        // fire every common way of opening a folder and report which app got it (opens and closes real windows)
+        "probe" => {
+            if !a.flag("--yes") {
+                return Err(usage("default probe opens real windows on the desktop for a moment and closes them; add --yes"));
+            }
+            let json_out = a.flag("--json");
+            let rows = fmcore::probe::run(&mut |r| {
+                if !json_out {
+                    println!("{:<42} {:<46} {}", r.way, r.got, r.note);
+                }
+            })
+            .map_err(fail)?;
+            let v = json!({"ok": true, "rows": rows.iter().map(|r| json!({"way": r.way, "got": r.got, "note": r.note})).collect::<Vec<_>>()});
+            Ok(Out { v, text: format!("{} ways probed
+", rows.len()) })
+        }
+        _ => Err(usage("default status|set|restore|probe [--yes] [--root TESTKEY] [--exe PATH]")),
     }
 }
 

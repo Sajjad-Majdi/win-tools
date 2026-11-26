@@ -10,6 +10,8 @@ pub const THEMES: [&str; 3] = ["Same as Windows", "Light", "Dark"];
 pub const DENSITY: [&str; 2] = ["Comfortable", "Compact"];
 pub const SIZES3: [&str; 3] = ["Small", "Medium", "Large"];
 pub const CORNERS: [&str; 2] = ["Rounded", "Square"];
+/// Settings > Layout > Toolbar: New / Sort / View at the right of the address bar, or Explorer's command bar under it
+pub const TOOLBARS: [&str; 2] = ["Compact", "Command bar"];
 /// Accent presets (name, colour). The first entry of the picker is "Windows accent".
 pub const ACCENTS: [(&str, u32); 9] = [
     ("Blue", 0x2563EB),
@@ -75,6 +77,10 @@ pub struct Look {
     /// the tabs open when the window last closed (folders, "::thispc", "::bin") and the current one
     pub tabs: Vec<String>,
     pub tab_cur: usize,
+    /// 0 compact (buttons at the right of the address bar), 1 command bar (a row under it, as in Explorer)
+    pub toolbar: u8,
+    /// the Details pane is shown (Alt+Shift+P)
+    pub details: bool,
 }
 
 impl Default for Look {
@@ -106,6 +112,8 @@ impl Default for Look {
             win: None,
             tabs: vec![],
             tab_cur: 0,
+            toolbar: 0,
+            details: false,
         }
     }
 }
@@ -155,6 +163,8 @@ impl Look {
             }),
             tabs: v["tabs"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).take(30).collect()).unwrap_or_default(),
             tab_cur: v["tab"].as_u64().unwrap_or(0) as usize,
+            toolbar: (v["toolbar"].as_str() == Some("command")) as u8,
+            details: b("details_pane", false),
         }
     }
 
@@ -170,6 +180,7 @@ impl Look {
             "width_date": self.w_date.round(), "width_size": self.w_size.round(), "width_type": self.w_type.round(),
             "start": self.start, "last": self.last,
             "window": self.win, "tabs": self.tabs, "tab": self.tab_cur,
+            "toolbar": if self.toolbar == 1 { "command" } else { "compact" }, "details_pane": self.details,
         })
     }
 
@@ -185,9 +196,6 @@ impl Look {
     /// List row height for the density.
     pub fn row_h(&self) -> f32 {
         if self.density == 1 { 26.0 } else { 32.0 }
-    }
-    pub fn list_row_h(&self) -> f32 {
-        if self.density == 1 { 22.0 } else { 26.0 }
     }
     /// List text size for the font setting.
     pub fn text(&self) -> f32 {
@@ -262,8 +270,28 @@ impl Look {
             "size" => self.col_size = on(val),
             "type" => self.col_type = on(val),
             "start" => self.start = val.to_string(),
+            "toolbar" => self.toolbar = match val { "compact" | "0" => 0, "command" | "command-bar" | "1" => 1, _ => return false },
+            "details" | "details_pane" => self.details = on(val),
             _ => return false,
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_and_details_pane_are_kept() {
+        let mut l = Look::default();
+        assert_eq!((l.toolbar, l.details), (0, false));
+        assert!(l.set("toolbar", "command") && l.set("details", "on"));
+        assert!(!l.set("toolbar", "ribbon"));
+        let v = l.to_json();
+        assert_eq!(v["toolbar"], "command");
+        assert_eq!(v["details_pane"], true);
+        assert!(l.set("toolbar", "compact"));
+        assert_eq!(l.to_json()["toolbar"], "compact");
     }
 }

@@ -101,6 +101,11 @@ fn main() {
         if running.is_some() {
             return;
         }
+        // at sign-in: folder keys left pointing at a RustFileExplorer.exe that is gone put Explorer back (restore
+        // also stops this helper and removes its Run value)
+        if fmcore::defaultfm::guard_missing_exe() {
+            return;
+        }
         let inst = GetModuleHandleW(None).unwrap_or_default();
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: CLASS, ..Default::default() };
         RegisterClassW(&wc);

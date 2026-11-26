@@ -1,4 +1,19 @@
-Rust Task Manager and Rust File Explorer 0.2.7: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.8: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.8
+- Rust File Explorer: a Details pane (Alt+Shift+P) shows a file's properties, and titles, artists, album, year,
+  tags, comments and other writable fields can be edited in place.
+- Rust File Explorer: each folder and drive remembers its own view (Details or Grid).
+- Rust File Explorer: Grid view shows the first pictures of a folder on its folder icon.
+- Rust File Explorer: a Quick settings panel holds layout, sorting, Details pane, hidden items and file name
+  extensions. Settings > Layout > Toolbar adds an Explorer-style command bar instead.
+- Rust File Explorer: as the default file manager it also takes the "explore" verb and Folder class opens, hands
+  Control Panel, Recycle Bin and Network back to Explorer, and keeps folders opened inside an Explorer window
+  in Explorer. Its entries now sit under "Show more options" only, and its own menu has "Open in Windows File
+  Explorer" with Explorer's icon.
+- Rust File Explorer: taskbar jump list with pinned and recent folders.
+- Rust File Explorer: the Compact list view is removed; Ctrl+Shift+1 is Details and Ctrl+Shift+2 is Grid.
+- Rust File Explorer fix: the Recycle Bin is found by its correct ID.
 
 New in 0.2.7
 - Rust File Explorer: the rename box and other text boxes behave exactly like Windows text boxes.

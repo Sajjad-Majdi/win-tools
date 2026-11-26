@@ -1,14 +1,23 @@
 //! "Set as default file manager" / "Restore Explorer", per user (HKCU only, no admin rights).
 //!
 //! `set` makes folders, drives, Win+E and the This PC / Recycle Bin desktop icons open in RustFileExplorer.exe:
-//! - `HKCU\Software\Classes\Directory\shell` and `...\Drive\shell`: the default verb is the canonical `open`, made ours
-//!   (`"<RustFileExplorer.exe>" "%1"`, empty `DelegateExecute`), so Windows 11's menu shows one "Open" entry; a second
-//!   verb `openinexplorer` ("Open in File Explorer") keeps Windows' Explorer one click away;
+//! - `HKCU\Software\Classes\Directory\shell` and `...\Drive\shell`: the canonical verb `open` is made ours
+//!   (`"<RustFileExplorer.exe>" "%1"`, empty `DelegateExecute`) and kept plain: no Icon, no name and no default-verb
+//!   value ([`DEFAULT_OPEN`]), so Windows 11's main right-click menu shows only Windows' own rows. Two classic verbs,
+//!   shown under "Show more options": `openinwfiles` ("Open in Rust File Explorer", our icon) and `openinexplorer`
+//!   ("Open in File Explorer", Explorer's icon and delegate). The `explore` verb (asked for by name by Visual
+//!   Studio and other apps) is ours too, hidden from menus (`ProgrammaticAccessOnly`);
+//! - `HKCU\Software\Classes\Folder\shell\open` and `\explore` (callers that name the class "Folder": AutoPlay
+//!   "Open folder", ShellExecuteEx with lpClass "Folder", virtual folders) = ours, plus `Folder\shell\openinexplorer`
+//!   (Explorer's own delegate, hidden) for the hand-back of virtual folders (Control Panel, Network, phones): our
+//!   exe gets them as "::{CLSID}" names and gives them to Explorer through that verb (never through open/explore,
+//!   which would loop). No default value is written on `Folder\shell`;
 //! - `HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command` (Win+E);
 //! - `HKCU\Software\Classes\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\shell\open\command` (This PC) and
-//!   `...\CLSID\{645FF040-5081-101B-9F08-08002B27103E}\shell\open\command` (Recycle Bin): `"<exe>" "::{CLSID}"`, with
+//!   `...\CLSID\{645FF040-5081-101B-9F08-00AA002F954E}\shell\open\command` (Recycle Bin): `"<exe>" "::{CLSID}"`, with
 //!   an empty `DelegateExecute` value so the per-user command wins over Explorer's delegate (as Files / Explorer++ do).
-//! `restore` deletes exactly those keys again, so Explorer is the handler once more.
+//! `restore` deletes exactly those keys again (only keys that carry our `WinToolsFiles` marker), so Explorer is the
+//! handler once more. [`guard_missing_exe`] restores at start when our keys point to an exe that is gone.
 //! Only the GUI's Settings buttons (a click by the user) and `wfm default set|restore --yes` run them. Every function has
 //! an `_in(root, ...)` form: `root` replaces `Software\Classes` (tests use `Software\RustFileExplorerTest\Classes`).
 use crate::util::{Res, wide};
@@ -20,7 +29,7 @@ use windows::core::PCWSTR;
 pub const CLASSES: &str = r"Software\Classes";
 /// This PC and Recycle Bin (desktop icons, "shell:" names).
 pub const THIS_PC: &str = "{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
-pub const RECYCLE_BIN: &str = "{645FF040-5081-101B-9F08-08002B27103E}";
+pub const RECYCLE_BIN: &str = "{645FF040-5081-101B-9F08-00AA002F954E}";
 const MARK: &str = "WinToolsFiles";
 
 const VERB: &str = "openinwfiles";
@@ -104,16 +113,43 @@ pub struct Status {
     pub this_pc: bool,
     /// the Win+E helper (RustFileExplorerWinE.exe) starts at sign-in; always true for a test root
     pub win_e_key: bool,
+    /// the `explore` verb of folders and drives is ours
+    pub explore: bool,
+    /// the class "Folder" (`open`, `explore`, plus the `openinexplorer` hand-back) is ours
+    pub folder_class: bool,
+    /// the right-click menus: nothing of ours in Windows 11's main list (`open` has no Icon or name); "Open in Rust
+    /// File Explorer" and "Open in File Explorer" with their icons under "Show more options"
+    pub menu: bool,
 }
 
 impl Status {
     pub fn all(&self) -> bool {
-        self.folders && self.drives && self.win_e && self.this_pc && self.win_e_key
+        self.parts().iter().all(|p| p.1)
     }
-    pub fn parts(&self) -> [(&'static str, bool); 5] {
-        [("folders", self.folders), ("drives", self.drives), ("win_e", self.win_e), ("this_pc", self.this_pc), ("win_e_key", self.win_e_key)]
+    pub fn parts(&self) -> [(&'static str, bool); 8] {
+        [
+            ("menu", self.menu),
+            ("folders", self.folders),
+            ("drives", self.drives),
+            ("explore", self.explore),
+            ("folder_class", self.folder_class || !FOLDER_CLASS),
+            ("win_e", self.win_e),
+            ("this_pc", self.this_pc),
+            ("win_e_key", self.win_e_key),
+        ]
     }
 }
+
+/// `set` makes the class "Folder" ours too (advisor item 2b). Off: `set` writes no Folder keys (restore still
+/// removes any it finds).
+pub const FOLDER_CLASS: bool = true;
+
+/// `set` names `open` as the default verb of Directory and Drive. Off (since 2026-11-26): no default value is
+/// written, so HKLM's "none" stays and Windows picks the verb exactly as it does without us (its main menu then
+/// shows only its own rows); double-click and ShellExecute without a verb still reach our `open` (`wfm default
+/// probe`: no verb, "open", "explore", class "Folder" all open here). A default value an earlier build wrote is
+/// removed by `set`.
+pub const DEFAULT_OPEN: bool = false;
 
 pub fn status() -> Status {
     status_in(CLASSES)
@@ -130,7 +166,15 @@ fn clsid_verb(id: &str) -> &'static str {
 pub fn status_in(root: &str) -> Status {
     let verb = |class: &str| {
         let shell = format!(r"{root}\{class}\shell");
-        get_value(&shell, "").map(|d| d.eq_ignore_ascii_case("open")).unwrap_or(false) && get_value(&format!(r"{shell}\open"), MARK).is_some() && get_value(&format!(r"{shell}\open\command"), "").is_some()
+        let default_ok = !DEFAULT_OPEN || get_value(&shell, "").map(|d| d.eq_ignore_ascii_case("open")).unwrap_or(false);
+        default_ok && get_value(&format!(r"{shell}\open"), MARK).is_some() && get_value(&format!(r"{shell}\open\command"), "").is_some()
+    };
+    // the menus: `open` plain (no Icon / name: Windows' own row in the main menu), our two named entries there
+    let menu = |class: &str| {
+        let shell = format!(r"{root}\{class}\shell");
+        let plain = get_value(&format!(r"{shell}\open"), "Icon").is_none() && get_value(&format!(r"{shell}\open"), "MUIVerb").is_none() && get_value(&format!(r"{shell}\open"), "").is_none();
+        let named = |v: &str| get_value(&format!(r"{shell}\{v}"), MARK).is_some() && get_value(&format!(r"{shell}\{v}"), "Icon").is_some() && get_value(&format!(r"{shell}\{v}"), "ProgrammaticAccessOnly").is_none();
+        plain && named(VERB) && named(EXPLORER_VERB)
     };
     // ours AND effective: our open verb is there and it is the default verb Windows sees. On the real root the
     // merged HKEY_CLASSES_ROOT is read (HKLM sets This PC's default verb to "none", which beats a lone HKCU verb).
@@ -141,12 +185,16 @@ pub fn status_in(root: &str) -> Status {
         let cmd = if root == CLASSES { get_value_in(HKEY_CLASSES_ROOT, &format!(r"CLSID\{id}\shell\{v}\command"), "") } else { get_value(&format!(r"{root}\CLSID\{id}\shell\{v}\command"), "") };
         ours && default_verb.as_deref().map(|d| d.eq_ignore_ascii_case(v)).unwrap_or(false) && cmd.map(|c| c.contains(&format!("::{id}"))).unwrap_or(false)
     };
+    let ours = |key: &str| get_value(key, MARK).is_some() && get_value(&format!(r"{key}\command"), "").is_some();
     Status {
         folders: verb("Directory"),
         drives: verb("Drive"),
         win_e: get_value(&format!(r"{root}\{WIN_E}"), MARK).is_some(),
         this_pc: clsid(THIS_PC),
         win_e_key: root != CLASSES || get_value(RUN, HELPER_NAME).is_some(),
+        explore: ours(&format!(r"{root}\Directory\shell\explore")) && ours(&format!(r"{root}\Drive\shell\explore")),
+        menu: menu("Directory") && menu("Drive"),
+        folder_class: ["open", "explore", EXPLORER_VERB].iter().all(|v| ours(&format!(r"{root}\Folder\shell\{v}"))),
     }
 }
 
@@ -202,6 +250,24 @@ fn assoc_changed() {
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
 }
 
+/// One verb that runs our exe: `"<exe>" "%1"`, an empty DelegateExecute (beats Explorer's delegate in the merged
+/// view), our marker, no Icon and no name (Windows' own row in its menus); `hidden` adds ProgrammaticAccessOnly (asked for by name only, never in a menu). Never over a
+/// command that is not ours.
+fn our_verb(key: &str, exe: &str, hidden: bool) -> Res<()> {
+    if get_value(&format!(r"{key}\command"), "").is_some() && get_value(key, MARK).is_none() {
+        return Err(format!(r"HKCU\{key} already has a command that is not ours"));
+    }
+    delete_tree(key);
+    if hidden {
+        set_value(key, "ProgrammaticAccessOnly", "")?;
+    }
+    set_value(key, "MultiSelectModel", "Document")?;
+    set_value(key, MARK, "1")?;
+    set_value(&format!(r"{key}\command"), "", &format!("\"{exe}\" \"%1\""))?;
+    set_value(&format!(r"{key}\command"), "DelegateExecute", "")?;
+    Ok(())
+}
+
 pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
     let exe = exe.to_string_lossy();
     if !exe.to_lowercase().ends_with(".exe") {
@@ -210,25 +276,45 @@ pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
     let explorer = format!(r"{}\Explorer.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\WINDOWS".into()));
     for class in ["Directory", "Drive"] {
         let base = format!(r"{root}\{class}\shell");
-        // Windows 11's menu always shows its own "Open" (Enter) plus the default verb when that verb is not "open":
-        // two entries. So ours IS "open": one "Open" entry that opens here (as Files does). A verb from 0.2.x goes.
-        delete_tree(&format!(r"{base}\{VERB}"));
-        let open = format!(r"{base}\open");
-        // never over a user's own "open" (a command already there that is not ours)
-        if get_value(&format!(r"{open}\command"), "").is_some() && get_value(&open, MARK).is_none() {
-            return Err(format!(r"HKCU\{open} already has a command that is not ours"));
+        // `open` is ours and stays plain: no Icon, no name, so Windows 11's main menu draws its own normal row (an
+        // Icon here made a half-styled row with our icon there; Sajjad, 2026-11-26). Our named entries below are
+        // classic verbs, shown only under "Show more options".
+        our_verb(&format!(r"{base}\open"), &exe, false)?;
+        if DEFAULT_OPEN {
+            set_value(&base, "", "open")?;
+        } else if get_value(&base, "").as_deref() == Some("open") && get_value(&format!(r"{base}\open"), MARK).is_some() {
+            delete_value(&base, "");
         }
-        delete_tree(&open); // drops the ProgrammaticAccessOnly / delegate values an earlier build wrote
-        set_value(&open, "Icon", &format!("{exe},0"))?;
-        set_value(&open, "MultiSelectModel", "Document")?;
-        set_value(&open, MARK, "1")?;
-        set_value(&format!(r"{open}\command"), "", &format!("\"{exe}\" \"%1\""))?;
-        // an empty DelegateExecute makes our command win over Explorer's delegate in the merged view
-        set_value(&format!(r"{open}\command"), "DelegateExecute", "")?;
-        set_value(&base, "", "open")?;
+        our_verb(&format!(r"{base}\explore"), &exe, true)?;
+        // "Open in Rust File Explorer" (classic menu only)
+        let me = format!(r"{base}\{VERB}");
+        delete_tree(&me);
+        set_value(&me, "", "Open in Rust File Explorer")?;
+        set_value(&me, "Icon", &format!("{exe},0"))?;
+        set_value(&me, "MultiSelectModel", "Document")?;
+        set_value(&me, MARK, "1")?;
+        set_value(&format!(r"{me}\command"), "", &format!("\"{exe}\" \"%1\""))?;
+        // "Open in File Explorer" (classic menu only): Explorer's own delegate
         let ex = format!(r"{base}\{EXPLORER_VERB}");
         set_value(&ex, "", "Open in File Explorer")?;
-        set_value(&ex, "Icon", "explorer.exe,0")?;
+        set_value(&ex, "Icon", &format!("{explorer},0"))?;
+        set_value(&ex, "MultiSelectModel", "Document")?;
+        set_value(&ex, MARK, "1")?;
+        set_value(&format!(r"{ex}\command"), "", &explorer)?;
+        set_value(&format!(r"{ex}\command"), "DelegateExecute", EXPLORER_DELEGATE)?;
+    }
+    if FOLDER_CLASS {
+        // the class "Folder": no default value on Folder\shell (Windows keeps choosing the verb per item)
+        let base = format!(r"{root}\Folder\shell");
+        our_verb(&format!(r"{base}\open"), &exe, false)?;
+        our_verb(&format!(r"{base}\explore"), &exe, true)?;
+        let ex = format!(r"{base}\{EXPLORER_VERB}");
+        if get_value(&format!(r"{ex}\command"), "").is_some() && get_value(&ex, MARK).is_none() {
+            return Err(format!(r"HKCU\{ex} already has a command that is not ours"));
+        }
+        delete_tree(&ex);
+        set_value(&ex, "", "Open in File Explorer")?;
+        set_value(&ex, "ProgrammaticAccessOnly", "")?;
         set_value(&ex, "MultiSelectModel", "Document")?;
         set_value(&ex, MARK, "1")?;
         set_value(&format!(r"{ex}\command"), "", &explorer)?;
@@ -283,7 +369,7 @@ pub fn restore_in(root: &str) -> Res<()> {
     for class in ["Directory", "Drive"] {
         let base = format!(r"{root}\{class}\shell");
         delete_tree(&format!(r"{base}\{VERB}"));
-        for v in ["open", EXPLORER_VERB] {
+        for v in ["open", "explore", EXPLORER_VERB] {
             if get_value(&format!(r"{base}\{v}"), MARK).is_some() {
                 delete_tree(&format!(r"{base}\{v}"));
             }
@@ -300,6 +386,15 @@ pub fn restore_in(root: &str) -> Res<()> {
             }
         }
     }
+    // the class "Folder": only our verbs, then the keys left empty (Folder\shell itself is Windows' in HKLM)
+    let fs = format!(r"{root}\Folder\shell");
+    for v in ["open", "explore", EXPLORER_VERB] {
+        if get_value(&format!(r"{fs}\{v}"), MARK).is_some() {
+            delete_tree(&format!(r"{fs}\{v}"));
+        }
+    }
+    delete_if_empty(&fs);
+    delete_if_empty(&format!(r"{root}\Folder"));
     let we = format!(r"{root}\{WIN_E}");
     if get_value(&we, MARK).is_some() {
         delete_tree(&we);
@@ -315,4 +410,152 @@ pub fn restore_in(root: &str) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// The exe our marked `Directory\shell\open` verb runs (None when that verb is not ours).
+pub fn registered_exe() -> Option<std::path::PathBuf> {
+    registered_exe_in(CLASSES)
+}
+
+pub fn registered_exe_in(root: &str) -> Option<std::path::PathBuf> {
+    let open = format!(r"{root}\Directory\shell\open");
+    get_value(&open, MARK)?;
+    exe_of_command(&get_value(&format!(r"{open}\command"), "")?)
+}
+
+/// `"C:\a b\x.exe" "%1"` -> `C:\a b\x.exe`; an unquoted command ends at the first ".exe".
+pub fn exe_of_command(cmd: &str) -> Option<std::path::PathBuf> {
+    let c = cmd.trim();
+    let p = if let Some(rest) = c.strip_prefix('"') {
+        rest.split('"').next()?.to_string()
+    } else {
+        let i = c.to_lowercase().find(".exe")?;
+        c[..i + 4].to_string()
+    };
+    (!p.is_empty()).then(|| std::path::PathBuf::from(p))
+}
+
+/// Called at start (RustFileExplorer.exe and the Win+E helper): when our keys point to an exe that no longer
+/// exists (moved, deleted, a build folder cleaned), folders would open nowhere, so Explorer is put back. True when
+/// it restored.
+pub fn guard_missing_exe() -> bool {
+    guard_missing_exe_in(CLASSES)
+}
+
+pub fn guard_missing_exe_in(root: &str) -> bool {
+    match registered_exe_in(root) {
+        Some(exe) if !exe.is_file() => {
+            if root == CLASSES {
+                let _ = restore();
+            } else {
+                let _ = restore_in(root);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A private test root under HKCU\Software\RustFileExplorerTest (never the real classes).
+    fn root(name: &str) -> String {
+        format!(r"Software\RustFileExplorerTest\Unit-{name}-{}\Classes", std::process::id())
+    }
+
+    fn drop_root(r: &str) {
+        assert!(r.starts_with(r"Software\RustFileExplorerTest\"));
+        delete_tree(r.trim_end_matches(r"\Classes"));
+    }
+
+    #[test]
+    fn exe_of_command_reads_quoted_and_plain() {
+        assert_eq!(exe_of_command(r#""C:\a b\RustFileExplorer.exe" "%1""#), Some(r"C:\a b\RustFileExplorer.exe".into()));
+        assert_eq!(exe_of_command(r"C:\x\y.exe %1"), Some(r"C:\x\y.exe".into()));
+        assert_eq!(exe_of_command(""), None);
+    }
+
+    #[test]
+    fn explore_and_folder_class_set_status_restore() {
+        let r = root("verbs");
+        let exe = std::env::current_exe().unwrap();
+        set_in(&r, &exe).unwrap();
+        let st = status_in(&r);
+        assert!(st.explore && st.folder_class && st.folders && st.drives && st.menu, "{st:?}");
+        assert_eq!(get_value(&format!(r"{r}\Directory\shell"), "").is_some(), DEFAULT_OPEN, "default verb value only when DEFAULT_OPEN");
+        // Windows 11's main menu: `open` carries nothing of ours (no Icon, no name); the named entries are classic
+        for class in ["Directory", "Drive"] {
+            let sh = format!(r"{r}\{class}\shell");
+            assert_eq!(get_value(&format!(r"{sh}\open"), "Icon"), None);
+            assert_eq!(get_value(&format!(r"{sh}\open"), ""), None);
+            assert_eq!(get_value(&format!(r"{sh}\{VERB}"), "").as_deref(), Some("Open in Rust File Explorer"));
+            assert_eq!(get_value(&format!(r"{sh}\{VERB}"), "Icon"), Some(format!("{},0", exe.display())));
+            assert_eq!(get_value(&format!(r"{sh}\{EXPLORER_VERB}"), "").as_deref(), Some("Open in File Explorer"));
+            assert!(get_value(&format!(r"{sh}\{EXPLORER_VERB}"), "Icon").unwrap().to_lowercase().ends_with("explorer.exe,0"));
+        }
+        // an Icon put back on `open` (as 0.2.7 wrote it) is reported
+        set_value(&format!(r"{r}\Directory\shell\open"), "Icon", "x.exe,0").unwrap();
+        assert!(!status_in(&r).menu);
+        set_in(&r, &exe).unwrap();
+        assert!(status_in(&r).menu);
+        for class in ["Directory", "Drive", "Folder"] {
+            let ex = format!(r"{r}\{class}\shell\explore");
+            assert_eq!(get_value(&ex, MARK).as_deref(), Some("1"));
+            assert!(get_value(&ex, "ProgrammaticAccessOnly").is_some(), "{class} explore is hidden");
+            assert_eq!(get_value(&format!(r"{ex}\command"), "DelegateExecute").as_deref(), Some(""));
+            assert!(get_value(&format!(r"{ex}\command"), "").unwrap().contains(&format!("\"{}\" \"%1\"", exe.display())));
+        }
+        let fo = format!(r"{r}\Folder\shell");
+        assert_eq!(get_value(&fo, ""), None, "no default verb on Folder\\shell");
+        assert!(get_value(&format!(r"{fo}\open"), "ProgrammaticAccessOnly").is_none());
+        assert_eq!(get_value(&format!(r"{fo}\openinexplorer\command"), "DelegateExecute").as_deref(), Some(EXPLORER_DELEGATE));
+        assert!(get_value(&format!(r"{fo}\openinexplorer"), "ProgrammaticAccessOnly").is_some());
+        assert_eq!(registered_exe_in(&r), Some(exe.clone()));
+        // a second set gives the same keys
+        set_in(&r, &exe).unwrap();
+        assert_eq!(status_in(&r), st);
+        restore_in(&r).unwrap();
+        let st = status_in(&r);
+        assert!(!st.explore && !st.folder_class && !st.folders && !st.menu, "{st:?}");
+        assert_eq!(get_value(&format!(r"{r}\Directory\shell\{VERB}\command"), ""), None);
+        assert_eq!(get_value(&format!(r"{r}\Folder\shell\open\command"), ""), None);
+        drop_root(&r);
+    }
+
+    #[test]
+    fn restore_keeps_keys_without_our_marker() {
+        let r = root("foreign");
+        let exe = std::env::current_exe().unwrap();
+        // someone else's Folder verb, and someone else's Directory explore verb
+        set_value(&format!(r"{r}\Folder\shell\other\command"), "", "x.exe").unwrap();
+        set_value(&format!(r"{r}\Directory\shell\explore\command"), "", "theirs.exe \"%1\"").unwrap();
+        assert!(set_in(&r, &exe).is_err(), "never over a command that is not ours");
+        restore_in(&r).unwrap();
+        assert_eq!(get_value(&format!(r"{r}\Directory\shell\explore\command"), "").as_deref(), Some("theirs.exe \"%1\""), "foreign explore stays");
+        delete_tree(&format!(r"{r}\Directory\shell\explore"));
+        set_in(&r, &exe).unwrap();
+        restore_in(&r).unwrap();
+        assert_eq!(get_value(&format!(r"{r}\Folder\shell\other\command"), "").as_deref(), Some("x.exe"), "foreign verb stays");
+        assert!(get_value(&format!(r"{r}\Folder\shell\open\command"), "").is_none());
+        drop_root(&r);
+    }
+
+    #[test]
+    fn guard_restores_when_the_exe_is_gone() {
+        let r = root("guard");
+        let gone = std::env::temp_dir().join(format!("wfm-test-gone-{}", std::process::id())).join("RustFileExplorer.exe");
+        set_in(&r, &gone).unwrap();
+        assert!(status_in(&r).folders);
+        assert!(guard_missing_exe_in(&r));
+        assert!(!status_in(&r).folders && !status_in(&r).folder_class && !status_in(&r).explore);
+        assert!(!guard_missing_exe_in(&r), "nothing left to restore");
+        // an exe that exists stays registered
+        set_in(&r, &std::env::current_exe().unwrap()).unwrap();
+        assert!(!guard_missing_exe_in(&r));
+        assert!(status_in(&r).folders);
+        restore_in(&r).unwrap();
+        drop_root(&r);
+    }
 }

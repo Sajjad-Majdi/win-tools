@@ -49,26 +49,36 @@ fn rr(g: &Gfx, ox: f32, oy: f32, k: f32, x: f32, y: f32, w: f32, h: f32, rad: f3
     g.fill_round(Rect::new(ox + x * k, oy + y * k, w * k, h * k), rad * k, c);
 }
 
+/// The folder's back (with its tab), in the square `r`.
+pub fn folder_back(g: &Gfx, t: &Theme, r: Rect) {
+    g.fill_path(
+        &[P::M(1.5, 4.2), P::B(1.5, 3.6, 1.9, 3.2, 2.5, 3.2), P::L(7.6, 3.2), P::L(9.5, 5.1), P::L(17.5, 5.1), P::B(18.1, 5.1, 18.5, 5.5, 18.5, 6.1), P::L(18.5, 15.7), P::B(18.5, 16.3, 18.1, 16.7, 17.5, 16.7), P::L(2.5, 16.7), P::B(1.9, 16.7, 1.5, 16.3, 1.5, 15.7), P::Z],
+        r.x,
+        r.y,
+        r.w / 20.0,
+        t.folder_back,
+    );
+}
+
+/// The folder's front, its top edge at `top` (of 20; 6.4 for the plain icon, lower when pictures peek out).
+pub fn folder_front(g: &Gfx, t: &Theme, r: Rect, top: f32) {
+    g.fill_path(
+        &[P::M(1.5, top + 0.9), P::B(1.5, top + 0.4, 1.9, top, 2.4, top), P::L(17.6, top), P::B(18.1, top, 18.5, top + 0.4, 18.5, top + 0.9), P::L(18.5, 15.7), P::B(18.5, 16.3, 18.1, 16.7, 17.5, 16.7), P::L(2.5, 16.7), P::B(1.9, 16.7, 1.5, 16.3, 1.5, 15.7), P::Z],
+        r.x,
+        r.y,
+        r.w / 20.0,
+        t.folder,
+    );
+}
+
 /// Draw the icon in the square `r` (its size is r.w).
 pub fn draw(g: &Gfx, t: &Theme, kind: Kind, r: Rect) {
     let k = r.w / 20.0;
     let (ox, oy) = (r.x, r.y);
     match kind {
         Kind::Folder => {
-            g.fill_path(
-                &[P::M(1.5, 4.2), P::B(1.5, 3.6, 1.9, 3.2, 2.5, 3.2), P::L(7.6, 3.2), P::L(9.5, 5.1), P::L(17.5, 5.1), P::B(18.1, 5.1, 18.5, 5.5, 18.5, 6.1), P::L(18.5, 15.7), P::B(18.5, 16.3, 18.1, 16.7, 17.5, 16.7), P::L(2.5, 16.7), P::B(1.9, 16.7, 1.5, 16.3, 1.5, 15.7), P::Z],
-                ox,
-                oy,
-                k,
-                t.folder_back,
-            );
-            g.fill_path(
-                &[P::M(1.5, 7.3), P::B(1.5, 6.8, 1.9, 6.4, 2.4, 6.4), P::L(17.6, 6.4), P::B(18.1, 6.4, 18.5, 6.8, 18.5, 7.3), P::L(18.5, 15.7), P::B(18.5, 16.3, 18.1, 16.7, 17.5, 16.7), P::L(2.5, 16.7), P::B(1.9, 16.7, 1.5, 16.3, 1.5, 15.7), P::Z],
-                ox,
-                oy,
-                k,
-                t.folder,
-            );
+            folder_back(g, t, r);
+            folder_front(g, t, r, 6.4);
             return;
         }
         Kind::Drive => {

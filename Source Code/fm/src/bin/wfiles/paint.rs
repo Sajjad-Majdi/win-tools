@@ -36,14 +36,21 @@ pub struct PG {
 
 /// Popup and view progress: a spring (a little bouncy for popups up to 200 ms, gentle for views); exactly 1.0 when
 /// settled, so `k != 1.0` means "still moving".
-fn prog(at: Instant, ms: f32, shooting: bool) -> f32 {
+pub(crate) fn prog(at: Instant, ms: f32, shooting: bool) -> f32 {
     crate::motion::since(at, if ms <= 200.0 { Spring::Bouncy } else { Spring::Gentle }, shooting)
 }
 
-/// Content area: right of the sidebar, below the bar, above the status bar, left of the "What is this file?" panel.
+/// Content area: right of the sidebar, below the bar, above the status bar, left of the Details pane (or the "What
+/// is this file?" panel).
 pub fn content_rect(a: &App) -> Rect {
     let m = a.main_rect();
-    let wi = if a.whatis.is_some() && !a.tab().split() && m.w > WHATIS_W + 300.0 { WHATIS_W } else { 0.0 };
+    let wi = if a.details_shown() {
+        DETAILS_W
+    } else if a.whatis.is_some() && !a.tab().split() && m.w > WHATIS_W + 300.0 {
+        WHATIS_W
+    } else {
+        0.0
+    };
     Rect::new(m.x + 1.0, m.y, m.w - 1.0 - wi, (m.h - STATUS_H).max(0.0))
 }
 
@@ -89,13 +96,7 @@ pub fn pane_geoms(a: &App, t: usize) -> Vec<PG> {
 
 pub fn row_h(a: &App, t: usize, p: usize) -> f32 {
     let pane = &a.tabs[t].panes[p];
-    if pane.searching() {
-        ROW2_H
-    } else if a.tabs[t].view == View::List {
-        a.look.list_row_h()
-    } else {
-        a.look.row_h()
-    }
+    if pane.searching() { ROW2_H } else { a.look.row_h() }
 }
 
 pub fn grid_cols(list: Rect) -> usize {
@@ -289,7 +290,7 @@ impl App {
         }
         if pa > 0.0 {
             self.gfx.fill(Rect::new(0.0, 0.0, self.w, TITLE_H), t.mica_a.a(pa));
-            self.gfx.fill(Rect::new(0.0, TOP, sx, self.h - TOP), t.mica_a.a(pa));
+            self.gfx.fill(Rect::new(0.0, self.top(), sx, self.h - self.top()), t.mica_a.a(pa));
         }
         self.paint_title(&t);
         self.paint_bar(&t);
@@ -301,7 +302,7 @@ impl App {
         self.paint_main(&t);
         // a narrow window: the full sidebar over the content, opened with the menu button
         if self.side_overlay() {
-            let r = Rect::new(0.0, TOP, self.look.side_w, self.h - TOP);
+            let r = Rect::new(0.0, self.top(), self.look.side_w, self.h - self.top());
             self.gfx.shadow(r, 0.0, 0.0, 24.0, if t.dark { 0.5 } else { 0.18 });
             self.gfx.fill(r, t.mica_a);
             self.gfx.fill(Rect::new(r.r() - 1.0, r.y, 1.0, r.h), t.stroke);
@@ -325,7 +326,7 @@ impl App {
             self.anim();
         }
         // caret blink only while a text field has focus
-        let field = self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some();
+        let field = self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some() || self.dp.edit.is_some();
         if field && !self.caret_timer {
             self.caret_timer = true;
             self.timer(T_CARET, 530);
@@ -674,17 +675,22 @@ impl App {
         }
     }
 
-    fn toolbar_widths(&mut self) -> (f32, f32, f32) {
+    /// Widths of the address row's Clean up, New, Sort and Quick settings buttons (all 0 with the command bar under
+    /// it). Sort lives inside Quick settings there (Sajjad, 2026-11-26), so its width is always 0.
+    fn toolbar_widths(&mut self) -> (f32, f32, f32, f32) {
+        if self.cmd_bar() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
         let this_pc = self.pane().loc == Loc::ThisPc;
         let cleanup = if this_pc { self.toolbar_action_width("Clean up") } else { 0.0 };
         let new = if this_pc || self.w >= 560.0 { self.toolbar_action_width("New") } else { 0.0 };
         let view = if self.toolbar_compact() { 34.0 } else { 53.0 };
-        (cleanup, new, view)
+        (cleanup, new, 0.0, view)
     }
 
     pub fn omni_rect(&mut self) -> Rect {
-        let (cw, nw, vw) = self.toolbar_widths();
-        let nx = self.w - 10.0 - vw - 4.0 - nw - if cw > 0.0 { cw + 4.0 } else { 0.0 };
+        let (cw, nw, sw, vw) = self.toolbar_widths();
+        let nx = if self.cmd_bar() { self.w } else { self.w - 10.0 - vw - 4.0 - nw - if cw > 0.0 { cw + 4.0 } else { 0.0 } - if sw > 0.0 { sw + 4.0 } else { 0.0 } };
         // very narrow: no forward button
         let x0 = self.nav_x() + if self.w < 560.0 { 82.0 } else { 120.0 };
         Rect::new(x0, TITLE_H + 7.0, (nx - 10.0 - x0).max(60.0), 34.0)
@@ -726,10 +732,141 @@ impl App {
         v
     }
 
+    /// A dropdown button of the top bar (Sort, View, the command bar's New): glyph, label (none when narrow) and a
+    /// chevron; lit while its menu is open. Returns nothing: `r` is from `drop_btn_w`.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_btn(&mut self, r: Rect, glyph: u32, label: &str, enabled: bool, open: bool, h: Hit, t: &Theme) {
+        if enabled {
+            let (hk, pk) = (self.hk(h), self.pk(h));
+            self.gfx.fill_round(r, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { hk }));
+            self.gfx.fill_round(r, R_CTRL, t.press.a(t.press.3 * pk * 0.6));
+        }
+        let (fg, fg2) = if enabled { (t.text, t.text2) } else { (t.text_dis, t.text_dis) };
+        let mut x = r.x + 12.0;
+        self.gfx.glyph(glyph, Rect::new(x, r.y, 14.0, r.h), 14.0, fg);
+        x += 20.0;
+        if !label.is_empty() {
+            let lw = self.gfx.measure(label, Font::Ui, 13.0, 400);
+            self.gfx.text(label, Rect::new(x, r.y, lw + 2.0, r.h), Font::Ui, 13.0, 400, Align::Left, fg);
+            x += lw + 8.0;
+        }
+        self.gfx.glyph(0xE70D, Rect::new(x, r.y, 9.0, r.h), 9.0, fg2);
+        if enabled {
+            self.hit(r, h);
+        }
+    }
+
+    fn drop_btn_w(&mut self, label: &str) -> f32 {
+        if label.is_empty() { 53.0 } else { 12.0 + 20.0 + self.gfx.measure(label, Font::Ui, 13.0, 400) + 8.0 + 9.0 + 12.0 }
+    }
+
+    fn drop_open(&self, k: DropKind) -> bool {
+        self.drop.as_ref().map(|d| d.kind == k).unwrap_or(false)
+    }
+
+    /// Glyph of the view in use (the View button shows it).
+    fn view_glyph(&self) -> u32 {
+        match self.tab().view {
+            View::Grid => 0xF0E2,
+            View::Details => 0xE8FD,
+        }
+    }
+
+    /// Explorer's command bar under the address bar (Settings > Layout > Toolbar): New, cut / copy / paste / rename
+    /// / share / delete, Sort, View, more (...), and the Details pane at the right end.
+    fn paint_cmdbar(&mut self, t: &Theme) {
+        let y0 = TITLE_H + BAR_H;
+        let y = y0 + 6.0;
+        let pane = self.pane();
+        let loc = pane.loc.clone();
+        let in_dir = loc.path().is_some();
+        let bin = loc == Loc::RecycleBin;
+        let page = matches!(loc, Loc::Settings | Loc::Cleanup);
+        let nsel = pane.sel.len();
+        let files_only = nsel > 0 && pane.selected().iter().all(|i| !i.is_dir);
+        let narrow = self.toolbar_compact();
+        let lab = |s: &'static str| if narrow { "" } else { s };
+        let sep = |a: &mut App, x: &mut f32| {
+            a.gfx.fill(Rect::new(*x + 4.0, y + 6.0, 1.0, 20.0), t.divider);
+            *x += 9.0;
+        };
+        let mut x = 10.0;
+        let w = self.drop_btn_w(lab("New"));
+        let open = self.drop_open(DropKind::New);
+        self.drop_btn(Rect::new(x, y, w, 32.0), 0xE710, lab("New"), in_dir, open, Hit::New, t);
+        x += w + 4.0;
+        sep(self, &mut x);
+        let cmds = [
+            (0u8, 0xE8C6u32, nsel > 0 && in_dir),
+            (1, 0xE8C8, nsel > 0 && !bin),
+            (2, 0xE77F, in_dir),
+            (3, 0xE8AC, nsel > 0 && in_dir),
+            (4, 0xE72D, files_only && in_dir),
+            (5, 0xE74D, nsel > 0 && (in_dir || bin)),
+        ];
+        for (k, g, on) in cmds {
+            let r = Rect::new(x, y, 36.0, 32.0);
+            if on {
+                self.icon_btn(r, g, 16.0, t.text, Hit::Cmd(k), R_CTRL, t);
+            } else {
+                self.gfx.glyph(g, r, 16.0, t.text_dis);
+            }
+            x += 38.0;
+        }
+        sep(self, &mut x);
+        let w = self.drop_btn_w(lab("Sort"));
+        let open = self.drop_open(DropKind::Sort);
+        self.drop_btn(Rect::new(x, y, w, 32.0), 0xE8CB, lab("Sort"), !page && loc != Loc::ThisPc, open, Hit::SortBtn, t);
+        x += w + 4.0;
+        let w = self.drop_btn_w(lab("View"));
+        let open = self.drop_open(DropKind::View);
+        let g = self.view_glyph();
+        self.drop_btn(Rect::new(x, y, w, 32.0), g, lab("View"), !page, open, Hit::ViewBtn, t);
+        x += w + 4.0;
+        if loc == Loc::ThisPc {
+            sep(self, &mut x);
+            let cw = self.toolbar_action_width("Clean up");
+            self.toolbar_action(Rect::new(x, y, cw, 32.0), "Clean up", crate::cleanup_page::BROOM, true, Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
+            x += cw + 4.0;
+        }
+        sep(self, &mut x);
+        let open = self.drop_open(DropKind::CmdMore);
+        let mr = Rect::new(x, y, 36.0, 32.0);
+        if open {
+            self.gfx.fill_round(mr, R_CTRL, t.hover);
+        }
+        self.icon_btn(mr, 0xE712, 16.0, t.text, Hit::Cmd(6), R_CTRL, t);
+        // the Details pane at the right end, lit while it is shown (as in Explorer)
+        let dl = lab("Details");
+        let dw = if dl.is_empty() { 36.0 } else { 12.0 + 20.0 + self.gfx.measure(dl, Font::Ui, 13.0, 400) + 12.0 };
+        let dr = Rect::new(self.w - 10.0 - dw, y, dw, 32.0);
+        if dr.x > mr.r() + 8.0 {
+            let on = self.look.details;
+            let h = Hit::Cmd(7);
+            let (hk, pk) = (self.hk(h), self.pk(h));
+            if on {
+                self.gfx.fill_round(dr, R_CTRL, t.sel);
+            }
+            self.gfx.fill_round(dr, R_CTRL, t.hover.a(t.hover.3 * hk));
+            self.gfx.fill_round(dr, R_CTRL, t.press.a(t.press.3 * pk * 0.6));
+            let fg = if on { t.accent_text } else { t.text };
+            let gx = if dl.is_empty() { dr.x + 10.0 } else { dr.x + 12.0 };
+            self.gfx.glyph(0xE90D, Rect::new(gx, dr.y, 16.0, dr.h), 15.0, fg);
+            if !dl.is_empty() {
+                self.gfx.text(dl, Rect::new(dr.x + 32.0, dr.y, dr.w - 40.0, dr.h), Font::Ui, 13.0, 400, Align::Left, t.text);
+            }
+            self.hit(dr, h);
+        }
+    }
+
     fn paint_bar(&mut self, t: &Theme) {
-        let bar = Rect::new(0.0, TITLE_H, self.w, BAR_H);
+        let bar = Rect::new(0.0, TITLE_H, self.w, self.top() - TITLE_H);
         self.gfx.fill(bar, t.bar.a(self.panel_alpha()));
-        self.gfx.fill(Rect::new(0.0, TOP - 1.0, self.w, 1.0), t.divider);
+        if self.cmd_bar() {
+            self.gfx.fill(Rect::new(0.0, TITLE_H + BAR_H - 0.5, self.w, 1.0), t.divider);
+            self.paint_cmdbar(t);
+        }
+        self.gfx.fill(Rect::new(0.0, self.top() - 1.0, self.w, 1.0), t.divider);
         let pane = self.pane();
         let cleanup = pane.loc == Loc::Cleanup;
         let (can_back, can_fwd, can_up) = (!pane.back.is_empty() || self.cleanup_back_tab().is_some(), !pane.fwd.is_empty(), !matches!(pane.loc, Loc::ThisPc | Loc::Settings | Loc::Cleanup));
@@ -746,9 +883,9 @@ impl App {
         self.icon_btn(Rect::new(nx0 + if tiny { 38.0 } else { 76.0 }, y, 34.0, 32.0), 0xE74A, 16.0, if can_up { t.text } else { t.text_dis }, Hit::Up, R_CTRL, t);
         let o = self.omni_rect();
         let narrow = self.toolbar_compact();
-        // Cleanup, New and View buttons.
+        // Cleanup, New, Sort and View buttons.
         let mut nx = o.r() + 10.0;
-        let (cw, nw, vw) = self.toolbar_widths();
+        let (cw, nw, sw, vw) = self.toolbar_widths();
         if cw > 0.0 {
             self.toolbar_action(Rect::new(nx, y, cw, 32.0), "Clean up", crate::cleanup_page::BROOM, true,
                 Hit::Cleanup(crate::cleanup_page::Target::Entry), t);
@@ -759,25 +896,19 @@ impl App {
             self.toolbar_action(Rect::new(nx, y, nw, 32.0), "New", 0xE710, self.pane().loc.path().is_some(), Hit::New, t);
             nx += nw + 4.0;
         }
-        let vr = Rect::new(nx, y, vw, 32.0);
-        let g = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
-        // Settings and Clean up have no views: the button is dim, with no hover pill, tooltip or click
-        let off = cleanup || self.pane().loc == Loc::Settings;
-        if narrow {
-            if off {
-                self.gfx.glyph(g, vr, 14.0, t.text_dis);
+        // Quick settings (sliders): layout, sort, Details pane, hidden items, extensions, All settings. It works on
+        // every page (the parts that do not apply there are greyed inside the panel).
+        let _ = (sw, cleanup);
+        if vw > 0.0 && !self.cmd_bar() {
+            let vr = Rect::new(nx, y, vw, 32.0);
+            let open = self.qs.is_some();
+            if narrow {
+                if open {
+                    self.gfx.fill_round(vr, R_CTRL, t.hover);
+                }
+                self.icon_btn(vr, 0xE9E9, 15.0, t.text, Hit::QuickBtn, R_CTRL, t);
             } else {
-                self.icon_btn(vr, g, 14.0, t.text, Hit::ViewBtn, R_CTRL, t);
-            }
-        } else {
-            let open = self.drop.as_ref().map(|d| d.kind == DropKind::View).unwrap_or(false);
-            if !off {
-                self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * if open { 1.0 } else { self.hk(Hit::ViewBtn) }));
-            }
-            self.gfx.glyph(g, Rect::new(vr.x + 12.0, vr.y, 14.0, 32.0), 14.0, if off { t.text_dis } else { t.text });
-            self.gfx.glyph(0xE70D, Rect::new(vr.x + 32.0, vr.y, 9.0, 32.0), 9.0, if off { t.text_dis } else { t.text2 });
-            if !off {
-                self.hit(vr, Hit::ViewBtn);
+                self.drop_btn(vr, 0xE9E9, "", true, open, Hit::QuickBtn, t);
             }
         }
         // omnibox
@@ -927,7 +1058,7 @@ impl App {
         let sw = if self.side_overlay() { self.look.side_w } else { self.side_w() };
         let x = 6.0;
         let w = sw - 12.0;
-        let mut y = TOP + 8.0;
+        let mut y = self.top() + 8.0;
         // the menu button: collapse to icons (remembered), or close the overlay
         // collapse (or close the overlay): E8A0 reads as an arrow into the edge
         self.icon_btn(Rect::new(x, y, 40.0, 32.0), 0xE8A0, 16.0, t.text2, Hit::Side(usize::MAX), R_CTRL, t);
@@ -1046,9 +1177,9 @@ impl App {
         self.gfx.text("Settings", Rect::new(r.x + 38.0, r.y, r.w - 46.0, r.h), Font::Ui, fs, 400, Align::Left, t.text);
         self.hit(r, Hit::SideSettings);
         // the edge: drag to resize (double-click: default width)
-        let er = Rect::new(sw - 4.0, TOP, 8.0, self.h - TOP);
+        let er = Rect::new(sw - 4.0, self.top(), 8.0, self.h - self.top());
         let ek = if self.side_drag.is_some() { 1.0 } else { self.hk(Hit::SideEdge) };
-        self.gfx.fill(Rect::new(sw - 1.0, TOP, 2.0, self.h - TOP), t.accent.a(0.6 * ek));
+        self.gfx.fill(Rect::new(sw - 1.0, self.top(), 2.0, self.h - self.top()), t.accent.a(0.6 * ek));
         self.hit(er, Hit::SideEdge);
     }
 
@@ -1107,7 +1238,7 @@ impl App {
             return;
         }
         let x = 6.0;
-        let mut y = TOP + 8.0;
+        let mut y = self.top() + 8.0;
         let r = Rect::new(x, y, 40.0, 36.0);
         // the menu button: full sidebar / rail
         // expand: E89F reads as an arrow out of the edge
@@ -1251,7 +1382,9 @@ impl App {
             }
         }
         self.paint_status(t);
-        if self.whatis.is_some() && !self.tab().split() && content_rect(self).w < m.w - 2.0 {
+        if self.details_shown() {
+            self.paint_details(t);
+        } else if self.whatis.is_some() && !self.tab().split() && content_rect(self).w < m.w - 2.0 {
             self.paint_whatis(t);
         }
     }
@@ -1366,13 +1499,11 @@ impl App {
 
     fn paint_list(&mut self, g: PG, p: usize, t: &Theme) {
         let cur = self.cur;
-        let view = self.tabs[cur].view;
         let pane_searching = self.tabs[cur].panes[p].searching();
         let pc = is_pc(self, cur, p);
         let grid = tiled(self, cur, p) && !pc;
         let (fs, fs2) = (self.look.text(), self.look.small_text());
-        let small = view == View::List && !pane_searching;
-        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        let isz = self.look.icon();
         // column header (dividers can be dragged; double-click fits)
         if !grid && !pc && g.cols.h > 0.0 {
             let c = g.cols;
@@ -1639,6 +1770,7 @@ impl App {
                 let th = Rect::new(r.x + 6.0, r.y + 6.0, 128.0, 96.0);
                 let has_thumb = matches!(it.kind, Kind::Img | Kind::Video | Kind::Pdf);
                 let bmp = if has_thumb { self.thumb_bitmap(&it.path) } else { None };
+                let ir = Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0);
                 if let Some(b) = bmp {
                     let (bw, bh) = self.thumbs.get(&it.path).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
                     let s = (th.w / bw).max(th.h / bh);
@@ -1646,6 +1778,8 @@ impl App {
                     let src = Rect::new((bw - cw) / 2.0, (bh - chh) / 2.0, cw, chh);
                     self.gfx.bitmap_round(&b, th, src, R_CTRL);
                     self.gfx.stroke_round(th, R_CTRL, t.stroke, 1.0);
+                } else if it.kind == Kind::Folder && it.attrs & 0x5 == 0 && self.folder_preview(&it.path, ir, t) {
+                    // a folder with pictures: they peek out of it (as in Windows)
                 } else {
                     self.item_icon_a(&it.path, &it.name, it.is_dir, it.attrs, it.modified, it.kind, Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0), t);
                 }
@@ -1675,7 +1809,7 @@ impl App {
                     self.gfx.text_spans(&name, Rect::new(nx, r.y + 5.0, nw, 20.0), Font::Ui, fs, 400, t.text, &spans);
                     self.gfx.text(&it.folder, Rect::new(nx, r.y + 25.0, nw, 16.0), Font::Ui, fs2, 400, Align::Left, t.text3);
                 } else {
-                    self.gfx.text(&name, Rect::new(nx, r.y, nw, rh), Font::Ui, if small { fs - 0.5 } else { fs }, 400, Align::Left, t.text);
+                    self.gfx.text(&name, Rect::new(nx, r.y, nw, rh), Font::Ui, fs, 400, Align::Left, t.text);
                 }
                 if let Some((x, w)) = cp.date {
                     let date = if it.kind == Kind::Drive { it.folder.clone() } else { fmt::date(it.modified, w < 130.0) };
@@ -1965,6 +2099,188 @@ impl App {
             };
             let br = Rect::new(ar.x + 15.0 + i as f32 * (bw + 8.0), ar.y + 13.0, bw, 32.0);
             self.button(br, label, glyph, Btn::Std, Hit::WhatIs(code), t);
+        }
+    }
+
+    /// A folder whose first pictures peek out of it (Grid view, like Windows). False (nothing drawn) until the
+    /// folder's pictures and at least one thumbnail are known; both load off the UI thread and are kept.
+    fn folder_preview(&mut self, dir: &std::path::Path, r: Rect, t: &Theme) -> bool {
+        let Some(files) = self.peek(dir) else { return false };
+        let mut cards = vec![];
+        for f in files.iter() {
+            if let Some(b) = self.thumb_bitmap(f) {
+                let (bw, bh) = self.thumbs.get(f).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
+                cards.push((b, bw, bh));
+            }
+        }
+        if cards.is_empty() {
+            return false;
+        }
+        let k = r.w / 20.0;
+        ficons::folder_back(&self.gfx, t, r);
+        // (x0, y0, x1, y1) of 20: one picture in the middle; two: the second behind, a little to the left
+        let spots: &[(f32, f32, f32, f32)] = if cards.len() == 1 { &[(4.4, 2.6, 15.6, 13.0)] } else { &[(6.4, 3.4, 16.9, 13.4), (3.1, 1.9, 13.6, 11.9)] };
+        for (j, (b, bw, bh)) in cards.iter().enumerate().rev() {
+            let (x0, y0, x1, y1) = spots[j.min(spots.len() - 1)];
+            let cr = Rect::new(r.x + x0 * k, r.y + y0 * k, (x1 - x0) * k, (y1 - y0) * k);
+            self.gfx.fill_round(cr, 2.0, t.page);
+            let ir = cr.inset(1.5, 1.5);
+            let s = (ir.w / bw).max(ir.h / bh);
+            let (cw, ch) = (ir.w / s, ir.h / s);
+            self.gfx.bitmap_round(b, ir, Rect::new((bw - cw) / 2.0, (bh - ch) / 2.0, cw, ch), 1.5);
+            self.gfx.stroke_round(cr, 2.0, t.page_stroke.a(0.55), 1.0);
+        }
+        ficons::folder_front(&self.gfx, t, r, 9.0);
+        true
+    }
+
+    /// The Details pane (Alt+Shift+P): the selected item's picture, name and properties as Explorer's pane shows
+    /// them. Values the file's own handler can change (music tags, title, tags, authors ...) open a text box on a
+    /// click; Enter saves into the file, Esc leaves it as it was.
+    fn paint_details(&mut self, t: &Theme) {
+        let m = self.main_rect();
+        let r = Rect::new(m.r() - DETAILS_W, m.y, DETAILS_W, m.h);
+        self.gfx.fill(r, t.layer.a(self.panel_alpha()));
+        self.gfx.fill(Rect::new(r.x, r.y, 1.0, r.h), t.stroke);
+        self.hit(r, Hit::Block);
+        let hr = Rect::new(r.x + 1.0, r.y, r.w - 1.0, 44.0);
+        self.gfx.glyph(0xE90D, Rect::new(hr.x + 15.0, hr.y, 16.0, hr.h), 15.0, t.text2);
+        self.gfx.text("Details", Rect::new(hr.x + 41.0, hr.y, 200.0, hr.h), Font::Ui, 13.0, 600, Align::Left, t.text);
+        self.icon_btn(Rect::new(hr.r() - 36.0, hr.y + 8.0, 28.0, 28.0), 0xE711, 10.0, t.text2, Hit::Dp(0), R_SMALL, t);
+        self.gfx.fill(Rect::new(hr.x, hr.b() - 1.0, hr.w, 1.0), t.divider);
+        // what it shows: the one selected item, else the folder itself; several items: their count and size
+        let pane = self.pane();
+        let sel = pane.selected();
+        let target: Option<std::path::PathBuf> = match sel.len() {
+            0 => pane.loc.path().map(|p| p.to_path_buf()),
+            1 => Some(sel[0].path.clone()),
+            _ => None,
+        };
+        let item = if sel.len() == 1 { Some(sel[0].clone()) } else { None };
+        if target != self.dp.path || (target.is_some() && self.dp.seq == 0) {
+            match target.clone() {
+                Some(p) => self.dp_load(p),
+                None => {
+                    self.dp.path = None;
+                    self.dp.props.clear();
+                    self.dp.edit = None;
+                }
+            }
+        }
+        let body = Rect::new(r.x + 1.0, hr.b(), r.w - 1.0, r.b() - hr.b());
+        self.gfx.clip(body);
+        let mut y = body.y + 16.0 - self.dp.scroll;
+        let x0 = r.x + 16.0;
+        let w0 = r.w - 32.0;
+        if target.is_none() && sel.len() > 1 {
+            // several items
+            let k = if sel.iter().all(|i| i.is_dir) { Kind::Folder } else { Kind::File };
+            ficons::draw(&self.gfx, t, k, Rect::new(r.cx() - 32.0, y + 12.0, 64.0, 64.0));
+            y += 96.0;
+            let bytes: u64 = sel.iter().filter_map(|i| i.size).sum();
+            self.gfx.text(&format!("{} items selected", sel.len()), Rect::new(x0, y, w0, 20.0), Font::Ui, 14.0, 600, Align::Center, t.text);
+            if !sel.iter().any(|i| i.is_dir && i.size.is_none()) {
+                self.gfx.text(&fmt::size(bytes), Rect::new(x0, y + 22.0, w0, 18.0), Font::Ui, 12.0, 400, Align::Center, t.text2);
+            }
+            self.gfx.unclip();
+            return;
+        }
+        let Some(path) = target else {
+            self.gfx.unclip();
+            return;
+        };
+        // the picture (thumbnail when the file has one), then the name and type
+        let pic = Rect::new(x0, y, w0, 140.0);
+        let thumbable = item.as_ref().map(|i| matches!(i.kind, Kind::Img | Kind::Video | Kind::Pdf)).unwrap_or(false);
+        let bmp = if thumbable { self.thumb_bitmap(&path) } else { None };
+        if let Some(b) = bmp {
+            let (bw, bh) = self.thumbs.get(&path).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
+            let s = (pic.w / bw).min(pic.h / bh).min(2.0);
+            let dr = Rect::new(pic.cx() - bw * s / 2.0, pic.cy() - bh * s / 2.0, bw * s, bh * s);
+            self.gfx.bitmap_round(&b, dr, Rect::new(0.0, 0.0, bw, bh), R_CTRL);
+            self.gfx.stroke_round(dr, R_CTRL, t.stroke, 1.0);
+        } else {
+            let (name, is_dir, attrs, modified, kind) = match &item {
+                Some(i) => (i.name.clone(), i.is_dir, i.attrs, i.modified, i.kind),
+                None => (folder_title(&path), true, 0, 0, if path.parent().is_none() { Kind::Drive } else { Kind::Folder }),
+            };
+            self.item_icon_a(&path, &name, is_dir, attrs, modified, kind, Rect::new(pic.cx() - 40.0, pic.cy() - 40.0, 80.0, 80.0), t);
+        }
+        y = pic.b() + 14.0;
+        let name = item.as_ref().map(|i| self.display_name(i)).unwrap_or_else(|| folder_title(&path));
+        let nh = self.gfx.para(&name, Rect::new(x0, y, w0, 60.0), Font::Ui, 14.0, 600, Align::Left, t.text, 19.0, false, 3);
+        y += nh + 4.0;
+        let ty = item.as_ref().map(|i| ficons::type_label(&i.name, i.is_dir)).unwrap_or_else(|| if path.parent().is_none() { "Drive".into() } else { "Folder".into() });
+        self.gfx.text(&ty, Rect::new(x0, y, w0, 18.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
+        y += 30.0;
+        self.gfx.fill(Rect::new(x0, y - 8.0, w0, 1.0), t.divider);
+        if self.dp.loading && self.dp.props.is_empty() {
+            self.gfx.unclip();
+            return;
+        }
+        if let Some(e) = self.dp.err.clone() {
+            self.gfx.para(&e, Rect::new(x0, y, w0, 60.0), Font::Ui, 12.0, 400, Align::Left, t.text2, 16.0, false, 3);
+            self.gfx.unclip();
+            return;
+        }
+        // the properties: label on the left, value on the right; values that can change are boxes on hover
+        let (lw, vx) = (96.0, x0 + 104.0);
+        let vw = r.r() - 12.0 - vx;
+        let props = self.dp.props.clone();
+        let edit = self.dp.edit.clone();
+        let saving = self.dp.saving.clone();
+        let mut last_common = false;
+        for (i, p) in props.iter().enumerate() {
+            // the file system's own rows (type, size, dates) start after a line
+            let common = matches!(p.key.as_str(), "System.ItemTypeText" | "System.Size" | "System.DateCreated" | "System.DateModified");
+            if common && !last_common && i > 0 {
+                self.gfx.fill(Rect::new(x0, y + 2.0, w0, 1.0), t.divider);
+                y += 10.0;
+            }
+            last_common = common;
+            let shown = match &saving {
+                Some((k, s)) if *k == i => s.clone(),
+                _ => p.value.clone(),
+            };
+            let vh = if shown.is_empty() { 18.0 } else { self.gfx.para_height(&shown, vw - 12.0, Font::Ui, 13.0, 18.0, false).clamp(18.0, 54.0) };
+            let rh = vh + 12.0;
+            self.gfx.text(&p.label, Rect::new(x0, y + 6.0, lw, 18.0), Font::Ui, 12.0, 400, Align::Left, t.text3);
+            let vr = Rect::new(vx - 6.0, y, vw + 6.0, rh);
+            let h = Hit::DpRow(i);
+            match &edit {
+                Some((k, f)) if *k == i => {
+                    let fr = Rect::new(vr.x, y + 1.0, vr.w, 28.0);
+                    self.field_box(fr, true, t);
+                    self.field_text(FieldId::Dp, f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 13.0, true, t, &[]);
+                    self.hit(fr, h);
+                    y += 32.0;
+                    continue;
+                }
+                _ => {}
+            }
+            if p.writable {
+                let (hk, pk) = (self.hk(h), self.pk(h));
+                self.gfx.fill_round(vr, R_CTRL, t.hover.a(t.hover.3 * hk));
+                self.gfx.fill_round(vr, R_CTRL, t.press.a(t.press.3 * pk * 0.6));
+                if hk > 0.01 {
+                    self.gfx.stroke_round(vr, R_CTRL, t.field_border.a(hk), 1.0);
+                }
+                self.hit(vr, h);
+            }
+            if shown.is_empty() {
+                self.gfx.text("Add", Rect::new(vx, y + 6.0, vw - 6.0, 18.0), Font::Ui, 13.0, 400, Align::Left, t.text3);
+            } else {
+                let c = if saving.as_ref().is_some_and(|s| s.0 == i) { t.text2 } else { t.text };
+                self.gfx.para(&shown, Rect::new(vx, y + 6.0, vw - 6.0, vh + 2.0), Font::Ui, 13.0, 400, Align::Left, c, 18.0, false, 3);
+            }
+            y += rh + 2.0;
+        }
+        self.gfx.unclip();
+        // how far the list can scroll (wheel over the pane)
+        let full = y + self.dp.scroll - body.y + 16.0;
+        let max = (full - body.h).max(0.0);
+        if self.dp.scroll > max {
+            self.dp.scroll = max;
         }
     }
 
@@ -2264,7 +2580,7 @@ impl App {
         dd(self, ry, 0xE8B3, "Corners", crate::look::CORNERS[lk.square as usize], 25, false);
         y = r.b() + 12.0;
         // Layout: density, text and icon size, sidebar, columns, start page
-        let rows_h = 38.0 + 48.0 * 5.0 + 3.0 * 44.0 + 30.0 + 3.0 * 44.0 + 30.0 + 48.0 + 4.0;
+        let rows_h = 38.0 + 48.0 * 6.0 + 3.0 * 44.0 + 30.0 + 3.0 * 44.0 + 30.0 + 48.0 + 4.0;
         let r = Rect::new(lx, y, colw, rows_h);
         self.set_card(r, t);
         self.gfx.text("Layout", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
@@ -2281,6 +2597,8 @@ impl App {
         ry += 48.0;
         let sw_label = if lk.side_collapsed { "Icons only".to_string() } else { crate::look::SIDEBAR_WIDTHS.iter().find(|w| (w.1 - lk.side_w).abs() < 1.0).map(|w| w.0.to_string()).unwrap_or_else(|| format!("{} px", lk.side_w.round())) };
         dd(self, ry, 0xE700, "Sidebar width", &sw_label, 26, false);
+        ry += 48.0;
+        dd(self, ry, 0xE712, "Toolbar", crate::look::TOOLBARS[lk.toolbar as usize % 2], 36, false);
         ry += 48.0;
         let sub = |a: &mut App, ry: &mut f32, title: &str| {
             a.gfx.fill(Rect::new(r.x, *ry, r.w, 1.0), t.divider);
@@ -2491,6 +2809,9 @@ impl App {
         if self.sub.is_some() {
             self.paint_drop(true, t, None);
         }
+        if self.qs.is_some() {
+            self.paint_quick(t);
+        }
         if self.palette.is_some() {
             self.paint_palette(t);
         }
@@ -2591,7 +2912,7 @@ impl App {
         let bottom = self.h - 42.0 - 48.0;
         let ib = self.inline_rect;
         let covers = |y: f32| self.inline.is_some() && ib.w > 0.0 && y < ib.b() + 52.0 && y + 48.0 > ib.y - 8.0 && x0 < ib.r() + 8.0 && x0 + w > ib.x - 8.0;
-        let y = if covers(bottom) { TOP + 12.0 - (1.0 - k) * 12.0 } else { bottom + (1.0 - k) * 12.0 };
+        let y = if covers(bottom) { self.top() + 12.0 - (1.0 - k) * 12.0 } else { bottom + (1.0 - k) * 12.0 };
         let r = Rect::new(x0, y, w, 48.0);
         self.gfx.opacity_layer(r.inset(-30.0, -30.0), k.clamp(0.05, 1.0));
         self.card(r, R_MENU, t, false);
@@ -2627,7 +2948,7 @@ impl App {
         // tabs and the address bar stay visible whenever there is room
         let y = if m.y + h <= self.h - 8.0 {
             m.y
-        } else if m.y - h >= TOP {
+        } else if m.y - h >= self.top() {
             m.y - h
         } else {
             (self.h - 8.0 - h).max(TITLE_H)

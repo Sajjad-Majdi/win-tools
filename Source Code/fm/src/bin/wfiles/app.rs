@@ -26,7 +26,8 @@ pub const TITLE_H: f32 = 40.0;
 /// caption button width (Windows 11: 46 px; they span the title bar height)
 pub const CAP_W: f32 = 46.0;
 pub const BAR_H: f32 = 48.0;
-pub const TOP: f32 = TITLE_H + BAR_H;
+/// the command bar under the address bar (Settings > Layout > Toolbar: Command bar)
+pub const CMD_H: f32 = 44.0;
 pub const RAIL_W: f32 = 52.0;
 pub const STATUS_H: f32 = 30.0;
 pub const HEADER_H: f32 = 34.0;
@@ -34,6 +35,8 @@ pub const ROW2_H: f32 = 46.0;
 pub const STRIP_H: f32 = 48.0;
 pub const PANE_HEAD_H: f32 = 40.0;
 pub const WHATIS_W: f32 = 320.0;
+/// the Details pane (Alt+Shift+P)
+pub const DETAILS_W: f32 = 300.0;
 
 /// lParam of the key messages `wfm gui keys` posts (never produced by a real keyboard)
 pub const TEST_KEY: isize = 0x7E57_0001;
@@ -94,11 +97,20 @@ pub enum Msg {
     AiFlags { ai: bool },
     /// the picture viewer's "Show in folder": the picture's folder here, the picture selected, this window in front
     ViewerReveal(PathBuf),
+    /// the Details pane's properties of `path` (answer `seq`)
+    Props { path: PathBuf, seq: u64, res: Result<Vec<fmcore::props::Prop>, String> },
+    /// a property was saved into the file (or not)
+    PropSaved { path: PathBuf, res: Result<(), String> },
+    /// a folder's first pictures (for its preview in Grid view)
+    Peek { dir: PathBuf, files: Vec<PathBuf> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
     Cleanup(crate::cleanup_page::Target),
+    /// the Quick settings button (sliders, right of the address bar) and the controls of its panel
+    QuickBtn,
+    Qs(u8),
     /// the search strip's "AI Search" button
     Ask,
     /// "Turn on AI Search" under empty results (AI features off)
@@ -159,6 +171,14 @@ pub enum Hit {
     Sug(usize),
     /// the status bar's view toggles at the bottom right (0 Details, 1 Grid)
     ViewQuick(u8),
+    /// the Sort button of the top bar
+    SortBtn,
+    /// command bar buttons: 0 cut, 1 copy, 2 paste, 3 rename, 4 share, 5 delete, 6 more (...), 7 Details pane
+    Cmd(u8),
+    /// Details pane: 0 close
+    Dp(u8),
+    /// Details pane: the value of property row i (editable ones open a text box)
+    DpRow(usize),
     Block,
 }
 
@@ -167,6 +187,8 @@ pub enum Act {
     Cleanup(crate::cleanup_page::Command),
     Open,
     OpenNewTab,
+    /// "Open in Windows File Explorer" (folders and drives): always Windows' own Explorer
+    OpenInExplorer,
     OpenWith,
     Preview,
     ExtractTo,
@@ -208,6 +230,10 @@ pub enum Act {
     Palette,
     Refresh,
     ToggleHidden,
+    /// show or hide the Details pane (Alt+Shift+P)
+    DetailsPane,
+    /// Windows' Share sheet for the selection
+    Share,
     /// tab menu (the tab is App::menu_tab)
     TabNew,
     TabClose,
@@ -289,6 +315,8 @@ pub enum DropKind {
     CopyTo,
     MoveTo,
     More,
+    /// the command bar's "..." menu
+    CmdMore,
     Shell,
     Look(u8),
 }
@@ -397,6 +425,8 @@ pub enum FieldId {
     Palette,
     Ren(u8),
     Relay(u8),
+    /// the Details pane's value being edited
+    Dp,
 }
 
 /// Where a text box's text was drawn this frame (the text area, not the border) and its font size.
@@ -492,12 +522,15 @@ pub struct App {
     pub search_focus: bool,
     pub menu: Option<CtxMenu>,
     pub drop: Option<DropMenu>,
+    /// the Quick settings panel, while open
+    pub qs: Option<crate::quick::Quick>,
     pub sub: Option<DropMenu>,
     pub pv: Option<Pv>,
     pub xfer_open: bool,
     pub palette: Option<Palette>,
     pub rename: Option<Rename>,
     pub whatis: Option<WhatIs>,
+    pub dp: DetailsPane,
     pub toast: Option<Toast>,
     pub inline: Option<Inline>,
     /// where the rename box was drawn this frame, and when it last refused a character (the tip under it)
@@ -611,6 +644,27 @@ pub struct App {
     /// (hue, colourfulness; kept so a grey keeps its hue)
     pub pick_rect: Rect,
     pub pick: (f32, f32),
+    /// the view each folder was last shown in (views.json)
+    pub views: ViewMemory,
+    /// Grid view folder previews: a folder's first pictures (None while being looked up), and the lookup queue
+    pub peeks: HashMap<PathBuf, Option<Vec<PathBuf>>>,
+    pub peek_q: Arc<(Mutex<Vec<PathBuf>>, Condvar)>,
+}
+
+/// The Details pane: the item it shows, its properties and the value being edited.
+#[derive(Default)]
+pub struct DetailsPane {
+    /// what the properties are of (the single selected item, else the folder shown)
+    pub path: Option<PathBuf>,
+    pub props: Vec<fmcore::props::Prop>,
+    pub loading: bool,
+    pub err: Option<String>,
+    pub seq: u64,
+    /// (row, text box) of the value being edited
+    pub edit: Option<(usize, Field)>,
+    /// a value on its way into the file: (row, text shown meanwhile)
+    pub saving: Option<(usize, String)>,
+    pub scroll: f32,
 }
 
 /// Rubber-band selection: start in content coordinates (scroll included), end in window coordinates.
@@ -908,10 +962,25 @@ impl App {
         }
     }
 
+    /// Everything above the content: the title bar, the address bar and, with the Command bar toolbar, that bar.
+    pub fn top(&self) -> f32 {
+        TITLE_H + BAR_H + if self.cmd_bar() { CMD_H } else { 0.0 }
+    }
+
+    /// Settings > Layout > Toolbar is "Command bar": Explorer's row of commands under the address bar.
+    pub fn cmd_bar(&self) -> bool {
+        self.look.toolbar == 1
+    }
+
+    /// The Details pane takes the right side of the content (not on Settings / Clean up, nor in a very narrow window).
+    pub fn details_shown(&self) -> bool {
+        self.look.details && !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) && self.main_rect().w > DETAILS_W + 320.0
+    }
+
     /// The content layer (right of the sidebar, below the top bar).
     pub fn main_rect(&self) -> Rect {
         let x = self.side_w();
-        Rect::new(x, TOP, self.w - x, self.h - TOP)
+        Rect::new(x, self.top(), self.w - x, self.h - self.top())
     }
 
     // ------------------------------------------------------------------ sidebar
@@ -962,6 +1031,7 @@ impl App {
         let tab = Tab { id: self.next_id, panes: vec![Pane::new(loc.clone())], active: 0, view, split_at: Instant::now() };
         let at = if self.tabs.is_empty() { 0 } else { self.cur + 1 };
         self.tabs.insert(at, tab);
+        self.apply_view(at);
         self.select_tab(at);
         self.path_edit = None;
         self.load(self.cur, 0, false);
@@ -1005,6 +1075,9 @@ impl App {
         if self.sizes.len() > 200 {
             self.sizes.clear();
         }
+        if self.peeks.len() > 1500 {
+            self.peeks.clear();
+        }
     }
 
     pub fn go(&mut self, loc: Loc) {
@@ -1033,6 +1106,22 @@ impl App {
         }
         self.tabs[t].visit(p, loc, history);
         self.after_move(t, p, None);
+    }
+
+    /// The tab shows its folder in the view that folder was last shown in (Details when never set).
+    pub fn apply_view(&mut self, t: usize) {
+        if let Some(v) = self.views.get(&self.tabs[t].pane().loc) {
+            self.tabs[t].view = v;
+        }
+    }
+
+    /// The user picked a view: this tab shows it, and the folder (or drive) opens in it from now on.
+    pub fn set_view(&mut self, v: View) {
+        self.tab_mut().view = v;
+        let loc = self.pane().loc.clone();
+        if self.views.set(&loc, v) {
+            self.views.save();
+        }
     }
 
     pub fn back(&mut self) {
@@ -1089,6 +1178,9 @@ impl App {
             if let Some(search) = search {
                 pane.restore_search(*search);
             }
+        }
+        if self.tabs[t].active == p {
+            self.apply_view(t);
         }
         if t == self.cur {
             if self.pane().loc != Loc::Cleanup {
@@ -1728,6 +1820,40 @@ impl App {
             Msg::ToastErr(e) => self.toast_err(&e),
             Msg::Refresh => self.refresh_all(),
             Msg::ViewerReveal(p) => self.reveal_picture(&p),
+            Msg::Props { path, seq, res } => {
+                if seq == self.dp.seq && self.dp.path.as_ref() == Some(&path) {
+                    self.dp.loading = false;
+                    self.dp.saving = None;
+                    match res {
+                        Ok(v) => {
+                            self.dp.props = v;
+                            self.dp.err = None;
+                        }
+                        Err(e) => self.dp.err = Some(e),
+                    }
+                }
+            }
+            Msg::PropSaved { path, res } => {
+                match res {
+                    Ok(()) => {
+                        // the file changed: its row (date, size) and its properties are read again
+                        self.refresh_all();
+                        // read again without closing a box opened meanwhile (Tab to the next value)
+                        if self.dp.path.as_ref() == Some(&path) {
+                            self.dp.seq += 1;
+                            let seq = self.dp.seq;
+                            self.spawn(move || Msg::Props { res: fmcore::props::read(&path), path, seq });
+                        }
+                    }
+                    Err(e) => {
+                        self.dp.saving = None;
+                        self.toast_err(&e);
+                    }
+                }
+            }
+            Msg::Peek { dir, files } => {
+                self.peeks.insert(dir, Some(files));
+            }
             Msg::EvStatus { running, total } => {
                 self.set.ev_running = Some(running);
                 self.set.ev_total = total;
@@ -1756,7 +1882,34 @@ impl App {
         }
     }
 
+    /// Read the properties of `path` for the Details pane (off the UI thread; a newer request wins).
+    pub fn dp_load(&mut self, path: PathBuf) {
+        self.dp.seq += 1;
+        let seq = self.dp.seq;
+        self.dp.path = Some(path.clone());
+        self.dp.loading = true;
+        self.dp.edit = None;
+        self.dp.err = None;
+        self.dp.scroll = 0.0;
+        self.spawn(move || Msg::Props { res: fmcore::props::read(&path), path, seq });
+    }
+
+    /// The first pictures of a folder for its Grid view preview: None until known (looked up off the UI thread,
+    /// newest request first, so the tiles on screen come first while scrolling).
+    pub fn peek(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+        if let Some(v) = self.peeks.get(dir) {
+            return v.clone();
+        }
+        self.peeks.insert(dir.to_path_buf(), None);
+        let (m, cv) = &*self.peek_q;
+        m.lock().unwrap().push(dir.to_path_buf());
+        cv.notify_one();
+        None
+    }
+
     pub fn refresh_all(&mut self) {
+        // folder previews are looked up again (their pictures may have changed)
+        self.peeks.retain(|_, v| v.is_none());
         for t in 0..self.tabs.len() {
             for p in 0..self.tabs[t].panes.len() {
                 if matches!(self.tabs[t].panes[p].loc, Loc::Folder(_) | Loc::RecycleBin) {
@@ -1922,6 +2075,12 @@ impl App {
         } else {
             ""
         };
+        let details = self.details_shown().then(|| {
+            let props: Vec<_> = self.dp.props.iter().map(|p| json!({"key": p.key, "label": p.label, "value": p.value, "writable": p.writable})).collect();
+            let editing = self.dp.edit.as_ref().map(|e| json!({"key": self.dp.props.get(e.0).map(|p| p.key.clone()), "text": e.1.text}));
+            json!({"path": self.dp.path, "loading": self.dp.loading, "error": self.dp.err, "editing": editing, "saving": self.dp.saving.as_ref().map(|s| s.1.clone()), "props": props})
+        });
+        let previews: HashMap<String, usize> = self.peeks.iter().filter_map(|(k, v)| v.as_ref().filter(|v| !v.is_empty()).map(|v| (k.display().to_string(), v.len()))).collect();
         json!({
             "ok": true, "tabs": tabs, "current_tab": self.cur, "overlay": overlay,
             "menu_items": self.menu.as_ref().map(|m| m.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()),
@@ -1949,6 +2108,9 @@ impl App {
             "last_error": self.last_error,
             "viewer": crate::viewer::state(),
             "picture_viewer": self.ui.viewer,
+            "details": details,
+            "folder_previews": previews,
+            "views_remembered": self.views.to_json()["views"].as_array().map(|a| a.len()).unwrap_or(0),
         })
     }
 }
@@ -2352,7 +2514,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         // the box a name is renamed in is a text field; the rest of its row keeps the arrow (Explorer)
                         Hit::Row(..) if app.inline.is_some() && app.over_inline() => IDC_IBEAM,
                         // buttons and toggles show the hand (Sajjad, 2026-11-25); rows, menus, tabs and the sidebar keep the arrow, as in Explorer
-                        Hit::ViewQuick(_) | Hit::ViewBtn | Hit::New | Hit::Back | Hit::Fwd | Hit::Up | Hit::TabAdd | Hit::TabScroll(_) | Hit::TabClose(_) | Hit::OmniClear
+                        Hit::ViewQuick(_) | Hit::ViewBtn | Hit::QuickBtn | Hit::Qs(_) | Hit::New | Hit::Back | Hit::Fwd | Hit::Up | Hit::TabAdd | Hit::TabScroll(_) | Hit::TabClose(_) | Hit::OmniClear
                         | Hit::Crumb(_) | Hit::Ask | Hit::AiOffer | Hit::Scope(_) | Hit::Filter(_) | Hit::Toast(_) | Hit::Dlg(_) | Hit::Set(_) | Hit::WhatIs(_)
                         | Hit::PlaceChk(_) | Hit::PlaceExp(_) | Hit::Xfer | Hit::XferHead(_) | Hit::Job(..) | Hit::Clash(..) | Hit::SameChoice(_)
                         | Hit::Pv(_) | Hit::Cleanup(_) => IDC_HAND,
@@ -2566,12 +2728,14 @@ pub fn run(o: Opts) -> i32 {
             search_focus: false,
             menu: None,
             drop: None,
+            qs: None,
             sub: None,
             pv: None,
             xfer_open: false,
             palette: None,
             rename: None,
             whatis: None,
+            dp: DetailsPane::default(),
             toast: None,
             inline: None,
             inline_rect: Rect::default(),
@@ -2654,6 +2818,9 @@ pub fn run(o: Opts) -> i32 {
             accent_field: None,
             pick_rect: Rect::default(),
             pick: (221.0, 0.82),
+            views: ViewMemory::load(),
+            peeks: HashMap::new(),
+            peek_q: Arc::new((Mutex::new(vec![]), Condvar::new())),
         });
         let ptr = Box::into_raw(app);
         let app = &mut *ptr;
@@ -2664,7 +2831,10 @@ pub fn run(o: Opts) -> i32 {
             "last" => Some(PathBuf::from(&app.look.last)).filter(|p| p.is_dir()).map(Loc::Folder).unwrap_or(Loc::ThisPc),
             p => Some(PathBuf::from(p)).filter(|p| p.is_dir()).map(Loc::Folder).unwrap_or(Loc::ThisPc),
         };
+        let reveal = o.path.as_deref().and_then(|p| p.trim_matches('"').strip_prefix("/select,")).map(fmcore::util::abs).filter(|p| p.exists() && p.parent().is_some());
         let (loc, select) = match o.path.as_deref().map(|p| p.trim_matches('"').trim_start_matches("/select,")) {
+            // "/select,<item>": its folder, the item selected (a folder item too)
+            Some(_) if let Some(r) = &reveal => (Loc::Folder(r.parent().unwrap().to_path_buf()), Some(r.clone())),
             Some(p) if special_loc(p).is_some() => (special_loc(p).unwrap(), None),
             Some(p) if Path::new(p).is_dir() => (Loc::Folder(fmcore::util::abs(p)), None),
             Some(p) if Path::new(p).is_file() => (Loc::Folder(fmcore::util::abs(p).parent().map(|x| x.to_path_buf()).unwrap_or_default()), Some(fmcore::util::abs(p))),
@@ -2739,6 +2909,24 @@ pub fn run(o: Opts) -> i32 {
                     });
                     post_bg(&bg, hw, Msg::Thumb { path, img });
                 }
+            });
+        }
+        // folder previews (Grid view): a folder's first pictures, newest request first
+        {
+            let q = app.peek_q.clone();
+            let bg = app.bg.clone();
+            let hw = hwnd.0 as isize;
+            std::thread::spawn(move || loop {
+                let dir = {
+                    let (m, cv) = &*q;
+                    let mut g = m.lock().unwrap();
+                    while g.is_empty() {
+                        g = cv.wait(g).unwrap();
+                    }
+                    g.pop().unwrap()
+                };
+                let files = peek_files(&dir);
+                post_bg(&bg, hw, Msg::Peek { dir, files });
             });
         }
         // copy queue worker

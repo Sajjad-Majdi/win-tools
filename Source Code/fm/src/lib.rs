@@ -30,6 +30,8 @@
 //! | Everything IPC (no es.exe): type-ahead search, all folder sizes of a folder | [`evipc::query`], [`evipc::folder_sizes`] |
 //! | Control pipe of the window (`wfm gui ...`) | [`pipe::send`], [`pipe::serve`] |
 //! | Default file manager (per user) | [`defaultfm::set`], [`defaultfm::restore`], [`defaultfm::is_default`] |
+//! | Read / change file properties (music tags, title, authors, tags) | [`props::read`], [`props::set`] |
+//! | Folders opened inside a Windows Explorer window stay there | [`explorer::hand_back`], [`explorer::list`] |
 //! | Drag and drop / clipboard data | [`dnd::data_object`], [`dnd::paths_from_data_object`], [`dnd::hdrop_bytes`] |
 //!
 //! Settings and the undo journal live in `%LOCALAPPDATA%\WinTools\` (`fm.json`, `fm-journal.json`); set the
@@ -40,8 +42,10 @@ pub mod defaultfm;
 pub mod dialog;
 pub mod dnd;
 pub mod evipc;
+pub mod explorer;
 pub mod info;
 pub mod journal;
+pub mod jumplist;
 pub mod list;
 pub mod menu;
 pub mod models;
@@ -50,6 +54,8 @@ pub mod ops;
 pub mod picture;
 pub mod pins;
 pub mod pipe;
+pub mod probe;
+pub mod props;
 pub mod recycle;
 pub mod rx;
 pub mod search;

@@ -23,6 +23,7 @@ mod motion;
 mod outproc;
 mod paint;
 mod preview;
+mod quick;
 mod rank;
 mod sicons;
 mod theme;
@@ -37,7 +38,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let flag = |name: &str| args.iter().any(|a| a == name);
-    let mut path = None;
+    // the positional words: Explorer-style switches may arrive split at spaces ("/select," "C:\a b\x.txt")
+    let mut words: Vec<String> = vec![];
     let mut skip = false;
     for a in &args {
         if skip {
@@ -51,14 +53,49 @@ fn main() {
         if a.starts_with("--") {
             continue;
         }
-        path = Some(a.clone());
+        words.push(a.clone());
     }
-    // one window: a second start opens its folder as a tab in the running window
+    let raw = if words.first().is_some_and(|w| w.starts_with('/')) { Some(words.join(" ")) } else { words.last().cloned() };
+    // the argument decides: a folder or drive opens here, "/select,<file>" opens its folder with the file selected,
+    // This PC / Recycle Bin are our own pages, anything else (Control Panel, Network, phones ...) goes to Explorer
+    let launch = raw.as_deref().map(fmcore::explorer::classify_here).unwrap_or(fmcore::explorer::Launch::Start);
+    fmcore::explorer::probe_note(raw.as_deref().unwrap_or(""), &format!("{launch:?}"));
+    // keys left pointing at an exe that is gone: Explorer is put back (this exe may be a copy elsewhere)
+    if std::env::var("WFILES_TEST").is_err() {
+        let _ = fmcore::defaultfm::guard_missing_exe();
+    }
+    use fmcore::explorer::Launch;
+    let path: Option<String> = match &launch {
+        Launch::Start => None,
+        Launch::Explorer(place) => {
+            let _ = fmcore::explorer::to_explorer(place);
+            return;
+        }
+        Launch::Open(p) | Launch::Missing(p) => Some(p.display().to_string()),
+        // the window opens the item's folder with the item selected (a folder too: selected in its parent)
+        Launch::Reveal(p) => Some(format!("/select,{}", p.display())),
+        Launch::Special(s) => Some(s.clone()),
+    };
+    // a folder double-clicked inside a Windows Explorer window stays in that window (our "open" verb is the default)
+    if let Launch::Open(p) = &launch
+        && !flag("--new-window")
+        && std::env::var("WFILES_TEST").is_err()
+        && fmcore::explorer::hand_back(&p.display().to_string())
+    {
+        fmcore::explorer::probe_note(&p.display().to_string(), "handed back to the Explorer window");
+        return;
+    }
+    // one window: a second start opens its folder as a tab in the running window (a file: its folder, selected)
     if !flag("--new-window") && std::env::var("WFILES_TEST").is_err() && fmcore::pipe::exists() {
         let p = path.clone().map(|p| {
-            let p = p.trim_matches('"').trim_start_matches("/select,");
             // "::{CLSID}" / "shell:..." names of This PC and the Recycle Bin pass through as they are
-            if model::special_loc(p).is_some() { p.to_string() } else { fmcore::util::abs(p).display().to_string() }
+            if model::special_loc(&p).is_some() {
+                p
+            } else if let Some(item) = p.strip_prefix("/select,") {
+                format!("/select,{}", fmcore::util::abs(item).display())
+            } else {
+                fmcore::util::abs(&p).display().to_string()
+            }
         });
         let cmd = match p {
             Some(p) => format!("tab new {p}"),
@@ -72,6 +109,18 @@ fn main() {
             let _ = fmcore::pipe::send("activate");
             return;
         }
+    }
+    // this process is the window: its own taskbar identity, then (in the background) its jump list and the Start
+    // menu shortcut's matching ID
+    if !flag("--offscreen") && std::env::var("WFILES_TEST").is_err() {
+        fmcore::jumplist::set_process_id();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = fmcore::jumplist::update(&exe);
+                let _ = fmcore::jumplist::fix_shortcut(&exe);
+            }
+        });
     }
     let size = opt("--size").and_then(|s| {
         let (w, h) = s.split_once('x')?;

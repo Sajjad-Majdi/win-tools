@@ -118,7 +118,6 @@ pub enum SortCol {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Details,
-    List,
     Grid,
 }
 
@@ -126,9 +125,113 @@ impl View {
     pub fn name(&self) -> &'static str {
         match self {
             View::Details => "details",
-            View::List => "list",
             View::Grid => "grid",
         }
+    }
+    pub fn from_name(s: &str) -> Option<View> {
+        match s {
+            "details" => Some(View::Details),
+            "grid" | "thumbnails" => Some(View::Grid),
+            _ => None,
+        }
+    }
+    /// A view name from saved data: the "Compact list" view is gone (Sajjad, 2026-11-26), so an old "list" /
+    /// "compact" entry loads as Details; anything unknown is None.
+    pub fn from_saved(s: &str) -> Option<View> {
+        match s {
+            "list" | "compact" => Some(View::Details),
+            _ => View::from_name(s),
+        }
+    }
+}
+
+/// The files a folder's Grid view preview shows, like Windows: its first two pictures (videos when it has none), in
+/// the folder's own (name) order, never hidden ones. At most 400 entries are looked at, so a huge folder costs no more.
+pub fn peek_files(dir: &Path) -> Vec<PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    let (mut pics, mut vids) = (vec![], vec![]);
+    for e in rd.flatten().take(400) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let kind = kind_of(&name, false);
+        if !matches!(kind, Kind::Img | Kind::Video) || e.metadata().map(|m| m.file_attributes() & 0x6 != 0 || m.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        if kind == Kind::Img {
+            pics.push(e.path());
+            if pics.len() == 2 {
+                break;
+            }
+        } else if vids.len() < 2 {
+            vids.push(e.path());
+        }
+    }
+    if pics.is_empty() { vids } else { pics }
+}
+
+/// The view each folder (or drive) was last shown in, so it opens that way again: `views.json` in the data dir. A
+/// folder never set shows Details, so Details is not stored; the oldest choice goes once VIEW_MAX are kept.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ViewMemory {
+    /// (folder key, view), the most recent last
+    list: Vec<(String, View)>,
+}
+
+pub const VIEW_MAX: usize = 400;
+
+/// "c:\users\me" style key of a place that remembers its view ("c:" for a drive, "::bin" for the Recycle Bin).
+fn view_key(loc: &Loc) -> Option<String> {
+    match loc {
+        Loc::Folder(p) => Some(p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase()).filter(|k| !k.is_empty()),
+        Loc::RecycleBin => Some("::bin".into()),
+        _ => None,
+    }
+}
+
+impl ViewMemory {
+    fn path() -> PathBuf {
+        fmcore::util::data_dir().join("views.json")
+    }
+    pub fn load() -> ViewMemory {
+        let v: serde_json::Value = std::fs::read_to_string(Self::path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Self::from_json(&v)
+    }
+    pub fn from_json(v: &serde_json::Value) -> ViewMemory {
+        let list = v["views"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| Some((x[0].as_str()?.to_lowercase(), View::from_saved(x[1].as_str()?)?))).filter(|(_, v)| *v != View::Details).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let skip = list.len().saturating_sub(VIEW_MAX);
+        ViewMemory { list: list.into_iter().skip(skip).collect() }
+    }
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"views": self.list.iter().map(|(k, v)| serde_json::json!([k, v.name()])).collect::<Vec<_>>()})
+    }
+    pub fn save(&self) {
+        let p = Self::path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, self.to_json().to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+    /// The view this place opens in (None: a page with its own layout, This PC, Settings).
+    pub fn get(&self, loc: &Loc) -> Option<View> {
+        let k = view_key(loc)?;
+        Some(self.list.iter().find(|(x, _)| *x == k).map(|(_, v)| *v).unwrap_or(View::Details))
+    }
+    /// Remember the view picked for this place; true when that changed what is kept.
+    pub fn set(&mut self, loc: &Loc, v: View) -> bool {
+        let Some(k) = view_key(loc) else { return false };
+        let before = self.list.clone();
+        self.list.retain(|(x, _)| *x != k);
+        if v != View::Details {
+            self.list.push((k, v));
+            if self.list.len() > VIEW_MAX {
+                self.list.remove(0);
+            }
+        }
+        self.list != before
     }
 }
 
@@ -737,14 +840,14 @@ pub fn match_ranges(name: &str, words: &str) -> Vec<(u32, u32)> {
 /// Known folders for the sidebar.
 /// Shell names Windows passes for its virtual folders (the desktop icons, "shell:" links) -> our pages.
 /// This PC: `::{20D04FE0-3AEA-1069-A2D8-08002B30309D}` / `shell:MyComputerFolder`; Recycle Bin:
-/// `::{645FF040-5081-101B-9F08-08002B27103E}` / `shell:RecycleBinFolder`.
+/// `::{645FF040-5081-101B-9F08-00AA002F954E}` / `shell:RecycleBinFolder`.
 pub fn special_loc(s: &str) -> Option<Loc> {
     let s = s.trim().trim_matches('"').to_ascii_lowercase();
     let s = s.strip_prefix("shell:").unwrap_or(&s);
     let s = s.trim_start_matches(':');
     match s {
         "{20d04fe0-3aea-1069-a2d8-08002b30309d}" | "mycomputerfolder" | "this pc" => Some(Loc::ThisPc),
-        "{645ff040-5081-101b-9f08-08002b27103e}" | "recyclebinfolder" | "recycle bin" => Some(Loc::RecycleBin),
+        "{645ff040-5081-101b-9f08-00aa002f954e}" | "recyclebinfolder" | "recycle bin" => Some(Loc::RecycleBin),
         _ => None,
     }
 }
@@ -926,5 +1029,91 @@ mod quiet_tests {
         // one more letter on an empty answer: nothing new can appear, the list stays as it is
         s.done_words = "zz".into();
         assert!(s.quiet());
+    }
+}
+
+#[cfg(test)]
+mod view_memory_tests {
+    use super::*;
+
+    #[test]
+    fn each_folder_and_drive_keeps_its_own_view() {
+        let mut m = ViewMemory::default();
+        let pics = Loc::Folder(PathBuf::from("C:/Users/Me/Pictures"));
+        let drive = Loc::Folder(PathBuf::from("D:/"));
+        assert_eq!(m.get(&pics), Some(View::Details));
+        assert!(m.set(&pics, View::Grid));
+        assert!(m.set(&drive, View::Grid));
+        // case and a trailing slash do not matter; other folders (even below) stay Details
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from("c:/users/me/pictures/"))), Some(View::Grid));
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from("D:"))), Some(View::Grid));
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from("C:/Users/Me/Pictures/2024"))), Some(View::Details));
+        // pages with their own layout keep none
+        assert_eq!(m.get(&Loc::ThisPc), None);
+        assert!(!m.set(&Loc::Settings, View::Grid));
+        // the same choice again changes nothing; Details is the default and is not stored
+        m.set(&pics, View::Grid);
+        assert!(!m.set(&pics, View::Grid));
+        assert!(m.set(&pics, View::Details));
+        assert_eq!(m.to_json()["views"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn kept_small_and_survives_a_save() {
+        let mut m = ViewMemory::default();
+        for i in 0..VIEW_MAX + 25 {
+            m.set(&Loc::Folder(PathBuf::from(format!("E:/f{i}"))), View::Grid);
+        }
+        let back = ViewMemory::from_json(&m.to_json());
+        assert_eq!(back, m);
+        assert_eq!(m.to_json()["views"].as_array().unwrap().len(), VIEW_MAX);
+        // the oldest went first; a folder set again moves to the newest end
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from("E:/f0"))), Some(View::Details));
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from(format!("E:/f{}", VIEW_MAX + 24)))), Some(View::Grid));
+        m.set(&Loc::Folder(PathBuf::from("E:/f30")), View::Grid);
+        m.set(&Loc::Folder(PathBuf::from("E:/new")), View::Grid);
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from("E:/f30"))), Some(View::Grid));
+        // a broken file reads as empty
+        assert_eq!(ViewMemory::from_json(&serde_json::json!({"views": [[1, 2], ["x", "nope"]]})), ViewMemory::default());
+    }
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use super::*;
+
+    #[test]
+    fn folder_preview_takes_the_first_two_pictures() {
+        let d = std::env::temp_dir().join(format!("wfm-peek-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub.png")).unwrap();
+        for f in ["a.txt", "b.mp4", "c.jpg", "d.png", "e.jpg"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let names = |v: Vec<PathBuf>| v.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        // pictures first, in name order; a folder named like a picture is not one
+        assert_eq!(names(peek_files(&d)), ["c.jpg", "d.png"]);
+        for f in ["c.jpg", "d.png", "e.jpg"] {
+            std::fs::remove_file(d.join(f)).unwrap();
+        }
+        // no pictures: the videos
+        assert_eq!(names(peek_files(&d)), ["b.mp4"]);
+        std::fs::remove_file(d.join("b.mp4")).unwrap();
+        assert!(peek_files(&d).is_empty());
+        assert!(peek_files(&d.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_compact_list_entries_load_as_details() {
+        assert_eq!(View::from_saved("list"), Some(View::Details));
+        assert_eq!(View::from_saved("compact"), Some(View::Details));
+        assert_eq!(View::from_saved("grid"), Some(View::Grid));
+        assert_eq!(View::from_name("list"), None, "gui view list is gone");
+        let v = serde_json::json!({"views": [["d:\\old", "list"], ["d:\\pics", "grid"], ["d:\\x", "nonsense"]]});
+        let m = ViewMemory::from_json(&v);
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from(r"D:\old"))), Some(View::Details));
+        assert_eq!(m.get(&Loc::Folder(PathBuf::from(r"D:\pics"))), Some(View::Grid));
+        assert_eq!(m.to_json()["views"].as_array().unwrap().len(), 1, "only the Grid entry is kept");
     }
 }

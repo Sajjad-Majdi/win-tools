@@ -96,8 +96,12 @@ impl App {
             Hit::TabScroll(d) => (if d < 0 { "Scroll tabs left" } else { "Scroll tabs right" }).to_string(),
             Hit::TabClose(_) => "Close tab (Ctrl+W)".to_string(),
             Hit::ViewBtn => "View".to_string(),
+            Hit::QuickBtn => "Quick settings".to_string(),
+            Hit::SortBtn => "Sort".to_string(),
+            Hit::Cmd(k) => ["Cut (Ctrl+X)", "Copy (Ctrl+C)", "Paste (Ctrl+V)", "Rename (F2)", "Share", "Delete (Del)", "See more", "Details pane (Alt+Shift+P)"][k.min(7) as usize].to_string(),
+            Hit::Dp(_) => "Close (Alt+Shift+P)".to_string(),
             Hit::ViewQuick(0) => "Details (Ctrl+Shift+1)".to_string(),
-            Hit::ViewQuick(_) => "Grid (Ctrl+Shift+3)".to_string(),
+            Hit::ViewQuick(_) => "Grid (Ctrl+Shift+2)".to_string(),
             Hit::New => "New (Ctrl+Shift+N: folder)".to_string(),
             Hit::OmniClear => "Clear".to_string(),
             Hit::OmniSearch => "Search (Ctrl+F)".to_string(),
@@ -264,7 +268,7 @@ impl App {
                 }
                 T_CARET => {
                     self.caret_on = !self.caret_on;
-                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some() {
+                    if self.path_edit.is_some() || self.search_focus || self.inline.is_some() || self.palette.is_some() || self.rename.is_some() || self.key_focus || self.relay_focus != 0 || self.accent_field.is_some() || self.dp.edit.is_some() {
                         self.invalidate();
                     } else {
                         // nothing to blink: no timer at all while idle
@@ -449,6 +453,15 @@ impl App {
             Act::Cleanup(cmd) => self.cleanup_action(cmd, paths.first().cloned()),
             Act::Open => self.open_selection(false),
             Act::OpenNewTab => self.open_selection(true),
+            Act::OpenInExplorer => {
+                let dirs: Vec<PathBuf> = sel.iter().filter(|i| i.is_dir || i.kind == crate::ficons::Kind::Drive).map(|i| i.path.clone()).collect();
+                let dirs = if dirs.is_empty() { dir.into_iter().collect() } else { dirs };
+                for d in dirs.into_iter().take(8) {
+                    if let Err(e) = fmcore::explorer::open_in_explorer(&d.display().to_string()) {
+                        self.toast_err(&e);
+                    }
+                }
+            }
             Act::Preview => self.preview_open(),
             Act::WhatIs => self.whatis_open(),
             Act::CopyPath => {
@@ -621,6 +634,7 @@ impl App {
                     match r {
                         Ok(_) => {
                             self.build_side();
+                            refresh_jump_list();
                             self.toast(if pinned { "Removed from the sidebar: " } else { "Pinned: " }, &folder_title(&p), false);
                         }
                         Err(e) => self.toast_err(&e),
@@ -651,6 +665,21 @@ impl App {
                 self.open_drop(DropKind::Sort, r, 200.0);
             }
             Act::Transfers => self.xfer_open = !self.xfer_open,
+            Act::DetailsPane => {
+                self.dp_commit();
+                self.look.details = !self.look.details;
+                self.save_look();
+            }
+            Act::Share => {
+                // Windows' own Share sheet (the shell's verb, run in wfm.exe like the other shell entries)
+                let files: Vec<PathBuf> = sel.iter().filter(|i| !i.is_dir).map(|i| i.path.clone()).collect();
+                if !files.is_empty() {
+                    self.spawn(move || match crate::outproc::invoke(&files, "Windows.ModernShare") {
+                        Ok(()) => Msg::Refresh,
+                        Err(e) => Msg::ToastErr(e),
+                    });
+                }
+            }
             Act::Palette => self.palette_open(""),
             Act::Refresh => self.refresh_all(),
             Act::ToggleHidden => {
@@ -811,6 +840,7 @@ impl App {
                     match fmcore::pins::unpin(&p.to_string_lossy()) {
                         Ok(_) => {
                             self.build_side();
+                            refresh_jump_list();
                             self.toast("Removed from the sidebar: ", &folder_title(&p), false);
                         }
                         Err(e) => self.toast_err(&e),
@@ -1381,6 +1411,12 @@ impl App {
         if self.menu.is_some() || self.drop.is_some() {
             return;
         }
+        // the Details pane scrolls on its own (paint keeps the scroll inside what it has)
+        if self.details_shown() && x >= self.w - DETAILS_W && y >= self.top() {
+            self.dp.scroll = (self.dp.scroll - d / 120.0 * 48.0).max(0.0);
+            self.invalidate();
+            return;
+        }
         if self.pane().loc == Loc::Cleanup && self.cleanup_wheel(x, y, d) {
             return;
         }
@@ -1472,10 +1508,10 @@ impl App {
         self.slow_click = None;
         self.press_collapse = false;
         // a click beside the sidebar overlay closes it
-        if self.side_overlay() && (x > self.look.side_w || y < TOP) {
+        if self.side_overlay() && (x > self.look.side_w || y < self.top()) {
             self.side_open = false;
             self.invalidate();
-            if y >= TOP {
+            if y >= self.top() {
                 return;
             }
         }
@@ -1495,6 +1531,14 @@ impl App {
             self.press_f.only(Some(h));
             self.anim();
         }
+        // Quick settings: a click outside the panel closes it (on its own button: only that)
+        if self.qs.is_some() && !matches!(h, Hit::Qs(_)) && !self.qs_rect().has(x, y) {
+            self.qs = None;
+            self.invalidate();
+            if h == Hit::QuickBtn {
+                return;
+            }
+        }
         // clicks outside a popup close it
         let in_menu = matches!(h, Hit::MenuItem(_) | Hit::MenuQuick(_) | Hit::SubItem(_) | Hit::SubPin(_) | Hit::Drop(_)) || (matches!(h, Hit::Block) && (self.menu_rect().map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(false).map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(true).map(|r| r.has(x, y)).unwrap_or(false)));
         if !in_menu && (self.menu.is_some() || self.drop.is_some()) {
@@ -1508,7 +1552,7 @@ impl App {
             // a click on the same dropdown button just closes it: the button that opened it, or any hit drawn at
             // exactly the dropdown's anchor rectangle
             let hit_rect = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0);
-            if drop_toggle_click(h, by_was, anchor_was, hit_rect) || matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New))) {
+            if drop_toggle_click(h, by_was, anchor_was, hit_rect) || matches!((h, drop_was), (Hit::ViewBtn, Some(DropKind::View)) | (Hit::New, Some(DropKind::New)) | (Hit::SortBtn, Some(DropKind::Sort)) | (Hit::Cmd(6), Some(DropKind::CmdMore))) {
                 return;
             }
         }
@@ -1563,6 +1607,9 @@ impl App {
         if self.accent_field.is_some() && !matches!(h, Hit::Set(50) | Hit::Set(51) | Hit::Set(53)) {
             self.accent_commit();
         }
+        if self.dp.edit.is_some() && !edit_click && !matches!(h, Hit::DpRow(_)) {
+            self.dp_commit();
+        }
         if h == Hit::Set(53) {
             self.pick_at(x, y);
         }
@@ -1613,9 +1660,30 @@ impl App {
             Hit::New if self.pane().loc.path().is_some() => self.act(Act::NewMenu),
             Hit::Sug(i) => self.sug_take(i, true),
             Hit::ViewBtn if !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) => self.act(Act::ViewMenu),
+            Hit::QuickBtn => self.qs_toggle(),
+            Hit::Qs(id) => self.qs_use(id),
+            Hit::SortBtn => {
+                let r = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0).unwrap_or_default();
+                self.open_drop(DropKind::Sort, r, 200.0);
+            }
+            Hit::Cmd(k) => match k {
+                0 => self.act(Act::Cut),
+                1 => self.act(Act::Copy),
+                2 => self.act(Act::Paste),
+                3 => self.act(Act::Rename),
+                4 => self.act(Act::Share),
+                5 => self.act(Act::Delete),
+                6 => {
+                    let r = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0).unwrap_or_default();
+                    self.open_drop(DropKind::CmdMore, r, 240.0);
+                }
+                _ => self.act(Act::DetailsPane),
+            },
+            Hit::Dp(_) => self.act(Act::DetailsPane),
+            Hit::DpRow(i) => self.dp_edit_start(i),
             Hit::ViewQuick(k) => {
                 // the two view toggles at the bottom right of the status bar (Explorer's Details / Large icons)
-                self.tab_mut().view = if k == 0 { View::Details } else { View::Grid };
+                self.set_view(if k == 0 { View::Details } else { View::Grid });
                 let p = self.tab().active;
                 self.tab_mut().panes[p].shown_at = Instant::now();
             }
@@ -1894,8 +1962,7 @@ impl App {
         }
         let Some(it) = self.tabs[t].panes[p].rows().get(i).cloned() else { return false };
         let r = crate::paint::item_rect(self, t, p, i);
-        let small = self.tabs[t].view == View::List && !self.tabs[t].panes[p].searching();
-        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        let isz = self.look.icon();
         let nx = r.x + 10.0 + isz + 10.0;
         let fs = self.look.text();
         let name = self.display_name(&it);
@@ -1921,8 +1988,7 @@ impl App {
         if self.tabs[t].view == View::Grid && !self.tabs[t].panes[p].searching() {
             return Rect::new(r.x + 4.0, r.y + 104.0, r.w - 8.0, 42.0).has(x, y);
         }
-        let small = self.tabs[t].view == View::List && !self.tabs[t].panes[p].searching();
-        let isz = if small { self.look.icon().min(16.0) } else { self.look.icon() };
+        let isz = self.look.icon();
         let nx = r.x + 10.0 + isz + 10.0;
         let name = self.display_name(&it);
         let tw = self.gfx.measure(&name, crate::gfx::Font::Ui, self.look.text(), 400);
@@ -2271,6 +2337,7 @@ impl App {
                 _ => &mut r.repl,
             }),
             FieldId::Relay(k) => self.relay_fields.get_mut(k as usize),
+            FieldId::Dp => self.dp.edit.as_mut().map(|e| &mut e.1),
         }
     }
 
@@ -2286,6 +2353,7 @@ impl App {
             (FieldId::Palette, Hit::Block) => self.palette.is_some(),
             (FieldId::Ren(k), Hit::Dlg(d)) => self.rename.is_some() && d == if k % 2 == 0 { 20 } else { 22 },
             (FieldId::Relay(k), Hit::Set(s)) => s == 90 + k,
+            (FieldId::Dp, Hit::DpRow(i)) => self.dp.edit.as_ref().is_some_and(|e| e.0 == i),
             _ => false,
         };
         ok.then_some(g)
@@ -2457,6 +2525,11 @@ impl App {
             self.invalidate();
             return;
         }
+        if let Some((_, f)) = self.dp.edit.as_mut() {
+            f.insert(&s);
+            self.invalidate();
+            return;
+        }
         if let Some(f) = self.accent_field.as_mut() {
             if c.is_ascii_hexdigit() || c == '#' {
                 f.insert(&s);
@@ -2561,6 +2634,35 @@ impl App {
         }
     }
 
+    /// Details pane: open the text box of property row `i` (only values the file's handler can change); the value
+    /// being edited in another row is saved first.
+    pub fn dp_edit_start(&mut self, i: usize) {
+        if self.dp.edit.as_ref().is_some_and(|e| e.0 == i) {
+            return;
+        }
+        self.dp_commit();
+        let Some(p) = self.dp.props.get(i).filter(|p| p.writable) else { return };
+        let mut f = Field::new(&p.raw);
+        f.select_all();
+        self.dp.edit = Some((i, f));
+        self.search_focus = false;
+        self.path_edit = None;
+    }
+
+    /// Details pane: write the edited value into the file (off the UI thread; the row shows the new text meanwhile).
+    /// Unchanged text just closes the box.
+    pub fn dp_commit(&mut self) {
+        let Some((i, f)) = self.dp.edit.take() else { return };
+        let (Some(path), Some(p)) = (self.dp.path.clone(), self.dp.props.get(i).cloned()) else { return };
+        let text = f.text.trim().to_string();
+        if text == p.raw.trim() {
+            return;
+        }
+        self.dp.saving = Some((i, text.clone()));
+        let key = p.key.clone();
+        self.spawn(move || Msg::PropSaved { res: fmcore::props::set(&path, &key, &text), path });
+    }
+
     fn field_mut(&mut self) -> Option<&mut Field> {
         if self.rename.is_some() {
             let r = self.rename.as_mut().unwrap();
@@ -2621,6 +2723,10 @@ impl App {
             }
             return true;
         }
+        // the Quick settings panel owns the keys while open
+        if self.qs.is_some() {
+            return self.qs_key(vk, shift);
+        }
         if self.menu.is_some() || self.drop.is_some() {
             if vk == ESC {
                 self.close_popups();
@@ -2630,6 +2736,30 @@ impl App {
                 return true;
             }
             // an open menu owns the keys: Delete, Space, letters ... never reach the list behind it
+            return true;
+        }
+        // Details pane: a value being edited (Enter saves into the file, Esc leaves it, Tab goes to the next one)
+        if let Some((i, mut f)) = self.dp.edit.take() {
+            match vk {
+                ESC => {}
+                ENTER => {
+                    self.dp.edit = Some((i, f));
+                    self.dp_commit();
+                }
+                TAB => {
+                    self.dp.edit = Some((i, f));
+                    self.dp_commit();
+                    let n = self.dp.props.len();
+                    let next = (1..n).map(|d| if shift { (i + n - d) % n } else { (i + d) % n }).find(|j| self.dp.props[*j].writable);
+                    if let Some(j) = next {
+                        self.dp_edit_start(j);
+                    }
+                }
+                _ => {
+                    edit_key(self.hwnd, &mut f, vk, ctrl, shift, "");
+                    self.dp.edit = Some((i, f));
+                }
+            }
             return true;
         }
         // custom accent colour (#RRGGBB)
@@ -2911,8 +3041,9 @@ impl App {
                     self.select_tab(if k == 0x39 { self.tabs.len() - 1 } else { i });
                 }
             }
+            // Ctrl+Shift+1 Details, Ctrl+Shift+2 Grid (3, Grid's key while Compact list existed, still works)
             (k @ 0x31..=0x33, true, true, _) => {
-                self.tab_mut().view = [View::Details, View::List, View::Grid][(k - 0x31) as usize];
+                self.set_view(if k == 0x31 { View::Details } else { View::Grid });
             }
             (0x4E, true, true, _) => self.act(Act::NewFolder),
             (0x4E, true, false, _) => {
@@ -2940,6 +3071,7 @@ impl App {
             (0x75, false, false, false) => self.act(Act::MoveOther),
             (0x51, true, true, _) => self.xfer_open = !self.xfer_open,
             (ENTER, false, false, true) => self.act(Act::Properties),
+            (0x50, false, true, true) => self.act(Act::DetailsPane),
             (0xBC, true, false, _) => self.open_settings(),
             (0xC0, true, false, _) => self.act(Act::Terminal),
             (ENTER, c, ..) => self.act(if c { Act::OpenNewTab } else { Act::Open }),
@@ -3016,6 +3148,7 @@ impl App {
             o.bold = true;
             items.push(o);
             items.push(MItem::new("Open in new tab", 0xE8A7, Act::OpenNewTab).keys("Ctrl+Enter"));
+            items.push(explorer_item());
             items.push(pin_item(Some(&sel[0].path)));
             items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
             let removable = self.drives.iter().any(|d| fmcore::util::path_eq(std::path::Path::new(&d.root), &sel[0].path) && d.kind == "removable");
@@ -3048,6 +3181,7 @@ impl App {
         items.push(ow);
         if sel.iter().any(|i| i.is_dir) {
             items.push(MItem::new("Open in new tab", 0xE8A7, Act::OpenNewTab).keys("Ctrl+Enter"));
+            items.push(explorer_item());
         }
         items.push(MItem::new("Preview", 0xE7B3, Act::Preview).keys("Space"));
         if one && sel[0].is_archive() {
@@ -3158,7 +3292,7 @@ impl App {
             }
             DropKind::View => {
                 let view = self.tab().view;
-                for (i, (l, g, vv)) in [("Details", 0xE8FDu32, View::Details), ("Compact list", 0xE14C, View::List), ("Grid", 0xF0E2, View::Grid)].iter().enumerate() {
+                for (i, (l, g, vv)) in [("Details", 0xE8FDu32, View::Details), ("Grid", 0xF0E2, View::Grid)].iter().enumerate() {
                     let mut m = MItem::new(l, *g, Act::None).keys(&format!("Ctrl+Shift+{}", i + 1));
                     m.value = i as i64;
                     m.checked = view == *vv;
@@ -3171,9 +3305,28 @@ impl App {
                     s.keys.clear();
                 }
                 v.push(s);
+                let mut d = MItem::new("Details pane", 0xE90D, Act::DetailsPane).keys("Alt+Shift+P");
+                d.checked = self.look.details;
+                if d.checked {
+                    d.keys.clear();
+                }
+                v.push(d);
                 let mut h = MItem::new("Hidden files", 0xE7B3, Act::ToggleHidden);
                 h.checked = self.ui.hidden;
                 v.push(h);
+            }
+            DropKind::CmdMore => {
+                let dir = self.pane().loc.path().map(|p| p.to_path_buf());
+                v.push(MItem::new("Undo", 0xE7A7, Act::Undo).keys("Ctrl+Z"));
+                v.push(MItem::new("Select all", 0xE8B3, Act::SelectAll).keys("Ctrl+A"));
+                if dir.is_some() {
+                    v.push(MItem::new("Copy path", 0xE71B, Act::CopyPath).keys("Ctrl+Shift+C").sep());
+                    let pin = self.pane().selected().first().filter(|i| i.is_dir).map(|i| i.path.clone()).or(dir.clone());
+                    v.push(pin_item(pin.as_deref()));
+                    v.push(MItem::new("Open in Terminal", 0xE756, Act::Terminal).keys("Ctrl+`"));
+                    v.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
+                }
+                v.push(MItem::new("Settings", 0xE713, Act::Settings).sep());
             }
             DropKind::Sort => {
                 let (col, desc) = self.pane().sort;
@@ -3362,10 +3515,10 @@ impl App {
         match kind {
             DropKind::CleanupScope => self.cleanup_toggle_scope(it.value as usize),
             DropKind::CleanupHidden => self.cleanup_apply_drop(it),
-            DropKind::New => self.act(it.act),
+            DropKind::New | DropKind::CmdMore => self.act(it.act),
             DropKind::View => {
                 if it.act == Act::None {
-                    self.tab_mut().view = [View::Details, View::List, View::Grid][it.value as usize];
+                    self.set_view([View::Details, View::Grid][it.value as usize]);
                 } else {
                     self.act(it.act);
                 }
@@ -3702,7 +3855,8 @@ impl App {
             1 => {
                 let exe = std::env::current_exe().unwrap_or_default();
                 match fmcore::defaultfm::set(&exe) {
-                    Ok(()) => self.toast("Folders, This PC and Win+E now open in Rust File Explorer", "", false),
+                    // one short hint: the taskbar's File Explorer button cannot be redirected, a pin of ours can
+                    Ok(()) => self.toast("Set as default. Tip: pin Rust File Explorer to the taskbar in place of File Explorer", "", false),
                     Err(e) => self.toast_err(&e),
                 }
             }
@@ -3764,7 +3918,7 @@ impl App {
             }
             93 => self.save_relay(),
             // Personalize: dropdowns
-            20..=26 | 33 | 34 | 35 => {
+            20..=26 | 33..=36 => {
                 let r = self.hits.iter().find(|h| h.1 == Hit::Set(k)).map(|h| h.0).unwrap_or_default();
                 self.open_drop(DropKind::Look(k), r, r.w.max(170.0));
             }
@@ -3894,6 +4048,7 @@ impl App {
             25 => (CORNERS.iter().map(|s| s.to_string()).collect(), lk.square as usize),
             34 => (STRENGTHS.iter().map(|s| s.to_string()).collect(), lk.strength as usize),
             35 => (PICTURE_OPENERS.iter().map(|s| s.to_string()).collect(), if self.ui.viewer { 0 } else { 1 }),
+            36 => (TOOLBARS.iter().map(|s| s.to_string()).collect(), lk.toolbar as usize),
             26 => {
                 let ws = SIDEBAR_WIDTHS;
                 let cur = if lk.side_collapsed { 0 } else { ws.iter().position(|w| (w.1 - lk.side_w).abs() < 1.0).unwrap_or(usize::MAX) };
@@ -3950,6 +4105,7 @@ impl App {
             24 => self.look.icons = i as u8,
             25 => self.look.square = i == 1,
             34 => self.look.strength = i as u8,
+            36 => self.look.toolbar = i.min(1) as u8,
             26 => {
                 let w = crate::look::SIDEBAR_WIDTHS[i.min(crate::look::SIDEBAR_WIDTHS.len() - 1)].1;
                 if w < 1.0 {
@@ -4251,7 +4407,32 @@ pub fn more_items(m: &CtxMenu) -> Vec<MItem> {
     v
 }
 
-const SKIP_VERBS: &[&str] = &["open", "opennew", "cut", "copy", "paste", "delete", "rename", "properties", "link", "pintohome", "openas", "explore", "opencontaining", "copyaspath", "pintostartscreen", "windows.share", "share", "find"];
+/// The taskbar jump list follows the pinned folders (in the background; test windows leave it alone).
+fn refresh_jump_list() {
+    if std::env::var("WFILES_TEST").is_err() {
+        std::thread::spawn(|| {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = fmcore::jumplist::update(&exe);
+            }
+        });
+    }
+}
+
+/// "Open in Windows File Explorer" with File Explorer's own icon (from explorer.exe, drawn like the shell's icons).
+fn explorer_item() -> MItem {
+    static ICON: std::sync::OnceLock<Option<std::sync::Arc<fmcore::menu::Icon>>> = std::sync::OnceLock::new();
+    let mut it = MItem::new("Open in Windows File Explorer", 0xEC50, Act::OpenInExplorer);
+    it.icon = ICON
+        .get_or_init(|| {
+            let exe = format!(r"{}\explorer.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
+            fmcore::menu::extract_icon(&exe, 0, 32).map(std::sync::Arc::new)
+        })
+        .clone();
+    it
+}
+
+// "openinexplorer" / "openinwfiles": our own registry verbs; the menu has its own "Open in Windows File Explorer"
+const SKIP_VERBS: &[&str] = &["openinexplorer", "openinwfiles", "open", "opennew", "cut", "copy", "paste", "delete", "rename", "properties", "link", "pintohome", "openas", "explore", "opencontaining", "copyaspath", "pintostartscreen", "windows.share", "share", "find"];
 const SKIP_TEXT: &[&str] = &["extract all...", "extract all", "open", "cut", "copy", "paste", "delete", "rename", "properties", "create shortcut", "open with", "pin to quick access", "copy as path", "open in new window", "open in new tab", "share", "pin to start", "open file location"];
 
 /// The shell's entries for "Open with" (`more` false: app launchers) or "More options" (`more` true: the rest,
@@ -4854,6 +5035,13 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
                 Some("new") => {
                     let rest: Vec<&str> = it.collect();
                     let p = rest.join(" ");
+                    // "/select,<item>" or a file: the item's folder with the item selected
+                    let item = p.strip_prefix("/select,").map(PathBuf::from).or_else(|| Some(PathBuf::from(&p)).filter(|f| f.is_file()));
+                    if let Some(item) = item.filter(|i| i.exists() && i.parent().is_some()) {
+                        a.new_tab(Loc::Folder(item.parent().unwrap().to_path_buf()));
+                        a.pane_mut().want = Some(item);
+                        return ok();
+                    }
                     let loc = if p.is_empty() { a.pane().loc.clone() } else { crate::model::special_loc(&p).unwrap_or_else(|| Loc::Folder(PathBuf::from(p))) };
                     a.new_tab(loc);
                 }
@@ -4870,12 +5058,27 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
             ok()
         }
         "view" => {
-            a.tab_mut().view = match arg {
-                "details" => View::Details,
-                "list" | "compact" => View::List,
-                "grid" | "thumbnails" => View::Grid,
-                _ => return err("view details|list|grid"),
-            };
+            let Some(v) = View::from_name(arg) else { return err("view details|grid") };
+            a.set_view(v);
+            ok()
+        }
+        // details on|off|toggle: the Details pane; details edit KEY TEXT: type TEXT into that value and press Enter
+        "details" => {
+            match arg.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg, "")) {
+                ("on", _) if !a.look.details => a.act(Act::DetailsPane),
+                ("off", _) if a.look.details => a.act(Act::DetailsPane),
+                ("toggle" | "", _) => a.act(Act::DetailsPane),
+                ("edit", rest) => {
+                    let (key, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                    let Some(i) = a.dp.props.iter().position(|p| p.key.eq_ignore_ascii_case(key)) else { return err("no such property in the pane") };
+                    a.dp_edit_start(i);
+                    let Some((_, f)) = a.dp.edit.as_mut() else { return err("that value cannot be changed") };
+                    f.select_all();
+                    f.insert(text);
+                    a.dp_commit();
+                }
+                _ => {}
+            }
             ok()
         }
         "split" => {
@@ -5185,6 +5388,25 @@ fn ipc_inner(a: &mut App, line: &str) -> String {
         "toast" => {
             a.toast(arg, "", arg.contains("Undo"));
             ok()
+        }
+        // quick open|close|use ID|key VK: the Quick settings panel (tests)
+        "quick" => {
+            let mut it = arg.split_whitespace();
+            match (it.next(), it.next().and_then(|v| v.parse::<u16>().ok())) {
+                (Some("open"), _) => {
+                    if a.qs.is_none() {
+                        a.qs_toggle();
+                    }
+                }
+                (Some("close"), _) => a.qs = None,
+                (Some("use"), Some(id)) => a.qs_use(id as u8),
+                (Some("key"), Some(vk)) => {
+                    a.qs_key(vk, false);
+                }
+                _ => return err("quick open|close|use ID|key VK"),
+            }
+            a.invalidate();
+            json!({"ok": true, "open": a.qs.is_some(), "focus": a.qs.as_ref().map(|q| q.focus)}).to_string()
         }
         "close-popups" => {
             a.close_popups();

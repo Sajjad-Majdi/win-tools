@@ -216,3 +216,26 @@ fn drag_drop_data_round_trip() {
     assert_eq!(back, paths);
     cleanup(&d);
 }
+
+/// `wfm default set|status|restore` on the test root: the explore verb, the class Folder (with Explorer's
+/// openinexplorer hand-back) and the right-click menu parts are written, reported and removed again.
+#[test]
+fn default_set_on_test_root_has_explore_folder_and_menu() {
+    let d = tdir("defaultroot");
+    let data = d.join("_data");
+    let root = format!(r"HKCU\Software\RustFileExplorerTest\Cli-{}\Classes", std::process::id());
+    let exe = wfm_exe().with_file_name("RustFileExplorer.exe");
+    let v = ok(&data, &["default", "set", "--yes", "--root", &root, "--exe", &s(&exe)]);
+    for part in ["folders", "drives", "explore", "folder_class", "menu", "win_e", "this_pc"] {
+        assert_eq!(v["parts"][part], true, "{part}: {v}");
+    }
+    assert_eq!(v["all"], true);
+    let v = ok(&data, &["default", "restore", "--yes", "--root", &root]);
+    for part in ["folders", "explore", "folder_class", "menu"] {
+        assert_eq!(v["parts"][part], false, "{part} after restore: {v}");
+    }
+    // a root that is not a test key is refused
+    assert_eq!(wfm(&data, &["default", "set", "--yes", "--root", r"HKCU\Software\Classes"]).code, 2);
+    let _ = std::process::Command::new("reg").args(["delete", &format!(r"HKCU\Software\RustFileExplorerTest\Cli-{}", std::process::id()), "/f"]).output();
+    cleanup(&d);
+}
