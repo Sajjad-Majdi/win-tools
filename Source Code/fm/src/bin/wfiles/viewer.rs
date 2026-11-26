@@ -145,6 +145,8 @@ pub struct Viewer {
     t: Theme,
     stage: C,
     mica: bool,
+    /// the DWM backdrop type set on the window (None: no Mica on this Windows); put back after full screen
+    bd: Option<i32>,
     pa: f32,
     pub list: Vec<PathBuf>,
     pub idx: usize,
@@ -261,6 +263,7 @@ pub fn sync(a: &App) {
         }
     }
     v.mica = mica;
+    v.bd = if a.can_mica { Some(a.look.dwm_backdrop()) } else { None };
     v.gfx.set_alpha(mica);
     v.gfx.corner = a.gfx.corner;
     v.invalidate();
@@ -368,6 +371,7 @@ fn create(a: &mut App, list: Vec<PathBuf>, idx: usize) -> Result<(), String> {
             t: a.t.clone(),
             stage: stage_colour(a),
             mica,
+            bd: if a.can_mica { Some(a.look.dwm_backdrop()) } else { None },
             pa: if mica { a.look.layer_alpha() } else { 1.0 },
             list: vec![],
             idx: 0,
@@ -1083,6 +1087,19 @@ impl Viewer {
         self.invalidate();
     }
 
+    /// Apply the window frame as `create` does: dark title bar, the backdrop, and the frame drawn into the client area.
+    unsafe fn reframe(&self) {
+        unsafe {
+            set_dark_frame(self.hwnd, self.t.dark);
+            if let Some(b) = self.bd {
+                let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const i32 as *const _, 4);
+                let _ = DwmExtendFrameIntoClientArea(self.hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+            } else {
+                let _ = DwmExtendFrameIntoClientArea(self.hwnd, &MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 });
+            }
+        }
+    }
+
     fn toggle_full(&mut self) {
         self.tip = None;
         unsafe {
@@ -1119,6 +1136,9 @@ impl Viewer {
                 }
                 let _ = SetWindowPos(hw, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
+            // a style change drops DWM's dark frame, backdrop and glass margins: put them back, or the window's
+            // colours come back wrong after full screen (Sajjad, 2026-11-26)
+            self.reframe();
         }
         self.fit = true;
         self.invalidate();
