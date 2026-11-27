@@ -34,6 +34,9 @@ pub const SIDE_MAX: f32 = 380.0;
 /// column width limits; the Name column keeps at least NAME_MIN
 pub const COL_MIN: f32 = 56.0;
 pub const COL_MAX: f32 = 480.0;
+/// Grid view tile size (Quick settings slider): 1.0 = the standard 128 x 96 picture.
+pub const GRID_MIN: f32 = 0.6;
+pub const GRID_MAX: f32 = 2.0;
 pub const NAME_MIN: f32 = 120.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +84,8 @@ pub struct Look {
     pub toolbar: u8,
     /// the Details pane is shown (Alt+Shift+P)
     pub details: bool,
+    /// Grid view tile size, GRID_MIN..=GRID_MAX (1.0 = standard)
+    pub grid: f32,
 }
 
 impl Default for Look {
@@ -114,6 +119,7 @@ impl Default for Look {
             tab_cur: 0,
             toolbar: 0,
             details: false,
+            grid: 1.0,
         }
     }
 }
@@ -165,6 +171,7 @@ impl Look {
             tab_cur: v["tab"].as_u64().unwrap_or(0) as usize,
             toolbar: (v["toolbar"].as_str() == Some("command")) as u8,
             details: b("details_pane", false),
+            grid: v["grid_size"].as_f64().map(|x| (x as f32).clamp(GRID_MIN, GRID_MAX)).unwrap_or(d.grid),
         }
     }
 
@@ -181,6 +188,7 @@ impl Look {
             "start": self.start, "last": self.last,
             "window": self.win, "tabs": self.tabs, "tab": self.tab_cur,
             "toolbar": if self.toolbar == 1 { "command" } else { "compact" }, "details_pane": self.details,
+            "grid_size": (self.grid as f64 * 100.0).round() / 100.0,
         })
     }
 

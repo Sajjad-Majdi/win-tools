@@ -1035,7 +1035,7 @@ impl App {
     fn move_focus(&mut self, d: i32, shift: bool, ctrl: bool) {
         let (t, p) = (self.cur, self.tab().active);
         let grid = self.tab().view == View::Grid && !self.pane().searching();
-        let cols = if grid { paint::grid_cols(pane_geoms(self, t)[p].list) as i32 } else { 1 };
+        let cols = if grid { paint::grid_cols(pane_geoms(self, t)[p].list, self.look.grid) as i32 } else { 1 };
         // PageUp / PageDown: the rows on screen less one (the last one stays in view), as in Explorer
         let page = {
             let (_, h, view_h) = paint::row_geom(self, t, p, 0);
@@ -1070,6 +1070,10 @@ impl App {
     pub fn mouse_move(&mut self, x: f32, y: f32, down: bool) {
         self.mx = x;
         self.my = y;
+        if self.qs_drag {
+            self.qs_size_at(x);
+            return;
+        }
         if let Some((x0, w0)) = self.side_drag {
             self.look.side_w = (w0 + x - x0).clamp(crate::look::SIDE_MIN, crate::look::SIDE_MAX);
             self.invalidate();
@@ -1206,6 +1210,10 @@ impl App {
     pub fn mouse_up(&mut self, x: f32, y: f32) {
         if self.side_drag.take().is_some() || self.col_drag.take().is_some() {
             self.save_look();
+        }
+        if std::mem::take(&mut self.qs_drag) {
+            self.grid_size_done();
+            self.invalidate();
         }
         self.field_drag_end();
         // a test drag ends: drop here (OLE does this for a real drag)
@@ -1661,6 +1669,11 @@ impl App {
             Hit::Sug(i) => self.sug_take(i, true),
             Hit::ViewBtn if !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) => self.act(Act::ViewMenu),
             Hit::QuickBtn => self.qs_toggle(),
+            Hit::Qs(crate::quick::Q_SIZE) => {
+                // the size slider: the tiles follow the pointer until the button comes up
+                self.qs_drag = true;
+                self.qs_size_at(x);
+            }
             Hit::Qs(id) => self.qs_use(id),
             Hit::SortBtn => {
                 let r = self.hits.iter().rev().find(|x| x.1 == h).map(|x| x.0).unwrap_or_default();
@@ -1986,7 +1999,7 @@ impl App {
         let r0 = crate::paint::item_rect(self, t, p, i);
         let r = Rect::new(r0.x, g.list.y + r0.y - self.tabs[t].panes[p].scroll, r0.w, r0.h);
         if self.tabs[t].view == View::Grid && !self.tabs[t].panes[p].searching() {
-            return Rect::new(r.x + 4.0, r.y + 104.0, r.w - 8.0, 42.0).has(x, y);
+            return Rect::new(r.x + 4.0, r.y + 8.0 + 96.0 * self.look.grid, r.w - 8.0, 42.0).has(x, y);
         }
         let isz = self.look.icon();
         let nx = r.x + 10.0 + isz + 10.0;

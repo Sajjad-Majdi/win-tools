@@ -3,10 +3,11 @@
 //! `set` makes folders, drives, Win+E and the This PC / Recycle Bin desktop icons open in RustFileExplorer.exe:
 //! - `HKCU\Software\Classes\Directory\shell` and `...\Drive\shell`: the canonical verb `open` is made ours
 //!   (`"<RustFileExplorer.exe>" "%1"`, empty `DelegateExecute`) and kept plain: no Icon, no name and no default-verb
-//!   value ([`DEFAULT_OPEN`]), so Windows 11's main right-click menu shows only Windows' own rows. Two classic verbs,
-//!   shown under "Show more options": `openinwfiles` ("Open in Rust File Explorer", our icon) and `openinexplorer`
-//!   ("Open in File Explorer", Explorer's icon and delegate). The `explore` verb (asked for by name by Visual
-//!   Studio and other apps) is ours too, hidden from menus (`ProgrammaticAccessOnly`);
+//!   value ([`DEFAULT_OPEN`]), so Windows 11's main right-click menu shows only Windows' own rows (its "Open" runs
+//!   our `open`). One classic verb, shown under "Show more options": `openinexplorer` ("Open in Windows File
+//!   Explorer", Explorer's icon and delegate). The old `openinwfiles` verb and a default value naming it (written by
+//!   0.2.x builds) are removed: Windows 11 puts a custom-named DEFAULT verb at the top of its main menu. The `explore`
+//!   verb (asked for by name by Visual Studio and other apps) is ours too, hidden from menus (`ProgrammaticAccessOnly`);
 //! - `HKCU\Software\Classes\Folder\shell\open` and `\explore` (callers that name the class "Folder": AutoPlay
 //!   "Open folder", ShellExecuteEx with lpClass "Folder", virtual folders) = ours, plus `Folder\shell\openinexplorer`
 //!   (Explorer's own delegate, hidden) for the hand-back of virtual folders (Control Panel, Network, phones): our
@@ -32,8 +33,10 @@ pub const THIS_PC: &str = "{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 pub const RECYCLE_BIN: &str = "{645FF040-5081-101B-9F08-00AA002F954E}";
 const MARK: &str = "WinToolsFiles";
 
+/// The 0.2.x "Open in Rust File Explorer" verb: no longer written; `set` and `restore` remove it.
 const VERB: &str = "openinwfiles";
-/// "Open in File Explorer": Windows' own Explorer, kept one click away while folders open here.
+/// "Open in Windows File Explorer": Windows' own Explorer, kept one click away while folders open here.
+const EXPLORER_LABEL: &str = "Open in Windows File Explorer";
 const EXPLORER_VERB: &str = "openinexplorer";
 /// The delegate Explorer itself registers for Folder\shell\open (opens the item in an Explorer window).
 const EXPLORER_DELEGATE: &str = "{11dbb47c-a525-400b-9e80-a54615a090c0}";
@@ -117,8 +120,8 @@ pub struct Status {
     pub explore: bool,
     /// the class "Folder" (`open`, `explore`, plus the `openinexplorer` hand-back) is ours
     pub folder_class: bool,
-    /// the right-click menus: nothing of ours in Windows 11's main list (`open` has no Icon or name); "Open in Rust
-    /// File Explorer" and "Open in File Explorer" with their icons under "Show more options"
+    /// the right-click menus: nothing of ours in Windows 11's main list (`open` has no Icon or name, no old
+    /// `openinwfiles`); "Open in Windows File Explorer" with Explorer's icon under "Show more options"
     pub menu: bool,
 }
 
@@ -166,15 +169,24 @@ fn clsid_verb(id: &str) -> &'static str {
 pub fn status_in(root: &str) -> Status {
     let verb = |class: &str| {
         let shell = format!(r"{root}\{class}\shell");
-        let default_ok = !DEFAULT_OPEN || get_value(&shell, "").map(|d| d.eq_ignore_ascii_case("open")).unwrap_or(false);
+        // DEFAULT_OPEN: the default verb must be "open"; otherwise no default value of ours may be left (an old
+        // "openinwfiles" default sits at the top of Windows 11's main menu and wins over our `open`)
+        let default = get_value(&shell, "");
+        let default_ok = if DEFAULT_OPEN {
+            default.map(|d| d.eq_ignore_ascii_case("open")).unwrap_or(false)
+        } else {
+            !default.map(|d| d.eq_ignore_ascii_case(VERB) || d.eq_ignore_ascii_case("open")).unwrap_or(false)
+        };
         default_ok && get_value(&format!(r"{shell}\open"), MARK).is_some() && get_value(&format!(r"{shell}\open\command"), "").is_some()
     };
-    // the menus: `open` plain (no Icon / name: Windows' own row in the main menu), our two named entries there
+    // the menus: `open` plain (no Icon / name: Windows' own row in the main menu), no old `openinwfiles`, our named
+    // Explorer entry under "Show more options"
     let menu = |class: &str| {
         let shell = format!(r"{root}\{class}\shell");
         let plain = get_value(&format!(r"{shell}\open"), "Icon").is_none() && get_value(&format!(r"{shell}\open"), "MUIVerb").is_none() && get_value(&format!(r"{shell}\open"), "").is_none();
         let named = |v: &str| get_value(&format!(r"{shell}\{v}"), MARK).is_some() && get_value(&format!(r"{shell}\{v}"), "Icon").is_some() && get_value(&format!(r"{shell}\{v}"), "ProgrammaticAccessOnly").is_none();
-        plain && named(VERB) && named(EXPLORER_VERB)
+        let old_gone = get_value(&format!(r"{shell}\{VERB}\command"), "").is_none() && get_value(&format!(r"{shell}\{VERB}"), "").is_none();
+        plain && old_gone && named(EXPLORER_VERB) && get_value(&format!(r"{shell}\{EXPLORER_VERB}"), "").as_deref() == Some(EXPLORER_LABEL)
     };
     // ours AND effective: our open verb is there and it is the default verb Windows sees. On the real root the
     // merged HKEY_CLASSES_ROOT is read (HKLM sets This PC's default verb to "none", which beats a lone HKCU verb).
@@ -282,21 +294,17 @@ pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
         our_verb(&format!(r"{base}\open"), &exe, false)?;
         if DEFAULT_OPEN {
             set_value(&base, "", "open")?;
-        } else if get_value(&base, "").as_deref() == Some("open") && get_value(&format!(r"{base}\open"), MARK).is_some() {
+        } else if get_value(&base, "").is_some_and(|d| d.eq_ignore_ascii_case("open") || d.eq_ignore_ascii_case(VERB)) {
+            // a default verb an earlier build wrote ("open", or 0.2.x's "openinwfiles", which Windows 11 put at the
+            // top of its main menu and ran instead of our `open`)
             delete_value(&base, "");
         }
         our_verb(&format!(r"{base}\explore"), &exe, true)?;
-        // "Open in Rust File Explorer" (classic menu only)
-        let me = format!(r"{base}\{VERB}");
-        delete_tree(&me);
-        set_value(&me, "", "Open in Rust File Explorer")?;
-        set_value(&me, "Icon", &format!("{exe},0"))?;
-        set_value(&me, "MultiSelectModel", "Document")?;
-        set_value(&me, MARK, "1")?;
-        set_value(&format!(r"{me}\command"), "", &format!("\"{exe}\" \"%1\""))?;
-        // "Open in File Explorer" (classic menu only): Explorer's own delegate
+        // the 0.2.x "Open in Rust File Explorer" verb goes (Sajjad, 2026-11-27: not in Windows' menus at all)
+        delete_tree(&format!(r"{base}\{VERB}"));
+        // "Open in Windows File Explorer" (classic menu only): Explorer's own delegate
         let ex = format!(r"{base}\{EXPLORER_VERB}");
-        set_value(&ex, "", "Open in File Explorer")?;
+        set_value(&ex, "", EXPLORER_LABEL)?;
         set_value(&ex, "Icon", &format!("{explorer},0"))?;
         set_value(&ex, "MultiSelectModel", "Document")?;
         set_value(&ex, MARK, "1")?;
@@ -313,7 +321,7 @@ pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
             return Err(format!(r"HKCU\{ex} already has a command that is not ours"));
         }
         delete_tree(&ex);
-        set_value(&ex, "", "Open in File Explorer")?;
+        set_value(&ex, "", EXPLORER_LABEL)?;
         set_value(&ex, "ProgrammaticAccessOnly", "")?;
         set_value(&ex, "MultiSelectModel", "Document")?;
         set_value(&ex, MARK, "1")?;
@@ -339,7 +347,6 @@ pub fn set_in(root: &str, exe: &std::path::Path) -> Res<()> {
         }
         let v = clsid_verb(id);
         let open = format!(r"{shell}\{v}");
-        set_value(&open, "", "Open in Rust File Explorer")?;
         set_value(&format!(r"{open}\command"), "", &format!("\"{exe}\" \"::{id}\""))?;
         set_value(&format!(r"{open}\command"), "DelegateExecute", "")?;
         set_value(&open, MARK, "1")?;
@@ -490,11 +497,20 @@ mod tests {
             let sh = format!(r"{r}\{class}\shell");
             assert_eq!(get_value(&format!(r"{sh}\open"), "Icon"), None);
             assert_eq!(get_value(&format!(r"{sh}\open"), ""), None);
-            assert_eq!(get_value(&format!(r"{sh}\{VERB}"), "").as_deref(), Some("Open in Rust File Explorer"));
-            assert_eq!(get_value(&format!(r"{sh}\{VERB}"), "Icon"), Some(format!("{},0", exe.display())));
-            assert_eq!(get_value(&format!(r"{sh}\{EXPLORER_VERB}"), "").as_deref(), Some("Open in File Explorer"));
+            assert_eq!(get_value(&format!(r"{sh}\{VERB}"), ""), None, "no openinwfiles verb");
+            assert_eq!(get_value(&format!(r"{sh}\{EXPLORER_VERB}"), "").as_deref(), Some(EXPLORER_LABEL));
             assert!(get_value(&format!(r"{sh}\{EXPLORER_VERB}"), "Icon").unwrap().to_lowercase().ends_with("explorer.exe,0"));
         }
+        // the 0.2.x state (default verb "openinwfiles" + its verb, no marker) is reported, and `set` removes it
+        set_value(&format!(r"{r}\Drive\shell"), "", VERB).unwrap();
+        set_value(&format!(r"{r}\Drive\shell\{VERB}"), "", "Open in Rust File Explorer").unwrap();
+        set_value(&format!(r"{r}\Drive\shell\{VERB}\command"), "", "x.exe \"%1\"").unwrap();
+        let old = status_in(&r);
+        assert!(!old.drives && !old.menu, "{old:?}");
+        set_in(&r, &exe).unwrap();
+        assert_eq!(get_value(&format!(r"{r}\Drive\shell"), ""), None);
+        assert_eq!(get_value(&format!(r"{r}\Drive\shell\{VERB}\command"), ""), None);
+        assert!(status_in(&r).drives && status_in(&r).menu);
         // an Icon put back on `open` (as 0.2.7 wrote it) is reported
         set_value(&format!(r"{r}\Directory\shell\open"), "Icon", "x.exe,0").unwrap();
         assert!(!status_in(&r).menu);

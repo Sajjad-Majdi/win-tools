@@ -1,11 +1,13 @@
 //! Quick settings: the panel under the sliders button at the right of the address bar (toolbar "compact" mode).
-//! The most used settings in one place, set without leaving the folder: Layout (Details / Grid tiles), Sort by
+//! The most used settings in one place, set without leaving the folder: Layout (Details / Grid tiles, and a
+//! continuous size slider for Grid tiles), Sort by
 //! (one segmented row plus a direction button), the Details pane, hidden items and file name extensions (switches),
 //! and "All settings". A change applies at once and the panel stays open; Esc or a click outside closes it.
 //! Arrow keys and Tab move between the controls, Enter or Space uses one.
 use crate::app::*;
 use crate::gfx::{Align, Font, Rect};
 use crate::model::*;
+use crate::look::{GRID_MAX, GRID_MIN};
 use crate::theme::{R_CTRL, R_MENU, Theme};
 use std::time::Instant;
 
@@ -15,20 +17,25 @@ pub struct Quick {
     /// the control the keyboard is on (shown with a focus ring once a key was used)
     pub focus: u8,
     pub kb: bool,
+    /// the size slider's track as drawn (a press or drag there sets the size from x)
+    pub track: Rect,
 }
 
 /// Control ids (Hit::Qs): layout tiles, sort fields, sort direction, switches, All settings.
 pub const Q_DETAILS: u8 = 0;
 pub const Q_GRID: u8 = 1;
+pub const Q_SIZE: u8 = 2;
 pub const Q_SORT: u8 = 10; // 10..=13: Name, Date, Type, Size
 pub const Q_DIR: u8 = 14;
 pub const Q_PANE: u8 = 20;
 pub const Q_HIDDEN: u8 = 21;
 pub const Q_EXT: u8 = 22;
 pub const Q_ALL: u8 = 30;
-const ORDER: [u8; 11] = [Q_DETAILS, Q_GRID, Q_SORT, Q_SORT + 1, Q_SORT + 2, Q_SORT + 3, Q_DIR, Q_PANE, Q_HIDDEN, Q_EXT, Q_ALL];
+const ORDER: [u8; 12] = [Q_DETAILS, Q_GRID, Q_SIZE, Q_SORT, Q_SORT + 1, Q_SORT + 2, Q_SORT + 3, Q_DIR, Q_PANE, Q_HIDDEN, Q_EXT, Q_ALL];
 const SORTS: [(&str, SortCol); 4] = [("Name", SortCol::Name), ("Date", SortCol::Date), ("Type", SortCol::Type), ("Size", SortCol::Size)];
 const W: f32 = 300.0;
+/// the size slider's row
+const SIZE_H: f32 = 28.0;
 const PAD: f32 = 12.0;
 
 impl App {
@@ -39,9 +46,34 @@ impl App {
     fn qs_sort_on(&self) -> bool {
         !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup | Loc::ThisPc)
     }
+    /// The size slider works while the folder is shown as Grid tiles.
+    fn qs_size_on(&self) -> bool {
+        self.qs_layout_on() && self.tab().view == View::Grid
+    }
+
+    /// Grid tile size from a point on the slider track (a press or a drag), live.
+    pub fn qs_size_at(&mut self, x: f32) {
+        let Some(q) = self.qs.as_ref() else { return };
+        if !self.qs_size_on() || q.track.w <= 0.0 {
+            return;
+        }
+        let f = ((x - q.track.x) / q.track.w).clamp(0.0, 1.0);
+        self.set_grid_size(GRID_MIN + f * (GRID_MAX - GRID_MIN));
+    }
+
+    /// Set the Grid tile size (clamped); the folder re-flows at once. Saved by the caller when the change ends.
+    pub fn set_grid_size(&mut self, z: f32) {
+        let z = z.clamp(GRID_MIN, GRID_MAX);
+        if (z - self.look.grid).abs() > f32::EPSILON {
+            self.look.grid = z;
+            self.invalidate();
+        }
+    }
+
     fn qs_enabled(&self, id: u8) -> bool {
         match id {
             Q_DETAILS | Q_GRID => self.qs_layout_on(),
+            Q_SIZE => self.qs_size_on(),
             Q_SORT..=Q_DIR => self.qs_sort_on(),
             _ => true,
         }
@@ -53,7 +85,7 @@ impl App {
         } else {
             self.close_popups();
             let first = ORDER.iter().copied().find(|i| self.qs_enabled(*i)).unwrap_or(Q_PANE);
-            self.qs = Some(Quick { at: Instant::now(), focus: first, kb: false });
+            self.qs = Some(Quick { at: Instant::now(), focus: first, kb: false, track: Rect::default() });
         }
         self.anim();
         self.invalidate();
@@ -68,8 +100,8 @@ impl App {
     }
 
     fn qs_height(&self) -> f32 {
-        // Layout, Sort by, three switches, the footer
-        let layout = PAD + 18.0 + 64.0 + PAD;
+        // Layout (tiles + size slider), Sort by, three switches, the footer
+        let layout = PAD + 18.0 + 64.0 + 8.0 + SIZE_H + PAD;
         let sort = PAD + 18.0 + 32.0 + PAD;
         let switches = 6.0 + 3.0 * 36.0 + 6.0;
         let footer = 4.0 + 36.0 + 4.0;
@@ -115,9 +147,20 @@ impl App {
 
     /// Keys while the panel is open: true when used.
     pub fn qs_key(&mut self, vk: u16, shift: bool) -> bool {
-        let Some(q) = self.qs.as_ref() else { return false };
+        let Some(focus) = self.qs.as_ref().map(|q| q.focus) else { return false };
+        // Left / Right on the size slider change the size (Up / Down move on)
+        if focus == Q_SIZE && matches!(vk, 0x25 | 0x27) {
+            let step = if vk == 0x25 { -0.1 } else { 0.1 };
+            self.set_grid_size(self.look.grid + step);
+            self.grid_size_done();
+            if let Some(q) = self.qs.as_mut() {
+                q.kb = true;
+            }
+            self.invalidate();
+            return true;
+        }
         let on: Vec<u8> = ORDER.iter().copied().filter(|i| self.qs_enabled(*i)).collect();
-        let at = on.iter().position(|i| *i == q.focus).unwrap_or(0);
+        let at = on.iter().position(|i| *i == focus).unwrap_or(0);
         let step = |d: isize| on[((at as isize + d).rem_euclid(on.len() as isize)) as usize];
         let next = match vk {
             0x1B => {
@@ -126,7 +169,7 @@ impl App {
                 return true;
             }
             0x0D | 0x20 => {
-                let f = q.focus;
+                let f = focus;
                 if let Some(q) = self.qs.as_mut() {
                     q.kb = true;
                 }
@@ -197,7 +240,36 @@ impl App {
                 self.hit(tr, h);
             }
         }
-        y += 64.0 + PAD;
+        y += 64.0 + 8.0;
+
+        // Size (Grid only): a small and a large tile glyph at the ends of a continuous slider
+        let size_on = self.qs_size_on();
+        let row = Rect::new(x0, y, w0, SIZE_H);
+        let h = Hit::Qs(Q_SIZE);
+        let hk = if size_on { self.hk(h) } else { 0.0 };
+        let fg = if size_on { t.text2 } else { t.text_dis };
+        self.gfx.glyph(0xF0E2, Rect::new(row.x, row.y, 16.0, SIZE_H), 10.0, fg);
+        self.gfx.glyph(0xF0E2, Rect::new(row.r() - 18.0, row.y, 18.0, SIZE_H), 16.0, fg);
+        let track = Rect::new(row.x + 26.0, row.cy() - 2.0, row.w - 26.0 - 28.0, 4.0);
+        let f = ((self.look.grid - GRID_MIN) / (GRID_MAX - GRID_MIN)).clamp(0.0, 1.0);
+        let kx = track.x + f * track.w;
+        self.gfx.fill_round(track, 2.0, if t.dark { t.text.a(0.16) } else { t.field_bottom.a(0.45) });
+        if size_on {
+            self.gfx.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, t.accent);
+        }
+        // the knob: a ring in the page colour with an accent dot that grows under the pointer or while dragged
+        let grab = self.qs_drag || hk > 0.5;
+        self.gfx.ellipse(kx, track.cy(), 9.0, t.layer2, true, 1.0);
+        self.gfx.ellipse(kx, track.cy(), 9.0, t.stroke, false, 1.0);
+        self.gfx.ellipse(kx, track.cy(), if grab { 6.0 } else { 4.5 }, if size_on { t.accent } else { t.text_dis }, true, 1.0);
+        self.qs_ring(Q_SIZE, Rect::new(track.x - 10.0, row.y + 2.0, track.w + 20.0, SIZE_H - 4.0), R_CTRL, t);
+        if let Some(q) = self.qs.as_mut() {
+            q.track = track;
+        }
+        if size_on {
+            self.hit(Rect::new(track.x - 10.0, row.y, track.w + 20.0, SIZE_H), h);
+        }
+        y += SIZE_H + PAD;
         self.gfx.fill(Rect::new(r.x, y, r.w, 1.0), t.divider);
         y += 1.0 + PAD;
 
@@ -297,7 +369,7 @@ mod tests {
         for id in ORDER {
             assert!(seen.insert(id));
         }
-        assert_eq!(ORDER.len(), 2 + 4 + 1 + 3 + 1);
+        assert_eq!(ORDER.len(), 2 + 1 + 4 + 1 + 3 + 1);
         assert_eq!(SORTS.len(), 4);
     }
 }

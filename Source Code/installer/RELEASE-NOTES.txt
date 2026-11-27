@@ -1,4 +1,11 @@
-Rust Task Manager and Rust File Explorer 0.2.8: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.9: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.9
+- Rust File Explorer: Quick settings has a size slider for Grid view; tiles grow and shrink continuously
+  (arrow keys work too), and pictures are made sharper for large tiles.
+- Rust File Explorer fix: "Set as default" now removes the default verb older versions wrote, so Windows 11's
+  main right-click menu shows only its own "Open" (which opens Rust File Explorer). "Open in Windows File
+  Explorer", with Explorer's icon, sits under "Show more options"; "Open in Rust File Explorer" is gone there.
 
 New in 0.2.8
 - Rust File Explorer: a Details pane (Alt+Shift+P) shows a file's properties, and titles, artists, album, year,

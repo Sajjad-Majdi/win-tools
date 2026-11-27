@@ -627,6 +627,11 @@ pub struct App {
     pub side_drag: Option<(f32, f32)>,
     /// column divider drag: (column, start x, start width)
     pub col_drag: Option<(u8, f32, f32)>,
+    /// the Quick settings size slider is being dragged
+    pub qs_drag: bool,
+    /// Grid thumbnails are made at 128 px (at 96 DPI) times this (percent: 100, 150, 200), read by the thumbnail
+    /// thread for each request; raised when the Grid size slider needs sharper pictures
+    pub thumb_zoom: Arc<std::sync::atomic::AtomicU32>,
     /// narrow window: the sidebar is open (as the rail) although the window is too narrow for it
     pub side_open: bool,
     /// Ctrl / Shift of a test drag (`wfm gui drag ... ctrl`)
@@ -787,6 +792,19 @@ impl App {
 
     pub fn save_look(&self) {
         self.look.save();
+    }
+
+    /// A Grid size change ended (slider released, arrow key): save it, and when the tiles now need sharper
+    /// pictures than the ones made, make them again at the larger size (smaller tiles keep the sharper ones).
+    pub fn grid_size_done(&mut self) {
+        self.save_look();
+        let need = thumb_zoom_for(self.look.grid);
+        if need > self.thumb_zoom.load(std::sync::atomic::Ordering::Relaxed) {
+            self.thumb_zoom.store(need, std::sync::atomic::Ordering::Relaxed);
+            self.thumbs.retain(|_, v| v.is_none());
+            self.bitmaps.clear();
+            self.thumb_asked.clear();
+        }
     }
 
     /// Backdrop type and the render target's transparency, live.
@@ -2808,6 +2826,8 @@ pub fn run(o: Opts) -> i32 {
             press_ws: false,
             side_drag: None,
             col_drag: None,
+            qs_drag: false,
+            thumb_zoom: Arc::new(std::sync::atomic::AtomicU32::new(100)),
             side_open: false,
             test_mods: None,
             settings_h: 0.0,
@@ -2891,7 +2911,9 @@ pub fn run(o: Opts) -> i32 {
             let q = app.thumb_q.clone();
             let bg = app.bg.clone();
             let hw = hwnd.0 as isize;
-            let px = (128.0 * GetDpiForWindow(hwnd) as f32 / 96.0).round() as u32;
+            let base = 128.0 * GetDpiForWindow(hwnd) as f32 / 96.0;
+            app.thumb_zoom.store(thumb_zoom_for(app.look.grid), std::sync::atomic::Ordering::Relaxed);
+            let zoom = app.thumb_zoom.clone();
             std::thread::spawn(move || {
                 let _c = fmcore::util::com();
                 loop {
@@ -2903,6 +2925,7 @@ pub fn run(o: Opts) -> i32 {
                         }
                         g.pop().unwrap()
                     };
+                    let px = (base * zoom.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0).round() as u32;
                     let img = fmcore::thumb::thumbnail(&path, px.max(128), fmcore::thumb::ThumbKind::ThumbnailOnly).ok().map(|mut i| {
                         crate::preview::premultiply(&mut i.bgra);
                         (i.width, i.height, i.bgra)
@@ -3081,4 +3104,9 @@ static SEARCH_SLOT: std::sync::LazyLock<(Mutex<Vec<SearchJob>>, Condvar)> = std:
 /// and to use in a startwith: query.
 pub fn plain_words(w: &str) -> bool {
     !w.is_empty() && !w.chars().any(|c| matches!(c, ':' | '|' | '!' | '"' | '*' | '?' | '<' | '>' | '/' | '\\'))
+}
+
+/// The thumbnail size step (percent of 128 px) that keeps Grid pictures sharp at tile size `z`.
+pub fn thumb_zoom_for(z: f32) -> u32 {
+    if z <= 1.0 { 100 } else if z <= 1.5 { 150 } else { 200 }
 }

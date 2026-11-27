@@ -99,8 +99,14 @@ pub fn row_h(a: &App, t: usize, p: usize) -> f32 {
     if pane.searching() { ROW2_H } else { a.look.row_h() }
 }
 
-pub fn grid_cols(list: Rect) -> usize {
-    (((list.w - 40.0 + 10.0) / 150.0).floor() as usize).max(1)
+/// Grid view tile at size `z` (Quick settings slider, 1.0 = standard): (tile width, tile height). The picture is
+/// 128 x 96 times `z`; the two-line name under it keeps its size.
+pub fn grid_tile(z: f32) -> (f32, f32) {
+    (12.0 + 128.0 * z, 54.0 + 96.0 * z)
+}
+
+pub fn grid_cols(list: Rect, z: f32) -> usize {
+    (((list.w - 40.0 + 10.0) / (grid_tile(z).0 + 10.0)).floor() as usize).max(1)
 }
 
 /// This PC page: drive tiles, then the pinned folders, both in a wrapping grid.
@@ -146,8 +152,10 @@ pub fn item_rect(a: &App, t: usize, p: usize, i: usize) -> Rect {
         return Rect::new(list.x + 20.0 + (k % l.cols) as f32 * (l.tw + 12.0), y0 + (k / l.cols) as f32 * (th + 8.0), l.tw, th);
     }
     if tiled(a, t, p) {
-        let cols = grid_cols(list);
-        return Rect::new(list.x + 20.0 + (i % cols) as f32 * 150.0, 14.0 + (i / cols) as f32 * 156.0, 140.0, 150.0);
+        let z = a.look.grid;
+        let (tw, th) = grid_tile(z);
+        let cols = grid_cols(list, z);
+        return Rect::new(list.x + 20.0 + (i % cols) as f32 * (tw + 10.0), 14.0 + (i / cols) as f32 * (th + 6.0), tw, th);
     }
     let h = row_h(a, t, p);
     Rect::new(list.x + 6.0, 4.0 + i as f32 * h, list.w - 12.0, h)
@@ -167,8 +175,9 @@ pub fn content_h(a: &App, t: usize, p: usize) -> f32 {
         return pc_lay(a, t, p, g.list).h;
     }
     if tiled(a, t, p) {
-        let cols = grid_cols(g.list);
-        return 14.0 + n.div_ceil(cols) as f32 * 156.0 + 14.0;
+        let z = a.look.grid;
+        let cols = grid_cols(g.list, z);
+        return 14.0 + n.div_ceil(cols) as f32 * (grid_tile(z).1 + 6.0) + 14.0;
     }
     8.0 + n as f32 * row_h(a, t, p)
 }
@@ -1767,10 +1776,12 @@ impl App {
                     self.gfx.text(&it.folder, Rect::new(r.x + 56.0, r.y + 29.0, r.w - 66.0, 18.0), Font::Ui, fs2, 400, Align::Left, t.text3);
                 }
             } else if grid {
-                let th = Rect::new(r.x + 6.0, r.y + 6.0, 128.0, 96.0);
+                let z = self.look.grid;
+                let th = Rect::new(r.x + 6.0, r.y + 6.0, 128.0 * z, 96.0 * z);
                 let has_thumb = matches!(it.kind, Kind::Img | Kind::Video | Kind::Pdf);
                 let bmp = if has_thumb { self.thumb_bitmap(&it.path) } else { None };
-                let ir = Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0);
+                let isz = 64.0 * z;
+                let ir = Rect::new(th.cx() - isz / 2.0, th.cy() - isz / 2.0, isz, isz);
                 if let Some(b) = bmp {
                     let (bw, bh) = self.thumbs.get(&it.path).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
                     let s = (th.w / bw).max(th.h / bh);
@@ -1781,16 +1792,16 @@ impl App {
                 } else if it.kind == Kind::Folder && it.attrs & 0x5 == 0 && self.folder_preview(&it.path, ir, t) {
                     // a folder with pictures: they peek out of it (as in Windows)
                 } else {
-                    self.item_icon_a(&it.path, &it.name, it.is_dir, it.attrs, it.modified, it.kind, Rect::new(th.cx() - 32.0, th.cy() - 32.0, 64.0, 64.0), t);
+                    self.item_icon_a(&it.path, &it.name, it.is_dir, it.attrs, it.modified, it.kind, ir, t);
                 }
                 if let Some((_, f)) = inline.as_ref().filter(|x| x.0 == it.path) {
                     // rename in place: the label becomes an edit box (F2, or a slow second click on the name)
-                    let fr = Rect::new(r.x + 2.0, r.y + 110.0, r.w - 4.0, 26.0);
+                    let fr = Rect::new(r.x + 2.0, th.b() + 8.0, r.w - 4.0, 26.0);
                     self.inline_rect = fr;
                     self.field_box(fr, true, t);
                     self.field_text(FieldId::Inline, f, Rect::new(fr.x + 6.0, fr.y, fr.w - 12.0, fr.h), 12.5, true, t, &[]);
                 } else {
-                    self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, r.y + 108.0, 128.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
+                    self.gfx.para(&self.display_name(it), Rect::new(r.x + 6.0, th.b() + 6.0, r.w - 12.0, 34.0), Font::Ui, 12.0, 400, Align::Center, t.text, 16.0, false, 2);
                 }
             } else {
                 let rh = r.h;
