@@ -27,6 +27,7 @@ mod quick;
 mod rank;
 mod sicons;
 mod theme;
+mod upd;
 mod viewer;
 
 fn main() {

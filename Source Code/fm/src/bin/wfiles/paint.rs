@@ -99,14 +99,36 @@ pub fn row_h(a: &App, t: usize, p: usize) -> f32 {
     if pane.searching() { ROW2_H } else { a.look.row_h() }
 }
 
-/// Grid view tile at size `z` (Quick settings slider, 1.0 = standard): (tile width, tile height). The picture is
-/// 128 x 96 times `z`; the two-line name under it keeps its size.
-pub fn grid_tile(z: f32) -> (f32, f32) {
-    (12.0 + 128.0 * z, 54.0 + 96.0 * z)
+/// Height the size slider adds to the View menu.
+pub const VIEW_SLIDER_H: f32 = 4.0 + 1.0 + 4.0 + 28.0 * 2.0 + 6.0;
+
+/// Grid view icon size at tile size `z` (Quick settings slider, 1.0 = standard).
+pub fn grid_icon(z: f32) -> f32 {
+    64.0 * z
 }
 
-pub fn grid_cols(list: Rect, z: f32) -> usize {
-    (((list.w - 40.0 + 10.0) / (grid_tile(z).0 + 10.0)).floor() as usize).max(1)
+/// Grid view picture box (thumbnails fill it, icons sit in its middle): the icon plus a margin set by the spacing
+/// `g` (Quick settings slider, 1.0 = standard), the same at every size.
+pub fn grid_pic(z: f32, g: f32) -> (f32, f32) {
+    (grid_icon(z) + 24.0 * g, grid_icon(z) + 12.0 * g)
+}
+
+/// Grid view tile at size `z` and spacing `g`: (tile width, tile height). The two-line name under the picture keeps
+/// its size.
+pub fn grid_tile(z: f32, g: f32) -> (f32, f32) {
+    let (w, h) = grid_pic(z, g);
+    // the name under the picture keeps room for about 12 characters, so tight spacing never cuts words
+    ((12.0 + w).max(96.0), 54.0 + h)
+}
+
+/// Space between Grid tiles at spacing `g`: (across, down).
+pub fn grid_step(g: f32) -> (f32, f32) {
+    (10.0 * g, 6.0 * g)
+}
+
+pub fn grid_cols(list: Rect, z: f32, g: f32) -> usize {
+    let sx = grid_step(g).0;
+    (((list.w - 40.0 + sx) / (grid_tile(z, g).0 + sx)).floor() as usize).max(1)
 }
 
 /// This PC page: drive tiles, then the pinned folders, both in a wrapping grid.
@@ -152,10 +174,11 @@ pub fn item_rect(a: &App, t: usize, p: usize, i: usize) -> Rect {
         return Rect::new(list.x + 20.0 + (k % l.cols) as f32 * (l.tw + 12.0), y0 + (k / l.cols) as f32 * (th + 8.0), l.tw, th);
     }
     if tiled(a, t, p) {
-        let z = a.look.grid;
-        let (tw, th) = grid_tile(z);
-        let cols = grid_cols(list, z);
-        return Rect::new(list.x + 20.0 + (i % cols) as f32 * (tw + 10.0), 14.0 + (i / cols) as f32 * (th + 6.0), tw, th);
+        let (z, gp) = (a.look.grid, a.look.grid_gap);
+        let (tw, th) = grid_tile(z, gp);
+        let (sx, sy) = grid_step(gp);
+        let cols = grid_cols(list, z, gp);
+        return Rect::new(list.x + 20.0 + (i % cols) as f32 * (tw + sx), 14.0 + (i / cols) as f32 * (th + sy), tw, th);
     }
     let h = row_h(a, t, p);
     Rect::new(list.x + 6.0, 4.0 + i as f32 * h, list.w - 12.0, h)
@@ -175,9 +198,9 @@ pub fn content_h(a: &App, t: usize, p: usize) -> f32 {
         return pc_lay(a, t, p, g.list).h;
     }
     if tiled(a, t, p) {
-        let z = a.look.grid;
-        let cols = grid_cols(g.list, z);
-        return 14.0 + n.div_ceil(cols) as f32 * (grid_tile(z).1 + 6.0) + 14.0;
+        let (z, gp) = (a.look.grid, a.look.grid_gap);
+        let cols = grid_cols(g.list, z, gp);
+        return 14.0 + n.div_ceil(cols) as f32 * (grid_tile(z, gp).1 + grid_step(gp).1) + 14.0;
     }
     8.0 + n as f32 * row_h(a, t, p)
 }
@@ -1085,7 +1108,7 @@ impl App {
             a.gfx.text(name, Rect::new(x + 12.0, *y + 10.0, w, 18.0), Font::Ui, 12.0, 600, Align::Left, t.text3);
             *y += 30.0;
         };
-        let fs = self.look.text();
+        let fs = self.look.ui_text();
         // This PC: the start page with the big drive tiles
         let r = Rect::new(x, y, w, 32.0);
         let sel = self.pane().loc == Loc::ThisPc;
@@ -1777,10 +1800,11 @@ impl App {
                 }
             } else if grid {
                 let z = self.look.grid;
-                let th = Rect::new(r.x + 6.0, r.y + 6.0, 128.0 * z, 96.0 * z);
+                let (pw, ph) = grid_pic(z, self.look.grid_gap);
+                let th = Rect::new(r.cx() - pw / 2.0, r.y + 6.0, pw, ph);
                 let has_thumb = matches!(it.kind, Kind::Img | Kind::Video | Kind::Pdf);
                 let bmp = if has_thumb { self.thumb_bitmap(&it.path) } else { None };
-                let isz = 64.0 * z;
+                let isz = grid_icon(z);
                 let ir = Rect::new(th.cx() - isz / 2.0, th.cy() - isz / 2.0, isz, isz);
                 if let Some(b) = bmp {
                     let (bw, bh) = self.thumbs.get(&it.path).and_then(|x| x.as_ref()).map(|x| (x.0 as f32, x.1 as f32)).unwrap_or((128.0, 96.0));
@@ -2757,6 +2781,19 @@ impl App {
         self.dropdown(Rect::new(r.r() - 16.0 - pw, ry + 8.0, pw, 32.0), label, Hit::Set(35), t, Font::Ui);
         ry += 48.0;
         self.paint_cleanup_hidden(Rect::new(r.x, ry, r.w, 48.0), t);
+        // About: the version and a check for updates (the update card can come back here after "Later")
+        let r = Rect::new(rx, r.b() + 12.0, colw, 38.0 + 52.0 + 4.0);
+        self.set_card(r, t);
+        self.gfx.text("About", Rect::new(r.x + 16.0, r.y + 12.0, 200.0, 20.0), Font::Ui, 13.0, 600, Align::Left, t.text);
+        let sub = match &self.upd_note {
+            Some(n) => format!("Version {} \u{00B7} {n}", env!("CARGO_PKG_VERSION")),
+            None => format!("Version {}", env!("CARGO_PKG_VERSION")),
+        };
+        self.set_row(r.x, r.y + 38.0, r.w, 52.0, 0xE946, "Rust File Explorer", &sub, true, t);
+        let cl = "Check for updates";
+        let cw = self.gfx.measure(cl, Font::Ui, 13.0, 400) + 26.0;
+        let busy = self.upd_note.as_deref() == Some(crate::upd::CHECKING);
+        self.button(Rect::new(r.r() - 16.0 - cw, r.y + 38.0 + 10.0, cw, 32.0), cl, 0, if busy { Btn::Disabled } else { Btn::Std }, Hit::Set(120), t);
         // the longer column decides how far Settings scrolls
         self.settings_h = r.b().max(left_end - 12.0) + 16.0 + scroll - c.y;
         self.gfx.unclip();
@@ -2804,6 +2841,7 @@ impl App {
 
     fn paint_overlays(&mut self, t: &Theme) {
         self.paint_name_tip(t);
+        self.paint_update(t);
         if self.toast.is_some() {
             self.paint_toast(t);
         }
@@ -3135,11 +3173,19 @@ impl App {
         }
     }
 
+    /// The View menu (Command bar) ends with the size slider of the layout shown.
+    fn view_slider(&self, d: &DropMenu) -> bool {
+        d.kind == DropKind::View && !d.child && self.qs_size_on()
+    }
+
     pub fn drop_rect(&self, sub: bool) -> Option<Rect> {
         let d = if sub { self.sub.as_ref()? } else { self.drop.as_ref()? };
         let mut h = 8.0;
         for it in &d.items {
             h += 32.0 + if it.sep { 9.0 } else { 0.0 };
+        }
+        if self.view_slider(d) {
+            h += VIEW_SLIDER_H;
         }
         let (mut x, mut y) = if d.child { (d.anchor.r() + 2.0, d.anchor.y - 4.0) } else { (d.anchor.x, d.anchor.b() + 4.0) };
         if d.child && x + d.width > self.w - 4.0 {
@@ -3168,6 +3214,13 @@ impl App {
             self.menu_rows(r, &items, r.y + 4.0, Hit::SubItem, t);
         } else {
             self.menu_rows(r, &items, r.y + 4.0, Hit::Drop, t);
+            if self.drop.as_ref().is_some_and(|d| self.view_slider(d)) {
+                let y = r.b() - VIEW_SLIDER_H;
+                self.gfx.fill(Rect::new(r.x, y + 4.0, r.w, 1.0), t.divider);
+                let sh = crate::quick::SIZE_H;
+                self.paint_slider(crate::quick::Q_SIZE, Rect::new(r.x + 12.0, y + 9.0, r.w - 24.0, sh), false, t);
+                self.paint_slider(crate::quick::Q_GAP, Rect::new(r.x + 12.0, y + 9.0 + sh, r.w - 24.0, sh), false, t);
+            }
         }
         self.gfx.pop_xf();
         self.gfx.pop_layer();

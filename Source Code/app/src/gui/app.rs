@@ -90,6 +90,8 @@ pub enum Hit {
     DlgWait,
     ToastLink,
     ToastClose,
+    /// the update card: 0 Update / Try again, 1 Later
+    Upd(u8),
     FlyFree,
     StToggle(usize),
     StSort,
@@ -371,6 +373,10 @@ pub struct App {
     pub menu: Option<Menu>,
     pub dialog: Option<Dialog>,
     pub toast: Option<Toast>,
+    /// a newer version offered by the update server (upd.rs), shared with its threads
+    pub upd: super::upd::UpdState,
+    /// the result of Settings > About > Check for updates, written by its thread
+    pub upd_note: Arc<Mutex<Option<String>>>,
     /// every running animation (fades, springs, transitions, closing overlays)
     pub mo: std::cell::RefCell<Mo>,
     anim_until: std::cell::Cell<Instant>,
@@ -2426,6 +2432,7 @@ impl App {
             }
             Hit::FreeAll => self.free_all(),
             Hit::ToastClose => self.toast = None,
+            Hit::Upd(k) => self.upd_click(k),
             Hit::ToastLink => {
                 if let Some(Toast { link: Some((_, ToastAct::Relaunch(c, d))), .. }) = self.toast.take() {
                     self.test_or_spawn(&c, &d, 0);
@@ -4302,6 +4309,8 @@ pub fn run(software: bool) -> i32 {
             menu: None,
             dialog: None,
             toast: None,
+            upd: Arc::new(Mutex::new(None)),
+            upd_note: Arc::new(Mutex::new(None)),
             mo: std::cell::RefCell::new(Mo::default()),
             anim_until: std::cell::Cell::new(Instant::now()),
             offscreen,
@@ -4348,6 +4357,7 @@ pub fn run(software: bool) -> i32 {
         let ptr = Box::into_raw(app);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         ctl.hwnd.store(hwnd.0 as isize, Relaxed);
+        (*ptr).upd_schedule();
         // local control pipe for `wtm gui ...`
         let hw = hwnd.0 as isize;
         std::thread::spawn(move || {

@@ -11,12 +11,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
 
-/// Open a file or folder with its default app (like a double-click). Errors instead of showing a dialog.
+/// Open a file or folder with its default app (like a double-click): the type's default verb, which is not always
+/// "open" (a disc image's is "mount"). Errors instead of showing a dialog.
 pub fn open(path: &Path) -> Res<()> {
-    open_verb(path, "open", "")
+    open_verb(path, "", "")
 }
 
-/// Run a shell verb ("open", "edit", "print", "runas", ...) on a path, with optional arguments.
+/// Run a shell verb ("open", "edit", "print", "runas", ...; "" = the default verb) on a path, with optional arguments.
 pub fn open_verb(path: &Path, verb: &str, args: &str) -> Res<()> {
     let path = abs(path);
     if !path.exists() {
@@ -28,7 +29,7 @@ pub fn open_verb(path: &Path, verb: &str, args: &str) -> Res<()> {
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-        lpVerb: PCWSTR(v.as_ptr()),
+        lpVerb: if verb.is_empty() { PCWSTR::null() } else { PCWSTR(v.as_ptr()) },
         lpFile: PCWSTR(f.as_ptr()),
         lpParameters: if args.is_empty() { PCWSTR::null() } else { PCWSTR(a.as_ptr()) },
         lpDirectory: PCWSTR(dir.as_ptr()),

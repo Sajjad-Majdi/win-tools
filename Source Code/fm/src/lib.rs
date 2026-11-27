@@ -61,6 +61,7 @@ pub mod rx;
 pub mod search;
 pub mod shell;
 pub mod thumb;
+pub mod update;
 pub mod util;
 pub mod watch;
 pub mod zip;

@@ -35,8 +35,14 @@ pub const SIDE_MAX: f32 = 380.0;
 pub const COL_MIN: f32 = 56.0;
 pub const COL_MAX: f32 = 480.0;
 /// Grid view tile size (Quick settings slider): 1.0 = the standard 128 x 96 picture.
-pub const GRID_MIN: f32 = 0.6;
-pub const GRID_MAX: f32 = 2.0;
+pub const GRID_MIN: f32 = 0.5;
+pub const GRID_MAX: f32 = 3.0;
+/// Details view size (rows, icons, text), its own setting
+pub const LIST_MIN: f32 = 0.8;
+pub const LIST_MAX: f32 = 1.8;
+/// Spacing between items (Grid and Details apart), 1.0 = standard
+pub const GAP_MIN: f32 = 0.0;
+pub const GAP_MAX: f32 = 3.0;
 pub const NAME_MIN: f32 = 120.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +92,11 @@ pub struct Look {
     pub details: bool,
     /// Grid view tile size, GRID_MIN..=GRID_MAX (1.0 = standard)
     pub grid: f32,
+    /// Details view size, LIST_MIN..=LIST_MAX (1.0 = standard), separate from the Grid size
+    pub list: f32,
+    /// Grid spacing and Details row spacing, GAP_MIN..=GAP_MAX (1.0 = standard)
+    pub grid_gap: f32,
+    pub list_gap: f32,
 }
 
 impl Default for Look {
@@ -120,6 +131,9 @@ impl Default for Look {
             toolbar: 0,
             details: false,
             grid: 1.0,
+            list: 1.0,
+            grid_gap: 1.0,
+            list_gap: 1.0,
         }
     }
 }
@@ -172,6 +186,9 @@ impl Look {
             toolbar: (v["toolbar"].as_str() == Some("command")) as u8,
             details: b("details_pane", false),
             grid: v["grid_size"].as_f64().map(|x| (x as f32).clamp(GRID_MIN, GRID_MAX)).unwrap_or(d.grid),
+            list: v["list_size"].as_f64().map(|x| (x as f32).clamp(LIST_MIN, LIST_MAX)).unwrap_or(d.list),
+            grid_gap: v["grid_gap"].as_f64().map(|x| (x as f32).clamp(GAP_MIN, GAP_MAX)).unwrap_or(d.grid_gap),
+            list_gap: v["list_gap"].as_f64().map(|x| (x as f32).clamp(GAP_MIN, GAP_MAX)).unwrap_or(d.list_gap),
         }
     }
 
@@ -189,6 +206,9 @@ impl Look {
             "window": self.win, "tabs": self.tabs, "tab": self.tab_cur,
             "toolbar": if self.toolbar == 1 { "command" } else { "compact" }, "details_pane": self.details,
             "grid_size": (self.grid as f64 * 100.0).round() / 100.0,
+            "list_size": (self.list as f64 * 100.0).round() / 100.0,
+            "grid_gap": (self.grid_gap as f64 * 100.0).round() / 100.0,
+            "list_gap": (self.list_gap as f64 * 100.0).round() / 100.0,
         })
     }
 
@@ -201,20 +221,28 @@ impl Look {
         }
     }
 
-    /// List row height for the density.
+    /// List row height for the density, the Details size and its spacing (0 = tight, 3 = very loose).
     pub fn row_h(&self) -> f32 {
-        if self.density == 1 { 26.0 } else { 32.0 }
+        ((if self.density == 1 { 26.0 } else { 32.0 }) * self.list * (0.8 + 0.2 * self.list_gap)).round()
     }
-    /// List text size for the font setting.
-    pub fn text(&self) -> f32 {
+    /// Text grows half as fast as rows and icons.
+    fn list_text(&self) -> f32 {
+        1.0 + (self.list - 1.0) * 0.5
+    }
+    /// Sidebar and page text size for the font setting.
+    pub fn ui_text(&self) -> f32 {
         [12.0, 13.0, 14.5][self.font as usize % 3]
     }
+    /// List text size for the font setting and the Details size.
+    pub fn text(&self) -> f32 {
+        self.ui_text() * self.list_text()
+    }
     pub fn small_text(&self) -> f32 {
-        [11.5, 12.0, 13.0][self.font as usize % 3]
+        [11.5, 12.0, 13.0][self.font as usize % 3] * self.list_text()
     }
     /// Details-view icon size.
     pub fn icon(&self) -> f32 {
-        [16.0, 20.0, 24.0][self.icons as usize % 3]
+        ([16.0, 20.0, 24.0][self.icons as usize % 3] * self.list).round()
     }
     /// DWMWA_SYSTEMBACKDROP_TYPE value: 2 Mica, 4 Mica Alt (tabbed), 3 Acrylic (transient), 1 none.
     pub fn dwm_backdrop(&self) -> i32 {

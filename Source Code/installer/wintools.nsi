@@ -18,6 +18,8 @@ Caption "${APPNAME} ${VERSION} Setup"
 BrandingText "${APPNAME} ${VERSION}"
 OutFile "${OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\${APPNAME}"
+; an update (silent, from the app itself) goes where the app was installed before
+InstallDirRegKey HKCU "Software\${APPID}" "InstallDir"
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "${APPNAME}"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
@@ -38,6 +40,19 @@ VIAddVersionKey "LegalCopyright" "Sajjad"
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+!include "FileFunc.nsh"
+; /RUN (given by the app's own updater with /S): start the app again when the files are in place. The short wait
+; lets the old window finish closing first, so the new one does not hand over to it.
+Function .onInstSuccess
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/RUN" $R1
+  IfErrors run_done
+  Sleep 1500
+  Exec '"$INSTDIR\${EXE}"'
+  run_done:
+FunctionEnd
 
 !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPID}"
 

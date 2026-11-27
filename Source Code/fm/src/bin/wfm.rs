@@ -92,6 +92,8 @@ Window (RustFileExplorer.exe must be running; every command answers with one lin
   gui view-state | view-key K | view-post K | view-click X Y | view-dblclick X Y | view-hover X Y
   gui view-wheel X Y N [ctrl] | view-drag X0 Y0 X1 Y1 | view-hits [f] | view-size W H | view-shot FILE [--hover]
   gui view-close                          (the viewer's state is also in gui state, key viewer)
+  update [check] | update download        ask the update server for a newer Rust File Explorer; download saves
+                                          its setup to %TEMP% and prints the path (it does not install)
   default status                          which parts open in Rust File Explorer: folders, drives, Win+E,
                                           This PC (set/restore only from Settings, or:
                                           default set --yes / default restore --yes; --root TESTKEY for tests)
@@ -208,6 +210,7 @@ fn run(a: &Args) -> R {
     match cmd {
         "gui" => cmd_gui(a),
         "default" => cmd_default(a),
+        "update" => cmd_update(a),
         "explorer" => cmd_explorer(a),
         "props" => cmd_props(a),
         "ev" => cmd_ev(a),
@@ -1097,6 +1100,32 @@ fn gui_shot_real(file: &str) -> R {
         Ok(Out { v: json!({"ok": true, "file": file, "size": [w, h], "window": [rc.left, rc.top]}), text: format!("saved {file} ({w}x{h})
 ") })
     }
+}
+
+fn cmd_update(a: &Args) -> R {
+    use fmcore::update;
+    let what = a.pos.get(1).map(|s| s.as_str()).unwrap_or("check");
+    let o = update::check("fm", env!("CARGO_PKG_VERSION"), true).map_err(|e| (1, e))?;
+    let Some(o) = o else {
+        return Ok(Out { v: json!({"ok": true, "update": null, "current": env!("CARGO_PKG_VERSION")}), text: "up to date
+".into() });
+    };
+    let mut v = json!({"ok": true, "current": env!("CARGO_PKG_VERSION"), "update": {"version": o.version, "url": o.url, "size": o.size, "notes": o.notes}});
+    let mut t = format!("{} is available
+{}
+", o.version, o.notes.iter().map(|n| format!("  - {n}")).collect::<Vec<_>>().join("
+"));
+    match what {
+        "check" => {}
+        "download" => {
+            let p = update::download(&o, &|_, _| true).map_err(|e| (1, e))?;
+            v["file"] = json!(p.display().to_string());
+            t += &format!("saved {}
+", p.display());
+        }
+        _ => return Err(usage("update [check|download]")),
+    }
+    Ok(Out { v, text: t })
 }
 
 fn cmd_default(a: &Args) -> R {

@@ -1035,7 +1035,7 @@ impl App {
     fn move_focus(&mut self, d: i32, shift: bool, ctrl: bool) {
         let (t, p) = (self.cur, self.tab().active);
         let grid = self.tab().view == View::Grid && !self.pane().searching();
-        let cols = if grid { paint::grid_cols(pane_geoms(self, t)[p].list, self.look.grid) as i32 } else { 1 };
+        let cols = if grid { paint::grid_cols(pane_geoms(self, t)[p].list, self.look.grid, self.look.grid_gap) as i32 } else { 1 };
         // PageUp / PageDown: the rows on screen less one (the last one stays in view), as in Explorer
         let page = {
             let (_, h, view_h) = paint::row_geom(self, t, p, 0);
@@ -1070,8 +1070,8 @@ impl App {
     pub fn mouse_move(&mut self, x: f32, y: f32, down: bool) {
         self.mx = x;
         self.my = y;
-        if self.qs_drag {
-            self.qs_size_at(x);
+        if let Some(k) = self.qs_drag {
+            self.slider_at(k, x);
             return;
         }
         if let Some((x0, w0)) = self.side_drag {
@@ -1211,7 +1211,7 @@ impl App {
         if self.side_drag.take().is_some() || self.col_drag.take().is_some() {
             self.save_look();
         }
-        if std::mem::take(&mut self.qs_drag) {
+        if std::mem::take(&mut self.qs_drag).is_some() {
             self.grid_size_done();
             self.invalidate();
         }
@@ -1548,7 +1548,7 @@ impl App {
             }
         }
         // clicks outside a popup close it
-        let in_menu = matches!(h, Hit::MenuItem(_) | Hit::MenuQuick(_) | Hit::SubItem(_) | Hit::SubPin(_) | Hit::Drop(_)) || (matches!(h, Hit::Block) && (self.menu_rect().map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(false).map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(true).map(|r| r.has(x, y)).unwrap_or(false)));
+        let in_menu = matches!(h, Hit::MenuItem(_) | Hit::MenuQuick(_) | Hit::SubItem(_) | Hit::SubPin(_) | Hit::Drop(_) | Hit::Qs(_)) || (matches!(h, Hit::Block) && (self.menu_rect().map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(false).map(|r| r.has(x, y)).unwrap_or(false) || self.drop_rect(true).map(|r| r.has(x, y)).unwrap_or(false)));
         if !in_menu && (self.menu.is_some() || self.drop.is_some()) {
             let drop_was = self.drop.as_ref().map(|d| d.kind);
             let anchor_was = self.drop.as_ref().map(|d| d.anchor);
@@ -1669,10 +1669,10 @@ impl App {
             Hit::Sug(i) => self.sug_take(i, true),
             Hit::ViewBtn if !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup) => self.act(Act::ViewMenu),
             Hit::QuickBtn => self.qs_toggle(),
-            Hit::Qs(crate::quick::Q_SIZE) => {
-                // the size slider: the tiles follow the pointer until the button comes up
-                self.qs_drag = true;
-                self.qs_size_at(x);
+            Hit::Qs(k @ (crate::quick::Q_SIZE | crate::quick::Q_GAP)) => {
+                // the size and spacing sliders: the items follow the pointer until the button comes up
+                self.qs_drag = Some(k);
+                self.slider_at(k, x);
             }
             Hit::Qs(id) => self.qs_use(id),
             Hit::SortBtn => {
@@ -1818,6 +1818,7 @@ impl App {
                     j.same_for_rest = !j.same_for_rest;
                 }
             }
+            Hit::Upd(k) => self.upd_click(k),
             Hit::Toast(k) => {
                 if k == 1 {
                     let job = self.toast_job.take();
@@ -1999,7 +2000,7 @@ impl App {
         let r0 = crate::paint::item_rect(self, t, p, i);
         let r = Rect::new(r0.x, g.list.y + r0.y - self.tabs[t].panes[p].scroll, r0.w, r0.h);
         if self.tabs[t].view == View::Grid && !self.tabs[t].panes[p].searching() {
-            return Rect::new(r.x + 4.0, r.y + 8.0 + 96.0 * self.look.grid, r.w - 8.0, 42.0).has(x, y);
+            return Rect::new(r.x + 4.0, r.y + 8.0 + crate::paint::grid_pic(self.look.grid, self.look.grid_gap).1, r.w - 8.0, 42.0).has(x, y);
         }
         let isz = self.look.icon();
         let nx = r.x + 10.0 + isz + 10.0;
@@ -3864,6 +3865,7 @@ impl App {
             return self.search_set_click(k);
         }
         match k {
+            120 => self.upd_check_now(),
             // the user's own click is the only thing that ever changes the default file manager
             1 => {
                 let exe = std::env::current_exe().unwrap_or_default();

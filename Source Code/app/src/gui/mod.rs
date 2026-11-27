@@ -11,4 +11,5 @@ mod paint;
 mod perfpage;
 pub mod prefs;
 mod side;
+mod upd;
 pub mod theme;

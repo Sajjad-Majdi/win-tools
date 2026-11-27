@@ -1,4 +1,15 @@
-Rust Task Manager and Rust File Explorer 0.2.9: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.10: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.10
+- Both apps: built-in updates. When a new version is out, a card shows what changed with Update and Later;
+  Update downloads it, installs it and starts the app again. Settings > About shows the version and has
+  "Check for updates".
+- Rust File Explorer: the size slider works in Details view too, and a second slider sets the space between
+  items; Grid and Details keep their own values, and both sliders snap back to the standard mark.
+- Rust File Explorer: with the Command bar toolbar, the View menu holds both sliders.
+- Rust File Explorer: Grid items sit closer together, and the gap stays the same at every size.
+- Rust File Explorer fix: disc images (.iso) and other files whose default action is not "open" now open the
+  way a double-click in Explorer does (an .iso is mounted).
 
 New in 0.2.9
 - Rust File Explorer: Quick settings has a size slider for Grid view; tiles grow and shrink continuously

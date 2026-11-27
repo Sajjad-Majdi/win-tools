@@ -7,7 +7,7 @@
 use crate::app::*;
 use crate::gfx::{Align, Font, Rect};
 use crate::model::*;
-use crate::look::{GRID_MAX, GRID_MIN};
+use crate::look::{GAP_MAX, GAP_MIN, GRID_MAX, GRID_MIN, LIST_MAX, LIST_MIN};
 use crate::theme::{R_CTRL, R_MENU, Theme};
 use std::time::Instant;
 
@@ -17,25 +17,24 @@ pub struct Quick {
     /// the control the keyboard is on (shown with a focus ring once a key was used)
     pub focus: u8,
     pub kb: bool,
-    /// the size slider's track as drawn (a press or drag there sets the size from x)
-    pub track: Rect,
 }
 
 /// Control ids (Hit::Qs): layout tiles, sort fields, sort direction, switches, All settings.
 pub const Q_DETAILS: u8 = 0;
 pub const Q_GRID: u8 = 1;
 pub const Q_SIZE: u8 = 2;
+pub const Q_GAP: u8 = 3;
 pub const Q_SORT: u8 = 10; // 10..=13: Name, Date, Type, Size
 pub const Q_DIR: u8 = 14;
 pub const Q_PANE: u8 = 20;
 pub const Q_HIDDEN: u8 = 21;
 pub const Q_EXT: u8 = 22;
 pub const Q_ALL: u8 = 30;
-const ORDER: [u8; 12] = [Q_DETAILS, Q_GRID, Q_SIZE, Q_SORT, Q_SORT + 1, Q_SORT + 2, Q_SORT + 3, Q_DIR, Q_PANE, Q_HIDDEN, Q_EXT, Q_ALL];
+const ORDER: [u8; 13] = [Q_DETAILS, Q_GRID, Q_SIZE, Q_GAP, Q_SORT, Q_SORT + 1, Q_SORT + 2, Q_SORT + 3, Q_DIR, Q_PANE, Q_HIDDEN, Q_EXT, Q_ALL];
 const SORTS: [(&str, SortCol); 4] = [("Name", SortCol::Name), ("Date", SortCol::Date), ("Type", SortCol::Type), ("Size", SortCol::Size)];
 const W: f32 = 300.0;
 /// the size slider's row
-const SIZE_H: f32 = 28.0;
+pub const SIZE_H: f32 = 28.0;
 const PAD: f32 = 12.0;
 
 impl App {
@@ -46,26 +45,98 @@ impl App {
     fn qs_sort_on(&self) -> bool {
         !matches!(self.pane().loc, Loc::Settings | Loc::Cleanup | Loc::ThisPc)
     }
-    /// The size slider works while the folder is shown as Grid tiles.
-    fn qs_size_on(&self) -> bool {
-        self.qs_layout_on() && self.tab().view == View::Grid
+    /// The size and spacing sliders work in a folder (This PC keeps its own tiles), for the layout shown: Grid and
+    /// Details each keep their own values.
+    pub fn qs_size_on(&self) -> bool {
+        self.qs_layout_on() && self.pane().loc != Loc::ThisPc
     }
 
-    /// Grid tile size from a point on the slider track (a press or a drag), live.
-    pub fn qs_size_at(&mut self, x: f32) {
-        let Some(q) = self.qs.as_ref() else { return };
-        if !self.qs_size_on() || q.track.w <= 0.0 {
+    /// (smallest, largest, current) value of slider `k` (Q_SIZE or Q_GAP) for the layout shown.
+    fn slider_range(&self, k: u8) -> (f32, f32, f32) {
+        let grid = self.tab().view == View::Grid;
+        match (k, grid) {
+            (Q_GAP, true) => (GAP_MIN, GAP_MAX, self.look.grid_gap),
+            (Q_GAP, false) => (GAP_MIN, GAP_MAX, self.look.list_gap),
+            (_, true) => (GRID_MIN, GRID_MAX, self.look.grid),
+            _ => (LIST_MIN, LIST_MAX, self.look.list),
+        }
+    }
+
+    /// Slider `k` (Q_SIZE: item size, Q_GAP: space between items) of the layout shown (Grid and Details apart): a
+    /// small and a large sign at the ends of a continuous track, with a mark at the standard value (the knob snaps
+    /// to it). Used by Quick settings (`ring`: its keyboard focus ring) and by the Command bar's View menu.
+    pub fn paint_slider(&mut self, k: u8, row: Rect, ring: bool, t: &Theme) {
+        let on = self.qs_size_on();
+        let h = Hit::Qs(k);
+        let hk = if on { self.hk(h) } else { 0.0 };
+        let fg = if on { t.text2 } else { t.text_dis };
+        if k == Q_GAP {
+            // two small squares: close together at the left end, apart at the right end
+            let cy = row.cy();
+            for (x, gap) in [(row.x + 2.0, 2.0), (row.r() - 18.0, 8.0)] {
+                self.gfx.fill_round(Rect::new(x, cy - 2.5, 5.0, 5.0), 1.0, fg);
+                self.gfx.fill_round(Rect::new(x + 5.0 + gap, cy - 2.5, 5.0, 5.0), 1.0, fg);
+            }
+        } else {
+            let sg = if self.tab().view == View::Grid { 0xF0E2 } else { 0xE8FD };
+            self.gfx.glyph(sg, Rect::new(row.x, row.y, 16.0, SIZE_H), 10.0, fg);
+            self.gfx.glyph(sg, Rect::new(row.r() - 18.0, row.y, 18.0, SIZE_H), 16.0, fg);
+        }
+        let track = Rect::new(row.x + 26.0, row.cy() - 2.0, row.w - 26.0 - 28.0, 4.0);
+        let (lo, hi, cur) = self.slider_range(k);
+        let f = ((cur - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let kx = track.x + f * track.w;
+        self.gfx.fill_round(track, 2.0, if t.dark { t.text.a(0.16) } else { t.field_bottom.a(0.45) });
+        if on {
+            self.gfx.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, t.accent);
+        }
+        let one = track.x + (1.0 - lo) / (hi - lo) * track.w;
+        self.gfx.fill_round(Rect::new(one - 1.0, track.y - 5.0, 2.0, track.h + 10.0), 1.0, fg);
+        // the knob: a ring in the page colour with an accent dot that grows under the pointer or while dragged
+        let grab = self.qs_drag == Some(k) || hk > 0.5;
+        self.gfx.ellipse(kx, track.cy(), 9.0, t.layer2, true, 1.0);
+        self.gfx.ellipse(kx, track.cy(), 9.0, t.stroke, false, 1.0);
+        self.gfx.ellipse(kx, track.cy(), if grab { 6.0 } else { 4.5 }, if on { t.accent } else { t.text_dis }, true, 1.0);
+        if ring {
+            self.qs_ring(k, Rect::new(track.x - 10.0, row.y + 2.0, track.w + 20.0, SIZE_H - 4.0), R_CTRL, t);
+        }
+        if k == Q_GAP {
+            self.gap_track = track;
+        } else {
+            self.size_track = track;
+        }
+        if on {
+            self.hit(Rect::new(track.x - 10.0, row.y, track.w + 20.0, SIZE_H), h);
+        }
+    }
+
+    /// Slider `k` from a point on its track (a press or a drag), live. Near the standard mark it snaps to it, so the
+    /// default is easy to get back.
+    pub fn slider_at(&mut self, k: u8, x: f32) {
+        let track = if k == Q_GAP { self.gap_track } else { self.size_track };
+        if !self.qs_size_on() || track.w <= 0.0 {
             return;
         }
-        let f = ((x - q.track.x) / q.track.w).clamp(0.0, 1.0);
-        self.set_grid_size(GRID_MIN + f * (GRID_MAX - GRID_MIN));
+        let (lo, hi, _) = self.slider_range(k);
+        let f = ((x - track.x) / track.w).clamp(0.0, 1.0);
+        let z = lo + f * (hi - lo);
+        let one = track.x + (1.0 - lo) / (hi - lo) * track.w;
+        self.set_slider(k, if (x - one).abs() <= 8.0 { 1.0 } else { z });
     }
 
-    /// Set the Grid tile size (clamped); the folder re-flows at once. Saved by the caller when the change ends.
-    pub fn set_grid_size(&mut self, z: f32) {
-        let z = z.clamp(GRID_MIN, GRID_MAX);
-        if (z - self.look.grid).abs() > f32::EPSILON {
-            self.look.grid = z;
+    /// Set slider `k` for the layout shown (clamped); the folder re-flows at once. Saved by the caller when the
+    /// change ends (`grid_size_done`).
+    pub fn set_slider(&mut self, k: u8, z: f32) {
+        let (lo, hi, cur) = self.slider_range(k);
+        let z = z.clamp(lo, hi);
+        if (z - cur).abs() > f32::EPSILON {
+            let grid = self.tab().view == View::Grid;
+            *match (k, grid) {
+                (Q_GAP, true) => &mut self.look.grid_gap,
+                (Q_GAP, false) => &mut self.look.list_gap,
+                (_, true) => &mut self.look.grid,
+                _ => &mut self.look.list,
+            } = z;
             self.invalidate();
         }
     }
@@ -73,7 +144,7 @@ impl App {
     fn qs_enabled(&self, id: u8) -> bool {
         match id {
             Q_DETAILS | Q_GRID => self.qs_layout_on(),
-            Q_SIZE => self.qs_size_on(),
+            Q_SIZE | Q_GAP => self.qs_size_on(),
             Q_SORT..=Q_DIR => self.qs_sort_on(),
             _ => true,
         }
@@ -85,7 +156,7 @@ impl App {
         } else {
             self.close_popups();
             let first = ORDER.iter().copied().find(|i| self.qs_enabled(*i)).unwrap_or(Q_PANE);
-            self.qs = Some(Quick { at: Instant::now(), focus: first, kb: false, track: Rect::default() });
+            self.qs = Some(Quick { at: Instant::now(), focus: first, kb: false });
         }
         self.anim();
         self.invalidate();
@@ -101,7 +172,7 @@ impl App {
 
     fn qs_height(&self) -> f32 {
         // Layout (tiles + size slider), Sort by, three switches, the footer
-        let layout = PAD + 18.0 + 64.0 + 8.0 + SIZE_H + PAD;
+        let layout = PAD + 18.0 + 64.0 + 8.0 + SIZE_H * 2.0 + PAD;
         let sort = PAD + 18.0 + 32.0 + PAD;
         let switches = 6.0 + 3.0 * 36.0 + 6.0;
         let footer = 4.0 + 36.0 + 4.0;
@@ -149,9 +220,12 @@ impl App {
     pub fn qs_key(&mut self, vk: u16, shift: bool) -> bool {
         let Some(focus) = self.qs.as_ref().map(|q| q.focus) else { return false };
         // Left / Right on the size slider change the size (Up / Down move on)
-        if focus == Q_SIZE && matches!(vk, 0x25 | 0x27) {
+        if matches!(focus, Q_SIZE | Q_GAP) && matches!(vk, 0x25 | 0x27) {
             let step = if vk == 0x25 { -0.1 } else { 0.1 };
-            self.set_grid_size(self.look.grid + step);
+            let cur = self.slider_range(focus).2;
+            let next = cur + step;
+            // a step across the standard value stops on it
+            self.set_slider(focus, if (cur - 1.0) * (next - 1.0) < 0.0 { 1.0 } else { next });
             self.grid_size_done();
             if let Some(q) = self.qs.as_mut() {
                 q.kb = true;
@@ -242,33 +316,11 @@ impl App {
         }
         y += 64.0 + 8.0;
 
-        // Size (Grid only): a small and a large tile glyph at the ends of a continuous slider
-        let size_on = self.qs_size_on();
-        let row = Rect::new(x0, y, w0, SIZE_H);
-        let h = Hit::Qs(Q_SIZE);
-        let hk = if size_on { self.hk(h) } else { 0.0 };
-        let fg = if size_on { t.text2 } else { t.text_dis };
-        self.gfx.glyph(0xF0E2, Rect::new(row.x, row.y, 16.0, SIZE_H), 10.0, fg);
-        self.gfx.glyph(0xF0E2, Rect::new(row.r() - 18.0, row.y, 18.0, SIZE_H), 16.0, fg);
-        let track = Rect::new(row.x + 26.0, row.cy() - 2.0, row.w - 26.0 - 28.0, 4.0);
-        let f = ((self.look.grid - GRID_MIN) / (GRID_MAX - GRID_MIN)).clamp(0.0, 1.0);
-        let kx = track.x + f * track.w;
-        self.gfx.fill_round(track, 2.0, if t.dark { t.text.a(0.16) } else { t.field_bottom.a(0.45) });
-        if size_on {
-            self.gfx.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, t.accent);
-        }
-        // the knob: a ring in the page colour with an accent dot that grows under the pointer or while dragged
-        let grab = self.qs_drag || hk > 0.5;
-        self.gfx.ellipse(kx, track.cy(), 9.0, t.layer2, true, 1.0);
-        self.gfx.ellipse(kx, track.cy(), 9.0, t.stroke, false, 1.0);
-        self.gfx.ellipse(kx, track.cy(), if grab { 6.0 } else { 4.5 }, if size_on { t.accent } else { t.text_dis }, true, 1.0);
-        self.qs_ring(Q_SIZE, Rect::new(track.x - 10.0, row.y + 2.0, track.w + 20.0, SIZE_H - 4.0), R_CTRL, t);
-        if let Some(q) = self.qs.as_mut() {
-            q.track = track;
-        }
-        if size_on {
-            self.hit(Rect::new(track.x - 10.0, row.y, track.w + 20.0, SIZE_H), h);
-        }
+        // Size of the layout shown (Grid and Details apart): a small and a large glyph at the ends of a continuous
+        // slider, with a mark at the standard size (the knob snaps to it)
+        self.paint_slider(Q_SIZE, Rect::new(x0, y, w0, SIZE_H), true, t);
+        y += SIZE_H;
+        self.paint_slider(Q_GAP, Rect::new(x0, y, w0, SIZE_H), true, t);
         y += SIZE_H + PAD;
         self.gfx.fill(Rect::new(r.x, y, r.w, 1.0), t.divider);
         y += 1.0 + PAD;
@@ -369,7 +421,7 @@ mod tests {
         for id in ORDER {
             assert!(seen.insert(id));
         }
-        assert_eq!(ORDER.len(), 2 + 1 + 4 + 1 + 3 + 1);
+        assert_eq!(ORDER.len(), 2 + 2 + 4 + 1 + 3 + 1);
         assert_eq!(SORTS.len(), 4);
     }
 }

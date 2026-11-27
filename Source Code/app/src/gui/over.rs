@@ -93,6 +93,7 @@ impl App {
             let layer = Rect::new(self.cx0(), TITLE_H, self.w - self.cx0() - 12.0, self.h - TITLE_H - 12.0);
             self.paint_toast(layer);
         }
+        self.paint_update();
         if self.menu.is_some() {
             self.paint_menu(None);
         } else if let Some((m, closed)) = { self.mo.borrow().ghost_menu.clone() } {
@@ -140,7 +141,7 @@ impl App {
         }
     }
 
-    fn fly_card(&self, r: Rect) {
+    pub(super) fn fly_card(&self, r: Rect) {
         let t = self.t;
         self.gfx.shadow(r, 8.0, 8.0, 16.0, 0.13 * t.sh);
         self.gfx.shadow(r, 8.0, 1.0, 3.0, 0.06 * t.sh);

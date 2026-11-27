@@ -12,3 +12,4 @@ pub mod reg;
 pub mod services;
 pub mod startup;
 pub mod sys;
+pub mod update;

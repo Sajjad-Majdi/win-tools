@@ -684,6 +684,27 @@ impl App {
         let fa = self.lang_is_fa();
         self.segmented(rx + rw2 - 16.0, ly + r3 / 2.0, &["English", "فارسی"], if fa { 1 } else { 0 }, 2);
         ry = card.b() + 20.0;
+        // About: the version and a check for updates (the update card comes back here after "Later"); as wide as
+        // the cards above
+        let (lx, lw) = (card.x, card.w);
+        self.gfx.text_at("About", lx, ry, 20.0, 200.0, Font::Ui, 14.0, 600, t.t1);
+        ry += 28.0;
+        let ac = Rect::new(lx, ry, lw, 56.0);
+        self.gfx.card(ac, 8.0, t.card, t.card_s);
+        let note = self.upd_note.lock().unwrap().clone();
+        let cl = "Check for updates";
+        let cw = self.btn_w(cl, 0, false);
+        let tw = lw - 48.0 - 16.0 - cw - 16.0;
+        self.gfx.glyph(0xE946, Rect::new(lx + 16.0, ry, 18.0, 56.0), 16.0, t.t1);
+        self.gfx.text_at("Rust Task Manager", lx + 48.0, ry + 10.0, 18.0, tw, Font::Ui, 13.0, 400, t.t1);
+        let sub = match &note {
+            Some(n) => format!("Version {} \u{00B7} {n}", env!("CARGO_PKG_VERSION")),
+            None => format!("Version {}", env!("CARGO_PKG_VERSION")),
+        };
+        self.gfx.text_at(&sub, lx + 48.0, ry + 29.0, 16.0, tw, Font::Ui, 12.0, 400, t.t2);
+        let busy = note.as_deref() == Some(super::upd::CHECKING);
+        self.button(Rect::new(ac.r() - 16.0 - cw, ry + 12.0, cw, 32.0), cl, 0, Btn::Std, false, !busy, Hit::Upd(2));
+        ry = ac.b() + 20.0;
         self.content_h[2] = ry.max(y) + self.scroll[2] - layer.y;
         let view = Rect::new(layer.x, layer.y, layer.w, layer.h);
         self.view_h[2] = view.h;

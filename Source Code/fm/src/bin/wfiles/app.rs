@@ -66,6 +66,8 @@ pub const T_FIELD: usize = 14;
 
 /// Results of background work, applied on the UI thread.
 pub enum Msg {
+    /// the update check and download (upd.rs)
+    Upd(crate::upd::UpdMsg),
     Cleanup(u64, crate::cleanup_page::Update),
     Listed { tab: u64, pane: usize, seq: u64, res: Result<Vec<Item>, String>, ms: f64 },
     Sizes { dir: PathBuf, sizes: HashMap<String, u64>, done: bool },
@@ -161,6 +163,8 @@ pub enum Hit {
     SameChoice(u64),
     XferHead(u8),
     Toast(u8),
+    /// the update card: 0 Update / Try again, 1 Later
+    Upd(u8),
     Pal(usize),
     Dlg(u8),
     DlgRow(usize),
@@ -532,6 +536,13 @@ pub struct App {
     pub whatis: Option<WhatIs>,
     pub dp: DetailsPane,
     pub toast: Option<Toast>,
+    /// a newer version offered by the update server (the card at the bottom right)
+    pub upd: Option<crate::upd::Upd>,
+    /// the result of Settings > About > Check for updates ("Checking...", "Up to date", an error)
+    pub upd_note: Option<String>,
+    /// the size slider's track as last drawn (Quick settings or the View menu)
+    pub size_track: Rect,
+    pub gap_track: Rect,
     pub inline: Option<Inline>,
     /// where the rename box was drawn this frame, and when it last refused a character (the tip under it)
     pub inline_rect: Rect,
@@ -628,7 +639,8 @@ pub struct App {
     /// column divider drag: (column, start x, start width)
     pub col_drag: Option<(u8, f32, f32)>,
     /// the Quick settings size slider is being dragged
-    pub qs_drag: bool,
+    /// the slider being dragged (Q_SIZE or Q_GAP)
+    pub qs_drag: Option<u8>,
     /// Grid thumbnails are made at 128 px (at 96 DPI) times this (percent: 100, 150, 200), read by the thumbnail
     /// thread for each request; raised when the Grid size slider needs sharper pictures
     pub thumb_zoom: Arc<std::sync::atomic::AtomicU32>,
@@ -1635,6 +1647,7 @@ impl App {
     fn apply(&mut self, m: Msg) {
         match m {
             Msg::Cleanup(id, update) => self.cleanup_updated(id, update),
+            Msg::Upd(m) => self.upd_apply(m),
             Msg::Listed { tab, pane, seq, res, ms } => {
                 let Some((t, p)) = self.find_pane(tab, pane) else { return };
                 if self.tabs[t].panes[p].seq != seq {
@@ -2755,6 +2768,10 @@ pub fn run(o: Opts) -> i32 {
             whatis: None,
             dp: DetailsPane::default(),
             toast: None,
+            upd: None,
+            upd_note: None,
+            size_track: Rect::default(),
+            gap_track: Rect::default(),
             inline: None,
             inline_rect: Rect::default(),
             inline_tip: None,
@@ -2826,7 +2843,7 @@ pub fn run(o: Opts) -> i32 {
             press_ws: false,
             side_drag: None,
             col_drag: None,
-            qs_drag: false,
+            qs_drag: None,
             thumb_zoom: Arc::new(std::sync::atomic::AtomicU32::new(100)),
             side_open: false,
             test_mods: None,
@@ -2890,6 +2907,7 @@ pub fn run(o: Opts) -> i32 {
         // drives (with a time limit for dead network shares) and recent files, off the UI thread
         app.spawn(|| Msg::Drives(fmcore::shell::drives_within(Duration::from_millis(1500))));
         app.spawn(|| Msg::Recent(fmcore::pins::recent(4).unwrap_or_default()));
+        app.upd_schedule();
         // Follow desktop: the cached wallpaper grid at once (one small file), else read it off the UI thread
         if app.look.desktop {
             app.wall = theme::cached_wall();
@@ -3108,5 +3126,6 @@ pub fn plain_words(w: &str) -> bool {
 
 /// The thumbnail size step (percent of 128 px) that keeps Grid pictures sharp at tile size `z`.
 pub fn thumb_zoom_for(z: f32) -> u32 {
-    if z <= 1.0 { 100 } else if z <= 1.5 { 150 } else { 200 }
+    let w = crate::paint::grid_icon(z) + 24.0;
+    if w <= 128.0 { 100 } else if w <= 192.0 { 150 } else { 200 }
 }
