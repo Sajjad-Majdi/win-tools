@@ -23,7 +23,7 @@
 //! | Recycle Bin list / restore / empty | [`recycle::list_all`], [`recycle::find_item`], [`recycle::restore`], [`recycle::empty_all`] |
 //! | Search without Everything (folder walk) | [`search::walk_search`], [`search::Engine`] |
 //! | Network: shares of a server, mapped drives with a timeout | [`shell::server_shares`], [`shell::drives_within`] |
-//! | Eject a USB stick / card / DVD | [`shell::eject`] |
+//! | Eject a USB stick / card / DVD / mounted ISO, mount a disc image | [`volume::eject`], [`volume::mount_image`] |
 //! | Phones and cameras (MTP) through the Shell namespace | [`namespace::portable_devices`], [`namespace::children`], [`namespace::copy`] |
 //! | Right-click menu with app extensions | [`menu::list`], [`menu::invoke`] |
 //! | `explorer /select,` requests | [`shell::select_target`] |
@@ -63,5 +63,6 @@ pub mod shell;
 pub mod thumb;
 pub mod update;
 pub mod util;
+pub mod volume;
 pub mod watch;
 pub mod zip;

@@ -130,7 +130,7 @@ impl App {
     }
 
     fn paint_cleanup_drives(&mut self, c: Rect, t: &Theme) {
-        let drives = self.drives.clone();
+        let drives = self.scan_drives();
         let scope = self.cleanup.scope(&drives);
         let columns = if c.w >= 472.0 { 2 } else { 1 };
         let width = ((c.w - 52.0) / columns as f32 + 6.0).min(300.0);
@@ -147,7 +147,7 @@ impl App {
         for (i, d) in drives.iter().enumerate() {
             let r = Rect::new(x + (i % columns) as f32 * (width + 12.0), y + 30.0 + (i / columns) as f32 * 88.0, width, 76.0);
             let on = scope.contains(&d.root);
-            let h = hit(Drive(i));
+            let h = hit(Drive(d.root.chars().next().unwrap_or('?')));
             let scaled = self.press_in(r, h);
             self.cleanup_card(r, f32::from(on), t);
             self.gfx.fill_round(r, R_CARD, t.hover.a(t.hover.3 * self.hk(h)));
@@ -300,7 +300,7 @@ impl App {
                     right = r.x - 8.0;
                 }
                 if self.cleanup.panel.is_none() && right - x > 220.0 {
-                    let all = self.drives.iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
+                    let all = self.scan_drives().iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
                     let value = if all { "All".into() } else { scope.iter().map(|r| r.trim_end_matches('\\')).collect::<Vec<_>>().join(" ") };
                     let w = 75.0 + self.gfx.measure(&value, Font::Ui, 12.5, 400);
                     let r = Rect::new(right - w, y + 1.0, w, 30.0);

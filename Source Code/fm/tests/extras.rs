@@ -127,9 +127,21 @@ fn eject_refuses_fixed_drive() {
     let data = d.join("_data");
     let r = wfm(&data, &["eject", "C:", "--json"]);
     assert_eq!(r.code, 1);
-    assert!(r.json()["error"].as_str().unwrap().contains("not removable"), "{}", r.out);
+    assert!(r.json()["error"].as_str().unwrap().contains("cannot be ejected"), "{}", r.out);
     assert_eq!(wfm(&data, &["eject", "C:\\"]).code, 1);
     assert_eq!(wfm(&data, &["eject", "nonsense"]).code, 1);
+    // an internal disk that is not the Windows drive is refused too (not ejectable, as in Explorer)
+    let v = ok(&data, &["drives"]);
+    let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_uppercase();
+    if let Some(x) = v["drives"].as_array().unwrap().iter().find(|x| x["type"] == "fixed" && x["eject"] == "" && !x["root"].as_str().unwrap().starts_with(&sys)) {
+        let r = wfm(&data, &["eject", x["root"].as_str().unwrap(), "--json"]);
+        assert_eq!(r.code, 1);
+        assert!(r.json()["error"].as_str().unwrap().contains("cannot be ejected"), "{}", r.out);
+    }
+    // every listed drive says how it ejects ("" for internal ones)
+    for x in v["drives"].as_array().unwrap() {
+        assert!(["", "image", "device", "media"].contains(&x["eject"].as_str().unwrap()), "{x}");
+    }
     cleanup(&d);
 }
 

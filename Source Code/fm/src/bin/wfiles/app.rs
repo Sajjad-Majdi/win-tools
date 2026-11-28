@@ -74,7 +74,12 @@ pub enum Msg {
     /// search results: Everything's matches and (ranked off the UI thread) the rows to show
     /// search results; `ai` = the AI's note when "AI Search" made them
     Found { tab: u64, pane: usize, seq: u64, res: Result<(u32, Vec<Item>), String>, rows: Vec<Item>, ai: Option<String> },
-    Drives(Vec<Drive>),
+    /// a drive list (which read, the drives)
+    Drives(u64, Vec<Drive>),
+    /// an eject finished (drive root, how it was ejected)
+    Ejected { root: String, res: Result<fmcore::volume::Eject, String> },
+    /// a disc image was mounted (its new drive)
+    Mounted { path: PathBuf, res: Result<String, String> },
     Recent(Vec<fmcore::pins::Recent>),
     Thumb { path: PathBuf, img: Option<(u32, u32, Vec<u8>)> },
     /// a real shell icon (cache key, pixel size, premultiplied pixels)
@@ -502,6 +507,8 @@ pub struct App {
     pub mx: f32,
     pub my: f32,
     pub drives: Vec<Drive>,
+    /// the live drive list: notices, re-reads, ejects (drives.rs)
+    pub dw: crate::drives::DriveWatch,
     pub recent: Vec<fmcore::pins::Recent>,
     pub side: Vec<(String, u32, u32, Loc)>,
     /// the tab / sidebar item a tab or sidebar menu is for
@@ -1131,7 +1138,7 @@ impl App {
         if let Loc::Folder(dir) = &loc
             && !dir.is_dir()
         {
-            self.toast(&format!("Not found: {}", dir.display()), "", false);
+            self.toast_err(&format!("Not found: {}", dir.display()));
             return;
         }
         self.tabs[t].visit(p, loc, history);
@@ -1192,7 +1199,7 @@ impl App {
         }
     }
 
-    fn after_move(&mut self, t: usize, p: usize, search: Option<Box<SearchView>>) {
+    pub(crate) fn after_move(&mut self, t: usize, p: usize, search: Option<Box<SearchView>>) {
         let restored = search.is_some();
         {
             let pane = &mut self.tabs[t].panes[p];
@@ -1251,7 +1258,7 @@ impl App {
                         let hw = self.hwnd.0 as isize;
                         let d2 = dir.clone();
                         if let Ok(x) = fmcore::watch::Watcher::start(&w, false, move |_c| post_bg(&bg, hw, Msg::Changed { dir: d2.clone() })) {
-                            pane.watch.push(x);
+                            pane.watch.push(crate::drives::Watch::new(x, self.hwnd));
                         }
                     }
                 }
@@ -1282,9 +1289,8 @@ impl App {
                     .drives
                     .iter()
                     .map(|d| {
-                        let letter = d.root.trim_end_matches('\\').to_string();
                         Item {
-                            name: if d.label.is_empty() { drive_label(&letter) } else { format!("{} ({letter})", d.label) },
+                            name: crate::drives::drive_name(d),
                             path: PathBuf::from(&d.root),
                             is_dir: true,
                             size: if d.total > 0 { Some(d.total) } else { None },
@@ -1478,11 +1484,18 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), T_SEARCH);
         }
         let here = self.sources(self.pane().dir());
+        // a place Everything does not index (a DVD, a mounted ISO, a FAT / exFAT stick): its folders are walked
+        let walk = !self.pane().search.as_ref().is_some_and(|s| s.pc) && !here.is_empty() && here.iter().all(|d| self.unindexed(d));
         let own = self.own_places();
         let sp = self.sp.clone();
         let show_hidden = self.ui.hidden;
         let tab_id = self.tab().id;
         let p = self.tab().active;
+        // the pane's previous folder walk (if one runs) stops: this search replaces it
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(old) = WALK_STOP.lock().unwrap().insert((tab_id, p), stop.clone()) {
+            old.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(s) = self.pane_mut().search.as_mut() else { return };
         let seq = s.next_request();
         let words = s.field.text.trim().to_string();
@@ -1550,7 +1563,7 @@ impl App {
             // the 200 newest matches (attributes are not indexed: every extra row is read from disk), then a fast
             // second look (~20 ms) for names that START with the words: they rank best and may be older
             let req = fmcore::evipc::REQ_NAME | fmcore::evipc::REQ_PATH | fmcore::evipc::REQ_SIZE | fmcore::evipc::REQ_MODIFIED | fmcore::evipc::REQ_ATTRS;
-            let mut r = fmcore::evipc::query(&q, 200, req, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(3));
+            let mut r = if walk { Err(String::new()) } else { fmcore::evipc::query(&q, 200, req, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(3)) };
             if let (Ok(r1), Some(pq)) = (r.as_mut(), prefix.as_ref())
                 && r1.total as usize > r1.items.len()
                 && let Ok(r2) = fmcore::evipc::query(pq, 100, req, fmcore::evipc::SORT_DATE_MODIFIED_DESC, false, Duration::from_secs(2))
@@ -1586,14 +1599,15 @@ impl App {
                     let gone = (n - items.len()) as u32;
                     Ok((r.total.saturating_sub(gone), items))
                 }
-                // Everything not running: the folder walk from fmcore (slower, this place only: every real folder)
+                // Everything not running, or a place it does not index: the folder walk from fmcore (slower, this
+                // place only: every real folder; stopped by a newer search)
                 Err(_) => {
                     let mut all = vec![];
                     let mut err = None;
                     for dir in if here.is_empty() { vec![None] } else { here.iter().cloned().map(Some).collect() } {
-                        let q = fmcore::search::Query { words: words.split_whitespace().map(|s| s.to_string()).collect(), in_dir: dir, top: 300, engine: fmcore::search::Engine::Walk, walk_limit_ms: 3000, ..Default::default() };
+                        let q = fmcore::search::Query { words: words.split_whitespace().map(|s| s.to_string()).collect(), in_dir: dir, top: 300, engine: fmcore::search::Engine::Walk, walk_limit_ms: 3000, stop: Some(stop.clone()), ..Default::default() };
                         match fmcore::search::search(&q) {
-                            Ok(f) => all.extend(f.hits.into_iter().map(|h| {
+                            Ok(f) => all.extend(f.hits.into_iter().filter(|h| show_hidden || h.attrs & 0x2 == 0 && !h.name.starts_with('.')).map(|h| {
                                 let folder = Path::new(&h.path).parent().map(|p| p.display().to_string()).unwrap_or_default();
                                 item(h.name.clone(), PathBuf::from(&h.path), folder, h.is_dir, h.size, h.modified, h.attrs)
                             })),
@@ -1702,6 +1716,8 @@ impl App {
                     Err(e) => {
                         pn.items.clear();
                         pn.error = Some(e);
+                        // its drive was ejected or unplugged (or the folder deleted): up to what still exists, no error page
+                        self.left_gone_folder(t, p);
                     }
                 }
                 self.anim();
@@ -1759,17 +1775,9 @@ impl App {
                 pn.focus = None;
                 pn.anchor = None;
             }
-            Msg::Drives(d) => {
-                self.drives = d;
-                self.cleanup_drives_ready();
-                for t in 0..self.tabs.len() {
-                    for p in 0..self.tabs[t].panes.len() {
-                        if self.tabs[t].panes[p].loc == Loc::ThisPc {
-                            self.load(t, p, true);
-                        }
-                    }
-                }
-            }
+            Msg::Drives(seq, d) => self.drives_arrived(seq, d),
+            Msg::Ejected { root, res } => self.ejected(root, res),
+            Msg::Mounted { path, res } => self.mounted(path, res),
             Msg::Recent(r) => self.recent = r,
             Msg::Thumb { path, img } => {
                 self.thumbs.insert(path.clone(), img);
@@ -2028,6 +2036,10 @@ impl App {
     /// Same, knowing the item's attributes and time (folders with their own icon: read-only / system + desktop.ini).
     #[allow(clippy::too_many_arguments)]
     pub fn item_icon_a(&mut self, path: &Path, name: &str, is_dir: bool, attrs: u32, modified: u64, kind: crate::ficons::Kind, r: crate::gfx::Rect, t: &crate::theme::Theme) {
+        // a DVD drive or a mounted ISO: the disc, as in the sidebar and on This PC
+        if kind == crate::ficons::Kind::Drive && self.is_disc(path) {
+            return crate::ficons::disc(&self.gfx, t, r);
+        }
         match self.icon_bitmap(path, name, is_dir, attrs, modified, r.w) {
             Some(b) => self.gfx.bitmap(&b, r, 1.0),
             None => crate::ficons::draw(&self.gfx, t, kind, r),
@@ -2086,7 +2098,7 @@ impl App {
                         "search": p.search.as_ref().map(|s| json!({"text": s.field.text, "this_pc": s.pc, "total": s.total, "busy": s.busy, "note": s.note})),
                         "loading": p.loading, "error": p.error, "scroll": p.scroll,
                         "folder_sizes_known": p.items.iter().filter(|i| i.is_dir && i.size.is_some()).count(),
-                        "back": p.back.len(), "forward": p.fwd.len(),
+                        "back": p.back.len(), "forward": p.fwd.len(), "watching": p.watch.len(),
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -2132,7 +2144,7 @@ impl App {
             "look": self.look.to_json(), "marquee": self.marquee.is_some(), "hover": format!("{:?}", self.hover),
             "surfaces": self.surfaces(),
             "size": [self.w, self.h], "rail": self.rail(),
-            "drives": self.drives.len(), "sidebar": self.side.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
+            "drives": self.drives.len(), "drive_list": self.drives_json(), "sidebar": self.side.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
             "ai_buttons": self.ai_on,
             "cleanup": self.cleanup_status(),
             "first_paint_ms": self.first_paint_ms, "first_list_ms": self.first_list_ms,
@@ -2164,7 +2176,12 @@ pub fn humanize(e: &str) -> String {
             continue;
         }
         let mut j = i + 2;
-        while j < cs.len() {
+        // a bare drive root before a space ("G:\ is in use ...") is the whole path
+        let bare_root = cs[i] != '\\' && i + 3 < cs.len() && cs[i + 3] == ' ';
+        if bare_root {
+            j = i + 3;
+        }
+        while !bare_root && j < cs.len() {
             let rest: String = cs[j..cs.len().min(j + 4)].iter().collect();
             if cs[j] == '"' || cs[j] == '\'' || rest.starts_with(": ") || rest.starts_with(", ") || (rest.starts_with(" to ") && starts(j + 4)) {
                 break;
@@ -2199,6 +2216,9 @@ mod humanize_tests {
         assert_eq!(super::humanize(r#"cannot open "C:\Program Files\App\x y.dll": access denied"#), "Cannot open \u{201C}x y.dll\u{201D}: access denied");
         assert_eq!(super::humanize(r"cannot move C:\a b\c d.txt to D:\e f\g: in use"), "Cannot move \u{201C}c d.txt\u{201D} to \u{201C}g\u{201D}: in use");
         assert_eq!(super::humanize("no path here"), "No path here");
+        // a bare drive root ends at its backslash (the sentence after it is not a path)
+        assert_eq!(super::humanize(r"G:\ is in use. Close the files, then try again."), "\u{201C}G:\\\u{201D} is in use. Close the files, then try again.");
+        assert_eq!(super::humanize(r"cannot open G:\: access denied"), "Cannot open \u{201C}G:\\\u{201D}: access denied");
     }
 }
 
@@ -2526,10 +2546,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     app.close_popups();
                     // the window lost the keys: a rename in progress is kept, as in Explorer
                     app.inline_blur();
-                } else if app.assoc_stale {
-                    // back from Windows' app picker: a new default app brings its own file icons
-                    app.assoc_stale = false;
-                    app.refresh_type_icons();
+                } else {
+                    if app.assoc_stale {
+                        // back from Windows' app picker: a new default app brings its own file icons
+                        app.assoc_stale = false;
+                        app.refresh_type_icons();
+                    }
+                    // a drive may have come or gone while another window was in front
+                    app.drives_on_activate();
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2563,6 +2587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
+            WM_DEVICECHANGE => app.on_device_change(wp.0, lp.0),
             m if m == WM_IPC => {
                 let jobs: Vec<(String, std::sync::mpsc::Sender<String>)> = app.ipc_in.lock().unwrap().drain(..).collect();
                 for (line, tx) in jobs {
@@ -2581,6 +2606,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // one process, one message loop: the picture viewer closes with the main window
                 crate::viewer::close();
                 app.stop_cleanup_review();
+                app.drives_watch_stop();
                 // remember where we were (start page "Last session"), the tabs and the window's place
                 if let Some(p) = app.pane().loc.path() {
                     app.look.last = p.display().to_string();
@@ -2740,6 +2766,7 @@ pub fn run(o: Opts) -> i32 {
             mx: -1.0,
             my: -1.0,
             drives: vec![],
+            dw: Default::default(),
             cleanup: crate::cleanup_page::Page::default(),
             recent: vec![],
             side: vec![],
@@ -2905,7 +2932,9 @@ pub fn run(o: Opts) -> i32 {
         trace(&format!("{:.1} ms: side + tab", started.elapsed().as_secs_f64() * 1000.0));
         app.tabs[0].panes[0].want = select;
         // drives (with a time limit for dead network shares) and recent files, off the UI thread
-        app.spawn(|| Msg::Drives(fmcore::shell::drives_within(Duration::from_millis(1500))));
+        app.refresh_drives();
+        // and from now on every drive that comes or goes (ISO mounted, USB plugged, disc in, network drive mapped ...):
+        // registered right after the first frame (the shell registration costs a few ms)
         app.spawn(|| Msg::Recent(fmcore::pins::recent(4).unwrap_or_default()));
         app.upd_schedule();
         // Follow desktop: the cached wallpaper grid at once (one small file), else read it off the UI thread
@@ -3117,6 +3146,9 @@ impl App {
 type SearchJob = ((u64, usize), Box<dyn FnOnce() -> Msg + Send>, Arc<Mutex<Vec<Msg>>>, isize);
 /// The waiting searches (at most one per pane) for the single search thread.
 static SEARCH_SLOT: std::sync::LazyLock<(Mutex<Vec<SearchJob>>, Condvar)> = std::sync::LazyLock::new(|| (Mutex::new(vec![]), Condvar::new()));
+/// Per pane (tab id, pane): the stop flag of its newest search's folder walk.
+type StopFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+static WALK_STOP: std::sync::LazyLock<Mutex<HashMap<(u64, usize), StopFlag>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Words with no Everything syntax (no operators, wildcards, quotes, paths or field: terms): safe to filter locally
 /// and to use in a startwith: query.

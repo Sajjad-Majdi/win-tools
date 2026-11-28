@@ -72,6 +72,17 @@ pub fn folder_front(g: &Gfx, t: &Theme, r: Rect, top: f32) {
 }
 
 /// Draw the icon in the square `r` (its size is r.w).
+/// A disc (DVD drive, mounted ISO): the drive icon's colours on a round disc with its hole.
+pub fn disc(g: &Gfx, t: &Theme, r: Rect) {
+    let k = r.w / 20.0;
+    let (cx, cy) = (r.x + 10.0 * k, r.y + 10.0 * k);
+    g.ellipse(cx, cy, 8.2 * k, t.page.mix(t.accent, 0.25), true, 1.0);
+    g.ellipse(cx, cy, 8.2 * k, t.page_stroke, false, k.max(1.0));
+    g.ellipse(cx, cy, 3.4 * k, t.page, true, 1.0);
+    g.ellipse(cx, cy, 3.4 * k, t.page_stroke, false, (0.8 * k).max(1.0));
+    g.ellipse(cx, cy, 1.1 * k, t.page_stroke, true, 1.0);
+}
+
 pub fn draw(g: &Gfx, t: &Theme, kind: Kind, r: Rect) {
     let k = r.w / 20.0;
     let (ox, oy) = (r.x, r.y);

@@ -49,15 +49,29 @@ pub fn folder_title(p: &Path) -> String {
     }
 }
 
-/// "Local Disk (C:)" style name for a drive root ("C:").
+/// "Local Disk (C:)" style name for a drive root ("C:"), from the last drive list (painting never waits on a disk).
+/// Before the first list only a local fixed disk is asked for its label (instant); a share root keeps its path.
 pub fn drive_label(letter: &str) -> String {
-    let root = format!("{}\\", letter.trim_end_matches('\\'));
-    let w = fmcore::util::wide(&root);
-    let mut name = [0u16; 128];
-    let ok = unsafe { windows::Win32::Storage::FileSystem::GetVolumeInformationW(windows::core::PCWSTR(w.as_ptr()), Some(&mut name), None, None, None, None) }.is_ok();
-    let label = if ok { String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(0)]) } else { String::new() };
     let l = letter.trim_end_matches('\\');
-    if label.is_empty() { format!("Local Disk ({l})") } else { format!("{label} ({l})") }
+    let b = l.as_bytes();
+    if b.len() != 2 || b[1] != b':' {
+        return l.to_string();
+    }
+    if let Some(n) = crate::drives::cached_name(l) {
+        return n;
+    }
+    let w = fmcore::util::wide(format!("{l}\\"));
+    let kind = match unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(w.as_ptr())) } {
+        2 => "removable",
+        4 => "network",
+        5 => "cdrom",
+        6 => "ramdisk",
+        _ => "fixed",
+    };
+    let mut name = [0u16; 128];
+    let ok = kind == "fixed" && unsafe { windows::Win32::Storage::FileSystem::GetVolumeInformationW(windows::core::PCWSTR(w.as_ptr()), Some(&mut name), None, None, None, None) }.is_ok();
+    let label = if ok { String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(0)]) } else { String::new() };
+    if label.is_empty() { format!("{} ({l})", crate::drives::generic_name(kind, "")) } else { format!("{label} ({l})") }
 }
 
 #[derive(Clone, Debug)]
@@ -504,7 +518,7 @@ pub struct Pane {
     pub shown_at: Instant,
     pub back_anim: bool,
     /// the folder's watchers (the Desktop also watches the Public Desktop)
-    pub watch: Vec<fmcore::watch::Watcher>,
+    pub watch: Vec<crate::drives::Watch>,
     pub hidden_count: usize,
     /// keyboard focus ring visible (set by arrow keys)
     pub kb: bool,

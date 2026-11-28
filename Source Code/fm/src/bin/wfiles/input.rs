@@ -208,6 +208,8 @@ impl App {
         }
         if refresh {
             self.refresh_all();
+            // free space on the drives changed (This PC's bars)
+            self.drives_changed();
         }
         self.invalidate();
     }
@@ -230,6 +232,12 @@ impl App {
                 T_RELIST => {
                     let _ = KillTimer(Some(self.hwnd), T_RELIST);
                     self.refresh_all();
+                }
+                crate::drives::T_DRIVES | crate::drives::T_DRIVES2 => self.drives_timer(id),
+                crate::drives::T_HOLD => self.hold_timer(),
+                crate::drives::T_WATCH => {
+                    let _ = KillTimer(Some(self.hwnd), id);
+                    self.drives_watch_start();
                 }
                 T_SEARCH => {
                     let _ = KillTimer(Some(self.hwnd), T_SEARCH);
@@ -356,6 +364,12 @@ impl App {
             crate::viewer::open(self, list, idx);
             return;
         }
+        // a disc image whose default action is Windows' "Mount": mount it here (off the UI thread) and open the new
+        // drive in a new tab, as Explorer opens it after mounting; This PC shows it at once
+        if fmcore::volume::mounts_by_default(&it.ext()) {
+            self.mount_and_open(it.path.clone());
+            return;
+        }
         let p = it.path.clone();
         // pictures, videos and songs get their folder neighbours in the list's order (arrow keys in Photos)
         let (col, desc) = self.pane().sort;
@@ -448,6 +462,16 @@ impl App {
         let sel = self.sel_items();
         let paths: Vec<PathBuf> = sel.iter().map(|i| i.path.clone()).collect();
         let dir = self.the_dir();
+        // a DVD, a mounted ISO or a write-protected card: nothing is cut, renamed, deleted, made or pasted there
+        // (the menus and the toolbar do not offer it; a key press says why)
+        let into_dir = matches!(a, Act::Paste | Act::NewFolder | Act::NewDocument(..) | Act::NewMenu | Act::Zip | Act::ExtractHere | Act::ExtractTo)
+            || (a == Act::PasteInto && sel.len() != 1);
+        let on_sel = matches!(a, Act::Cut | Act::Rename | Act::BatchRename | Act::Delete | Act::DeleteForGood | Act::MoveToMenu | Act::PasteInto);
+        let ro = if into_dir { dir.as_deref().filter(|d| self.read_only_at(d)) } else if on_sel { paths.iter().map(|p| p.as_path()).find(|p| self.read_only_at(p)) } else { None };
+        if let Some(p) = ro {
+            let name = crate::drives::cached_name(&p.to_string_lossy()).unwrap_or_else(|| p.display().to_string());
+            return self.toast_err(&format!("{name} is read-only: nothing can be changed there"));
+        }
         match a {
             Act::Cleanup(crate::cleanup_page::Command::SideDrive) => self.side_act(a),
             Act::Cleanup(cmd) => self.cleanup_action(cmd, paths.first().cloned()),
@@ -681,7 +705,11 @@ impl App {
                 }
             }
             Act::Palette => self.palette_open(""),
-            Act::Refresh => self.refresh_all(),
+            Act::Refresh => {
+                self.refresh_all();
+                // F5 reads the drives again too (This PC's free space, a drive Windows did not announce)
+                self.refresh_drives();
+            }
             Act::ToggleHidden => {
                 self.ui.hidden = !self.ui.hidden;
                 self.save_ui();
@@ -696,14 +724,8 @@ impl App {
             }
             Act::Eject => {
                 if let Some(it) = sel.first() {
-                    let root = it.path.to_string_lossy().trim_end_matches('\\').to_string();
-                    match fmcore::shell::eject(&root) {
-                        Ok(()) => {
-                            self.toast(&format!("{root} can be removed now"), "", false);
-                            self.spawn(|| Msg::Drives(fmcore::shell::drives_within(Duration::from_millis(1500))));
-                        }
-                        Err(e) => self.toast_err(&e),
-                    }
+                    let root = it.path.clone();
+                    self.eject_drive(&root);
                 }
             }
             Act::EmptyBin => {
@@ -806,15 +828,17 @@ impl App {
             Loc::Folder(p) => {
                 let is_drive = i >= side_n && i < side_n + self.drives.len();
                 if is_drive {
-                    let removable = self.drives.get(i - side_n).map(|d| d.kind == "removable").unwrap_or(false);
-                    if removable {
-                        items.push(MItem::new("Eject", 0xE7E7, Act::SideEject).sep());
+                    // mounted ISO / VHD, USB stick or disk, DVD, card: Eject, as in Explorer (never internal disks)
+                    if !self.eject_kind_of(p).is_empty() {
+                        let mut e = MItem::new("Eject", 0xF847, Act::SideEject).sep();
+                        e.enabled = !self.is_ejecting(p);
+                        items.push(e);
                     }
                 } else if i < side_n && fmcore::pins::pins().iter().any(|x| fmcore::util::path_eq(Path::new(&x.path), p)) {
                     items.push(MItem::new("Unpin from sidebar", 0xE77A, Act::SideUnpin).sep());
                 }
                 items.push(MItem::new("Copy path", 0xE71B, Act::SideCopyPath).sep());
-                if is_drive {
+                if is_drive && !self.is_disc(p) {
                     items.push(MItem::new("Clean up", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::SideDrive)).sep());
                 }
                 let mut props = MItem::new("Properties", 0xE946, Act::SideProps);
@@ -849,14 +873,7 @@ impl App {
             }
             Act::SideEject => {
                 if let Some(p) = path {
-                    let root = p.to_string_lossy().trim_end_matches('\\').to_string();
-                    match fmcore::shell::eject(&root) {
-                        Ok(()) => {
-                            self.toast(&format!("{root} can be removed now"), "", false);
-                            self.spawn(|| Msg::Drives(fmcore::shell::drives_within(Duration::from_millis(1500))));
-                        }
-                        Err(e) => self.toast_err(&e),
-                    }
+                    self.eject_drive(&p);
                 }
             }
             Act::SideCopyPath => {
@@ -891,6 +908,10 @@ impl App {
             Ok(_) => Msg::Toast { text: format!("{} {n} item{}", if permanent { "Deleted" } else { "Moved to the Recycle Bin:" }, if n == 1 { "" } else { "s" }), undo: !permanent },
             Err(e) => Msg::ToastErr(e),
         });
+        if permanent {
+            // free space comes back (This PC's bars)
+            self.drives_changed();
+        }
     }
 
     fn empty_bin(&mut self) {
@@ -899,6 +920,7 @@ impl App {
             Err(e) => self.toast_err(&e),
         }
         self.refresh_all();
+        self.drives_changed();
     }
 
     fn purge_selected(&mut self) {
@@ -914,6 +936,7 @@ impl App {
             None => self.toast(&format!("Deleted {} item{} for good", recs.len(), if recs.len() == 1 { "" } else { "s" }), "", false),
         }
         self.refresh_all();
+        self.drives_changed();
     }
 
     pub fn undo(&mut self) {
@@ -2218,7 +2241,7 @@ impl App {
                     self.pane_mut().want = Some(p.clone());
                 }
             } else {
-                self.toast(&format!("Not found: {}", p.display()), "", false);
+                self.toast_err(&format!("Not found: {}", p.display()));
             }
         } else if s.eq_ignore_ascii_case("this pc") {
             self.go(Loc::ThisPc);
@@ -3127,12 +3150,13 @@ impl App {
         let mut items = vec![];
         if bg || paths.is_empty() {
             let folder = self.pane().loc.path().is_some();
+            let writable = folder && !self.pane().dir().is_some_and(|d| self.read_only_at(&d));
             let mut p = MItem::new("Paste", 0xE77F, Act::Paste).keys("Ctrl+V");
-            p.enabled = !crate::dnd::clipboard_files().0.is_empty() && folder;
+            p.enabled = writable && !crate::dnd::clipboard_files().0.is_empty();
             items.push(p);
             let mut n = MItem::new("New", 0xE710, Act::NewMenu);
             n.sub = true;
-            n.enabled = folder;
+            n.enabled = writable;
             items.push(n);
             items.push(MItem::new("Select all", 0xE8B3, Act::SelectAll).keys("Ctrl+A"));
             let mut v = MItem::new("View", 0xE8FD, Act::ViewMenu).sep();
@@ -3165,11 +3189,16 @@ impl App {
             items.push(explorer_item());
             items.push(pin_item(Some(&sel[0].path)));
             items.push(MItem::new("Copy path", 0xE71B, Act::CopyPath));
-            let removable = self.drives.iter().any(|d| fmcore::util::path_eq(std::path::Path::new(&d.root), &sel[0].path) && d.kind == "removable");
-            if removable {
-                items.push(MItem::new("Eject", 0xE7E7, Act::Eject).sep());
+            // mounted ISO / VHD, USB stick or disk, DVD, card: Eject, as in Explorer (never internal disks)
+            if !self.eject_kind_of(&sel[0].path).is_empty() {
+                let mut e = MItem::new("Eject", 0xF847, Act::Eject).sep();
+                e.enabled = !self.is_ejecting(&sel[0].path);
+                items.push(e);
             }
-            items.push(MItem::new("Clean up", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::Drive)).sep());
+            // a disc (DVD, mounted ISO) is read-only: nothing to clean up there
+            if !self.is_disc(&sel[0].path) {
+                items.push(MItem::new("Clean up", crate::cleanup_page::BROOM, Act::Cleanup(crate::cleanup_page::Command::Drive)).sep());
+            }
             items.push(MItem::new("Properties", 0xE946, Act::Properties).keys("Alt+Enter").sep());
             self.menu = Some(CtxMenu { x, y, items, paths, bg: true, seq, loading: false, shell: vec![], apps: vec![], at: Instant::now() });
             return;
@@ -3181,6 +3210,8 @@ impl App {
             return;
         }
         let one = sel.len() == 1;
+        // on a DVD / mounted ISO only reading actions are offered (Cut, Rename and Delete are dimmed in the strip)
+        let ro = paths.iter().any(|p| self.read_only_at(p));
         let mut o = MItem::new("Open", 0xE8E5, Act::Open).keys("Enter");
         o.bold = true;
         items.push(o);
@@ -3198,7 +3229,7 @@ impl App {
             items.push(explorer_item());
         }
         items.push(MItem::new("Preview", 0xE7B3, Act::Preview).keys("Space"));
-        if one && sel[0].is_archive() {
+        if one && sel[0].is_archive() && !ro {
             let stem = archive_stem(&sel[0].name);
             items.push(MItem::new(&format!("Extract to \u{201C}{stem}\\\u{201D}"), 0xE8B5, Act::ExtractTo));
             items.push(MItem::new("Extract here", 0xE8B5, Act::ExtractHere));
@@ -3207,15 +3238,17 @@ impl App {
         let mut ct = MItem::new("Copy to", 0xE8C8, Act::CopyToMenu).sep();
         ct.sub = true;
         items.push(ct);
-        let mut mt = MItem::new("Move to", 0xE8DE, Act::MoveToMenu);
-        mt.sub = true;
-        items.push(mt);
-        if one && sel[0].is_dir {
+        if !ro {
+            let mut mt = MItem::new("Move to", 0xE8DE, Act::MoveToMenu);
+            mt.sub = true;
+            items.push(mt);
+        }
+        if one && sel[0].is_dir && !ro {
             let mut p = MItem::new("Paste into folder", 0xE77F, Act::PasteInto);
             p.enabled = !crate::dnd::clipboard_files().0.is_empty();
             items.push(p);
         }
-        if !(one && sel[0].is_archive()) {
+        if !(one && sel[0].is_archive()) && !ro {
             items.push(MItem::new("Compress to zip", 0xF012, Act::Zip));
         }
         if one && sel[0].is_dir {
@@ -3429,8 +3462,10 @@ impl App {
             }
             DropKind::CopyTo | DropKind::MoveTo => {
                 let tab = self.tab();
+                // only places that can be written to: never a DVD, a mounted ISO or a write-protected card
                 if tab.split()
                     && let Some(d) = tab.panes[1 - tab.active].dir()
+                    && !self.read_only_at(&d)
                 {
                     let mut m = MItem::new(&format!("Other pane: {}", folder_title(&d)), 0xE8A9, Act::None);
                     m.shell = Some(d.display().to_string());
@@ -3438,15 +3473,16 @@ impl App {
                     v.push(m);
                 }
                 for (name, _, _, loc) in &self.side {
-                    if let Loc::Folder(p) = loc {
+                    if let Loc::Folder(p) = loc
+                        && !self.read_only_at(p)
+                    {
                         let mut m = MItem::new(name, 0xE8B7, Act::None);
                         m.shell = Some(p.display().to_string());
                         v.push(m);
                     }
                 }
-                for d in &self.drives {
-                    let letter = d.root.trim_end_matches('\\');
-                    let mut m = MItem::new(&if d.label.is_empty() { drive_label(letter) } else { format!("{} ({letter})", d.label) }, 0xEDA2, Act::None);
+                for d in self.drives.iter().filter(|d| d.ready && !d.read_only) {
+                    let mut m = MItem::new(&crate::drives::drive_name(d), 0xEDA2, Act::None);
                     m.shell = Some(d.root.clone());
                     v.push(m);
                 }
@@ -3527,7 +3563,7 @@ impl App {
             return;
         }
         match kind {
-            DropKind::CleanupScope => self.cleanup_toggle_scope(it.value as usize),
+            DropKind::CleanupScope => self.cleanup_toggle_scope(it.shell.clone()),
             DropKind::CleanupHidden => self.cleanup_apply_drop(it),
             DropKind::New | DropKind::CmdMore => self.act(it.act),
             DropKind::View => {

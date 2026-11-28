@@ -10,6 +10,7 @@ use fmcore::{ai, models};
 mod app;
 mod ask;
 mod cleanup_page;
+mod drives;
 mod dnd;
 mod ficons;
 mod fmt;

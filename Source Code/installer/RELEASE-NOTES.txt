@@ -1,4 +1,16 @@
-Rust Task Manager and Rust File Explorer 0.2.10: a fast Task Manager and a fast file manager for Windows 10/11.
+Rust Task Manager and Rust File Explorer 0.2.11: a fast Task Manager and a fast file manager for Windows 10/11.
+
+New in 0.2.11
+- Rust File Explorer: the drive list is live. A mounted .iso, a USB stick, a DVD, a subst or a mapped network drive
+  shows up or goes away at once, without restarting; a pane inside a removed drive moves to This PC.
+- Rust File Explorer: Eject in the right-click menu of a drive (This PC and the sidebar) for disc images, USB drives
+  and DVDs. If a program still uses the drive, it says so and nothing is forced.
+- Rust File Explorer: read-only discs (DVDs, mounted .iso) get a disc icon, no "almost full" bar, and no
+  New, Cut, Rename or Delete; they are not offered in Copy to and Move to.
+- Rust File Explorer: search also works inside discs and other drives the search index does not cover.
+- Rust File Explorer: Enter on an .iso that is already mounted opens its tab instead of a new one.
+- Rust File Explorer fixes: the Details pane shows the right size and dates for files on a disc; the Cleanup
+  drive menu follows drive changes; a slow search reply no longer closes the app; less memory at idle.
 
 New in 0.2.10
 - Both apps: built-in updates. When a new version is out, a card shows what changed with Update and Later;

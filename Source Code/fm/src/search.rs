@@ -31,6 +31,8 @@ pub struct Query {
     pub engine: Engine,
     /// Time limit of the folder walk in ms (0 = 5000).
     pub walk_limit_ms: u64,
+    /// Set by the caller to stop a folder walk early (a newer search replaced this one).
+    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Search engine choice.
@@ -312,7 +314,7 @@ pub fn walk_search(q: &Query) -> Res<Found> {
     let mut complete = true;
     let mut queue = std::collections::VecDeque::from([root.clone()]);
     'walk: while let Some(d) = queue.pop_front() {
-        if std::time::Instant::now() > deadline {
+        if std::time::Instant::now() > deadline || q.stop.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
             complete = false;
             break;
         }

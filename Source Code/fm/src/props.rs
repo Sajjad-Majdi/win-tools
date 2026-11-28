@@ -128,11 +128,31 @@ fn shown(k: &PROPERTYKEY, pv: &PROPVARIANT) -> String {
     s.chars().filter(|c| !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}')).collect()
 }
 
+/// Size and dates of the file system's own record (None for the other properties).
+fn fs_value(key: &str, m: &std::fs::Metadata) -> Option<PROPVARIANT> {
+    use windows::Win32::System::Com::StructuredStorage::InitPropVariantFromFileTime;
+    let time = |t: std::io::Result<std::time::SystemTime>| -> Option<PROPVARIANT> {
+        // 100 ns steps since 1601
+        let n = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64 / 100 + 116_444_736_000_000_000;
+        let ft = windows::Win32::Foundation::FILETIME { dwLowDateTime: n as u32, dwHighDateTime: (n >> 32) as u32 };
+        unsafe { InitPropVariantFromFileTime(&ft) }.ok()
+    };
+    match key {
+        "System.Size" if m.is_file() => Some(PROPVARIANT::from(m.len())),
+        "System.DateCreated" => time(m.created()),
+        "System.DateModified" => time(m.modified()),
+        _ => None,
+    }
+}
+
 /// The properties of a file to show (a value only when it has one; writable ones also when empty, to fill in).
 pub fn read(path: &Path) -> Res<Vec<Prop>> {
     let _c = com();
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let is_dir = path.is_dir();
+    let meta = std::fs::metadata(path).ok();
+    let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+    // a read-only file (every file on a DVD or a mounted ISO) cannot take new values
+    let read_only = meta.as_ref().is_some_and(|m| m.permissions().readonly());
     let st = store(path, GPS_BESTEFFORT)?;
     // which values this file's handler can change (the same check Explorer's pane makes)
     let caps: Option<IPropertyStoreCapabilities> = st.cast().ok();
@@ -140,13 +160,15 @@ pub fn read(path: &Path) -> Res<Vec<Prop>> {
     let list = if is_dir { &[][..] } else { keys_for(group_of(&name)) };
     for (key, label) in list.iter().chain(COMMON.iter()) {
         let Ok(k) = key_of(key) else { continue };
-        let pv = unsafe { st.GetValue(&k) }.unwrap_or_default();
+        // size and dates come from the file system, as in the list: the shell's store of a disc (DVD, mounted
+        // ISO) says 0 bytes and has no dates
+        let pv = meta.as_ref().and_then(|m| fs_value(key, m)).unwrap_or_else(|| unsafe { st.GetValue(&k) }.unwrap_or_default());
         let common = COMMON.iter().any(|c| c.0 == *key);
         let d = description(&k);
         let innate = d.as_ref().and_then(|d| unsafe { d.GetTypeFlags(PDTF_ISINNATE) }.ok()).map(|f| f.0 != 0).unwrap_or(true);
         // only text and whole numbers are typed in (dates and other kinds stay as they are)
         let typed = d.as_ref().and_then(|d| unsafe { d.GetPropertyType() }.ok()).map(|vt| matches!(vt & 0x0FFF, 8 | 31 | 18 | 19 | 21 | 3)).unwrap_or(false);
-        let writable = !common && !innate && typed && caps.as_ref().map(|c| unsafe { c.IsPropertyWritable(&k) }.0 == 0).unwrap_or(false);
+        let writable = !common && !innate && typed && !read_only && caps.as_ref().map(|c| unsafe { c.IsPropertyWritable(&k) }.0 == 0).unwrap_or(false);
         let value = shown(&k, &pv);
         if value.is_empty() && !writable {
             continue;

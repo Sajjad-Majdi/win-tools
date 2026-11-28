@@ -368,6 +368,8 @@ impl App {
         }
         if self.first_paint_ms.is_none() {
             self.first_paint_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
+            // the live drive list starts listening once the window is on the screen
+            self.timer(crate::drives::T_WATCH, 1);
         }
     }
 
@@ -614,6 +616,7 @@ impl App {
                 Loc::Cleanup => self.gfx.glyph(crate::cleanup_page::BROOM, ir, 15.0, t.text2),
                 Loc::RecycleBin => self.gfx.glyph(0xE74D, ir, 15.0, t.text2),
                 Loc::ThisPc => self.gfx.glyph(0xE7F8, ir, 15.0, t.text2),
+                Loc::Folder(ref p) if p.parent().is_none() && self.is_disc(p) => ficons::disc(&self.gfx, t, ir),
                 Loc::Folder(ref p) if p.parent().is_none() => ficons::draw(&self.gfx, t, Kind::Drive, ir),
                 _ => ficons::draw(&self.gfx, t, Kind::Folder, ir),
             }
@@ -812,6 +815,8 @@ impl App {
         let pane = self.pane();
         let loc = pane.loc.clone();
         let in_dir = loc.path().is_some();
+        // a DVD / mounted ISO folder: nothing to make, cut, paste, rename or delete there
+        let ro = loc.path().is_some_and(|p| self.read_only_at(p)) || pane.selected().iter().any(|i| self.read_only_at(&i.path));
         let bin = loc == Loc::RecycleBin;
         let page = matches!(loc, Loc::Settings | Loc::Cleanup);
         let nsel = pane.sel.len();
@@ -825,16 +830,16 @@ impl App {
         let mut x = 10.0;
         let w = self.drop_btn_w(lab("New"));
         let open = self.drop_open(DropKind::New);
-        self.drop_btn(Rect::new(x, y, w, 32.0), 0xE710, lab("New"), in_dir, open, Hit::New, t);
+        self.drop_btn(Rect::new(x, y, w, 32.0), 0xE710, lab("New"), in_dir && !ro, open, Hit::New, t);
         x += w + 4.0;
         sep(self, &mut x);
         let cmds = [
-            (0u8, 0xE8C6u32, nsel > 0 && in_dir),
+            (0u8, 0xE8C6u32, nsel > 0 && in_dir && !ro),
             (1, 0xE8C8, nsel > 0 && !bin),
-            (2, 0xE77F, in_dir),
-            (3, 0xE8AC, nsel > 0 && in_dir),
+            (2, 0xE77F, in_dir && !ro),
+            (3, 0xE8AC, nsel > 0 && in_dir && !ro),
             (4, 0xE72D, files_only && in_dir),
-            (5, 0xE74D, nsel > 0 && (in_dir || bin)),
+            (5, 0xE74D, nsel > 0 && ((in_dir && !ro) || bin)),
         ];
         for (k, g, on) in cmds {
             let r = Rect::new(x, y, 36.0, 32.0);
@@ -924,8 +929,9 @@ impl App {
             nx += cw + 4.0;
         }
         if nw > 0.0 {
-            // New makes items only inside a folder.
-            self.toolbar_action(Rect::new(nx, y, nw, 32.0), "New", 0xE710, self.pane().loc.path().is_some(), Hit::New, t);
+            // New makes items only inside a folder that can be written to (not on a DVD or a mounted ISO).
+            let on = self.pane().loc.path().is_some_and(|p| !self.read_only_at(p));
+            self.toolbar_action(Rect::new(nx, y, nw, 32.0), "New", 0xE710, on, Hit::New, t);
             nx += nw + 4.0;
         }
         // Quick settings (sliders): layout, sort, Details pane, hidden items, extensions, All settings. It works on
@@ -1132,19 +1138,32 @@ impl App {
                 let loc = Loc::Folder(d.root.clone().into());
                 let sel = self.side_selected(&loc);
                 self.nav_bg(r, sel, Hit::Side(base + i), t);
-                let letter = d.root.trim_end_matches('\\');
-                let name = if d.label.is_empty() { drive_label(letter) } else { format!("{} ({letter})", d.label) };
+                let name = crate::drives::drive_name(d);
                 let l1 = Rect::new(r.x, r.y + 9.5, r.w, 18.0);
-                self.gfx.glyph(if d.kind == "network" { 0xE8CE } else if d.kind == "removable" { 0xE88E } else { 0xEDA2 }, Rect::new(r.x + 10.0, l1.y, 16.0, l1.h), 16.0, t.text2);
-                let free = if d.total > 0 { format!("{} free", fmt::size(d.free)) } else { String::new() };
+                // network share, USB drive, disc (DVD drive, mounted ISO), disk
+                let glyph = match d.kind {
+                    "network" => 0xE8CE,
+                    "removable" => 0xE88E,
+                    "cdrom" => 0xE958,
+                    _ => 0xEDA2,
+                };
+                self.gfx.glyph(glyph, Rect::new(r.x + 10.0, l1.y, 16.0, l1.h), 16.0, t.text2);
+                let free = if d.total > 0 && !d.read_only { format!("{} free", fmt::size(d.free)) } else { String::new() };
                 let fw = if w > 170.0 { self.gfx.measure(&free, Font::Ui, 12.0, 400) } else { 0.0 };
                 self.gfx.text(&name, Rect::new(r.x + 38.0, l1.y, r.w - 38.0 - fw - 16.0, l1.h), Font::Ui, fs, 400, Align::Left, t.text);
                 if fw > 0.0 {
                     self.gfx.text(&free, Rect::new(r.r() - 10.0 - fw - 2.0, l1.y, fw + 2.0, l1.h), Font::Ui, 12.0, 400, Align::Right, t.text3);
                 }
                 let mr = Rect::new(r.x + 38.0, l1.b() + 5.0, r.w - 48.0, 4.0);
-                self.gfx.fill_round(mr, 2.0, t.track);
-                if d.total > 0 {
+                if d.read_only {
+                    // a disc: no usage bar (it is always full), its size instead
+                    if d.total > 0 {
+                        self.gfx.text(&format!("{} \u{00B7} read-only", fmt::size(d.total)), Rect::new(mr.x, mr.y - 4.0, mr.w, 14.0), Font::Ui, 11.0, 400, Align::Left, t.text3);
+                    }
+                } else {
+                    self.gfx.fill_round(mr, 2.0, t.track);
+                }
+                if d.total > 0 && !d.read_only {
                     let used = 1.0 - d.free as f32 / d.total as f32;
                     self.gfx.fill_round(Rect::new(mr.x, mr.y, (mr.w * used).max(4.0), 4.0), 2.0, if used > 0.9 { t.danger } else { t.accent });
                 }
@@ -1908,7 +1927,11 @@ impl App {
         let tx = r.x + 64.0;
         let tw = r.w - 64.0 - 14.0;
         self.gfx.text(&it.name, Rect::new(tx, r.y + 8.0, tw, 20.0), Font::Ui, self.look.text(), 400, Align::Left, t.text);
-        if let Some(d) = d.filter(|d| d.total > 0) {
+        if let Some(d) = d.as_ref().filter(|d| d.total > 0 && d.read_only) {
+            // a DVD or mounted ISO is always "full": its size and no usage bar
+            let s = format!("{} \u{00B7} read-only", fmt::size(d.total));
+            self.gfx.text(&s, Rect::new(tx, r.y + 31.0, tw, 18.0), Font::Ui, self.look.small_text(), 400, Align::Left, t.text2);
+        } else if let Some(d) = d.filter(|d| d.total > 0) {
             let used = 1.0 - d.free as f32 / d.total as f32;
             let bar = Rect::new(tx, r.y + 31.0, tw, 6.0);
             self.gfx.fill_round(bar, 3.0, t.track);
@@ -2245,7 +2268,7 @@ impl App {
         let name = item.as_ref().map(|i| self.display_name(i)).unwrap_or_else(|| folder_title(&path));
         let nh = self.gfx.para(&name, Rect::new(x0, y, w0, 60.0), Font::Ui, 14.0, 600, Align::Left, t.text, 19.0, false, 3);
         y += nh + 4.0;
-        let ty = item.as_ref().map(|i| ficons::type_label(&i.name, i.is_dir)).unwrap_or_else(|| if path.parent().is_none() { "Drive".into() } else { "Folder".into() });
+        let ty = item.as_ref().map(|i| if i.kind == Kind::Drive { "Drive".to_string() } else { ficons::type_label(&i.name, i.is_dir) }).unwrap_or_else(|| if path.parent().is_none() { "Drive".into() } else { "Folder".into() });
         self.gfx.text(&ty, Rect::new(x0, y, w0, 18.0), Font::Ui, 12.0, 400, Align::Left, t.text2);
         y += 30.0;
         self.gfx.fill(Rect::new(x0, y - 8.0, w0, 1.0), t.divider);
@@ -3133,6 +3156,8 @@ impl App {
         let (ax, ay) = (m.x.clamp(r.x, r.r()), if m.y > r.y { r.b() } else { r.y });
         let items = m.items.clone();
         let bg = m.bg;
+        // items on a DVD / mounted ISO: Cut, Rename and Delete are dimmed (only Copy works there)
+        let ro = m.paths.iter().any(|p| self.read_only_at(p));
         self.gfx.opacity_layer(r.inset(-30.0, -30.0), op.max(0.02));
         self.gfx.push_scale(ax, ay, sc, 0.0, dy);
         self.card(r, R_MENU, t, false);
@@ -3147,6 +3172,14 @@ impl App {
             let ch = QUICK_H - 6.0;
             for (i, (id, g, label)) in qs.iter().enumerate() {
                 let cell = Rect::new(x0 + cw * i as f32, y, cw, ch);
+                if ro && *id != 1 {
+                    if i > 0 {
+                        self.gfx.fill(Rect::new(cell.x - 0.5, cell.y + 10.0, 1.0, ch - 20.0), t.divider);
+                    }
+                    self.gfx.glyph(*g, Rect::new(cell.x, cell.y + 9.0, cell.w, 18.0), 16.0, t.text_dis);
+                    self.gfx.text(label, Rect::new(cell.x + 2.0, cell.y + 30.0, cell.w - 4.0, 16.0), Font::Ui, 11.5, 400, Align::Center, t.text_dis);
+                    continue;
+                }
                 let h = Hit::MenuQuick(*id);
                 let (hk, pk) = (self.hk(h), self.pk(h));
                 let inner = cell.inset(2.0, 0.0);
@@ -3879,6 +3912,10 @@ pub fn menu_glyph(verb: &str, label: &str) -> u32 {
         0xE768 // play
     } else if has("encrypt") || has("lock") || has("password") || has("protect") {
         0xE72E // lock
+    } else if has("eject") {
+        0xF847 // eject
+    } else if has("mount") || has("burn") {
+        0xE958 // disc
     } else if has("usb") || has("removable") {
         0xE88E // usb drive
     } else if last.contains(":)") || has("drive") {

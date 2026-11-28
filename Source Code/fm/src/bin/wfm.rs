@@ -59,7 +59,9 @@ Open
   reveal <path>                           show it selected in a folder window
   menu <path...> [--extended]             the right-click menu, with app extensions (7-Zip, Terminal, ...)
   menu <path...> --invoke VERB            run one entry (by verb or by its text)
-  eject <drive>                           safely remove a USB stick, card or DVD
+  eject <drive>                           eject as Explorer does: dismount an ISO / VHD, safely remove a USB
+                                          stick or disk, eject a DVD or card
+  mount <image.iso>                       mount a disc image (as Explorer's Mount) and print its drive
 
 Live
   watch <dir> [--recursive] [--timeout SEC] [--count N]   JSON lines of changes until Ctrl+C
@@ -250,6 +252,7 @@ fn run(a: &Args) -> R {
         "menu-data" => cmd_menu_data(a),
         "icon" => cmd_icon(a),
         "eject" => cmd_eject(a),
+        "mount" => cmd_mount(a),
         other => Err(usage(&format!("unknown command '{other}'"))),
     }
 }
@@ -393,6 +396,7 @@ fn cmd_find(a: &Args) -> R {
             Some(_) => return Err(usage("--engine takes auto, everything or walk")),
         },
         walk_limit_ms: a.num("--limit")?.unwrap_or(5000),
+        stop: None,
     };
     let t0 = Instant::now();
     let found = search::search(&q).map_err(fail)?;
@@ -451,12 +455,12 @@ fn cmd_explorer(a: &Args) -> R {
 
 fn cmd_drives(a: &Args) -> R {
     let d = shell::drives_within(Duration::from_millis(a.num("--timeout")?.unwrap_or(2000)));
-    let mut t = format!("{:<5} {:<24} {:<10} {:<6} {:>10} {:>10}  {}\n", "DRIVE", "LABEL", "TYPE", "FS", "FREE", "TOTAL", "SHARE");
+    let mut t = format!("{:<5} {:<24} {:<10} {:<6} {:>10} {:>10}  {:<7} {}\n", "DRIVE", "LABEL", "TYPE", "FS", "FREE", "TOTAL", "EJECT", "SHARE");
     for x in &d {
         let (free, total) = if x.ready { (fmt_bytes(x.free), fmt_bytes(x.total)) } else if x.timed_out { ("no answer".into(), "-".into()) } else { ("-".into(), "-".into()) };
-        t += &format!("{:<5} {:<24} {:<10} {:<6} {:>10} {:>10}  {}\n", x.root, trunc(&x.label, 24), x.kind, x.fs, free, total, x.remote);
+        t += &format!("{:<5} {:<24} {:<10} {:<6} {:>10} {:>10}  {:<7} {}\n", x.root, trunc(&x.label, 24), x.kind, x.fs, free, total, if x.eject.is_empty() { "-" } else { x.eject }, x.remote);
     }
-    let v = json!({"ok": true, "drives": d.iter().map(|x| json!({"root": x.root, "label": x.label, "type": x.kind, "fs": x.fs, "free": x.free, "total": x.total, "ready": x.ready, "remote": x.remote, "timed_out": x.timed_out})).collect::<Vec<_>>()});
+    let v = json!({"ok": true, "drives": d.iter().map(|x| json!({"root": x.root, "label": x.label, "type": x.kind, "fs": x.fs, "free": x.free, "total": x.total, "ready": x.ready, "remote": x.remote, "timed_out": x.timed_out, "eject": x.eject, "read_only": x.read_only, "image": fmcore::volume::image_of(&x.root)})).collect::<Vec<_>>()});
     Ok(Out { v, text: t })
 }
 
@@ -603,8 +607,19 @@ fn cmd_icon(a: &Args) -> R {
 
 fn cmd_eject(a: &Args) -> R {
     let d = a.arg(1, "eject needs a drive letter")?;
-    shell::eject(d).map_err(fail)?;
-    Ok(Out { v: json!({"ok": true, "ejected": d}), text: format!("{d} can be removed now\n") })
+    let how = fmcore::volume::eject(d).map_err(fail)?;
+    let text = match how {
+        fmcore::volume::Eject::Image => format!("{d} was dismounted\n"),
+        fmcore::volume::Eject::Device => format!("{d} can be removed now\n"),
+        _ => format!("{d} was ejected\n"),
+    };
+    Ok(Out { v: json!({"ok": true, "ejected": d, "how": how.as_str()}), text })
+}
+
+fn cmd_mount(a: &Args) -> R {
+    let p = a.arg(1, "mount needs a disc image (.iso)")?;
+    let root = fmcore::volume::mount_image(std::path::Path::new(p)).map_err(fail)?;
+    Ok(Out { v: json!({"ok": true, "image": p, "drive": root}), text: format!("{p} is mounted as {root}\n") })
 }
 
 fn cmd_recent(a: &Args) -> R {

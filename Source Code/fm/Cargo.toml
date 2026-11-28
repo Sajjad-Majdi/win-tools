@@ -1,6 +1,6 @@
 [package]
 name = "fmcore"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2024"
 description = "Rust File Explorer: fast file manager core (library) and the wfm CLI"
 
@@ -34,6 +34,7 @@ windows = { version = "0.61", features = [
   "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole",
   "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_StationsAndDesktops", "Win32_System_Memory",
   "Win32_System_SystemServices", "Win32_System_Registry", "Win32_System_Ioctl",
+  "Win32_Storage_Vhd", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties",
   "Win32_NetworkManagement_NetManagement", "Win32_NetworkManagement_WNet",
   "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_Globalization",
   "Win32_Graphics_Gdi", "Win32_Graphics_Imaging",

@@ -157,8 +157,16 @@ fn relay(search: &str, max: u32, request: u32, sort: u32, match_path: bool, time
             }
         }
         let _ = CloseHandle(rd);
-        let _ = WaitForSingleObject(pi.hProcess, 2000);
+        let done = WaitForSingleObject(pi.hProcess, 2000) == WAIT_OBJECT_0;
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
         let _ = CloseHandle(pi.hProcess);
+        // wfm prints "error: ..." (text, not a reply) and exits 1 when Everything failed: never parse that as a
+        // reply (its letters read as a result count of a billion and the window died allocating for it)
+        if !done || code != 0 {
+            let text = String::from_utf8_lossy(&out[..out.len().min(200)]).trim().trim_start_matches("error: ").to_string();
+            return Err(if text.is_empty() { "Everything did not answer".into() } else { text });
+        }
         if out.len() < 20 {
             return Err("Everything did not answer".into());
         }
@@ -279,6 +287,10 @@ fn parse(b: &[u8]) -> Option<Reply> {
     let total = u32_at(b, 0)?;
     let num = u32_at(b, 4)? as usize;
     let req = u32_at(b, 12)?;
+    // every result has an 8-byte entry after the 20-byte header: a count the reply cannot hold is not a reply
+    if num.checked_mul(8).and_then(|n| n.checked_add(20)).is_none_or(|n| n > b.len()) {
+        return None;
+    }
     let mut items = Vec::with_capacity(num);
     for i in 0..num {
         let base = 20 + i * 8;
@@ -347,4 +359,22 @@ pub fn folder_sizes(dir: &str, timeout: Duration) -> Res<Vec<(String, u64)>> {
     let q = format!("parent:{} folder:", quote(&format!("{d}\\")));
     let r = query(&q, 100_000, REQ_NAME | REQ_SIZE, SORT_NAME, false, timeout)?;
     Ok(r.items.into_iter().filter_map(|i| i.size.map(|s| (i.name, s))).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn text_is_not_a_reply() {
+        // wfm's error text through the relay once read as 1 159 740 018 results ("r: E") and aborted the window
+        assert!(super::parse(b"error: Everything did not answer in time\r\n").is_none());
+        // a real empty reply: total 0, num 0, offset, request, sort
+        let mut b = vec![];
+        for v in [0u32, 0, 0, super::REQ_NAME, 1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(super::parse(&b).map(|r| r.items.len()), Some(0));
+        // a count bigger than the bytes that follow
+        b[4] = 3;
+        assert!(super::parse(&b).is_none());
+    }
 }

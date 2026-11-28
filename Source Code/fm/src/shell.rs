@@ -346,11 +346,17 @@ pub struct Drive {
     pub remote: String,
     /// The drive did not answer within the time limit (a dead network share).
     pub timed_out: bool,
+    /// How Explorer's Eject works on it: "" (not ejectable), "image" (mounted ISO / VHD), "device" (USB stick or
+    /// disk: safe removal), "media" (DVD / card: the media comes out). See [`crate::volume::eject_kind`].
+    pub eject: &'static str,
+    /// Nothing can be written there: a DVD / CD, a mounted ISO, a write-protected card or a read-only volume.
+    pub read_only: bool,
 }
 
-fn drive_kind(root: &str) -> &'static str {
+pub(crate) fn drive_kind(root: &str) -> &'static str {
     let w = wide(root);
     match unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) } {
+        1 => "none",
         2 => "removable",
         3 => "fixed",
         4 => "network",
@@ -367,8 +373,11 @@ pub fn drives_fast() -> Vec<Drive> {
         .filter(|i| mask & (1 << i) != 0)
         .map(|i| {
             let root = format!("{}:\\", (b'A' + i as u8) as char);
-            Drive { kind: drive_kind(&root), root, label: String::new(), fs: String::new(), free: 0, total: 0, ready: false, remote: String::new(), timed_out: false }
+            let kind = drive_kind(&root);
+            Drive { kind, root, label: String::new(), fs: String::new(), free: 0, total: 0, ready: false, remote: String::new(), timed_out: false, eject: "", read_only: kind == "cdrom" }
         })
+        // a letter that is going away right now (or a subst of a folder that is gone) has no root: not a drive
+        .filter(|d| d.kind != "none")
         .collect()
 }
 
@@ -387,9 +396,12 @@ fn fill_drive(d: &mut Drive) {
     let w = wide(&d.root);
     let mut label = [0u16; 261];
     let mut fsn = [0u16; 261];
-    d.ready = unsafe { GetVolumeInformationW(PCWSTR(w.as_ptr()), Some(&mut label), None, None, None, Some(&mut fsn)) }.is_ok();
+    let mut flags = 0u32;
+    d.ready = unsafe { GetVolumeInformationW(PCWSTR(w.as_ptr()), Some(&mut label), None, None, Some(&mut flags), Some(&mut fsn)) }.is_ok();
     d.label = from_wide(&label);
     d.fs = from_wide(&fsn);
+    // FILE_READ_ONLY_VOLUME; a DVD drive is read-only even when empty
+    d.read_only = d.kind == "cdrom" || (d.ready && flags & 0x0008_0000 != 0);
     if d.ready {
         unsafe {
             let _ = GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut d.free), Some(&mut d.total), None);
@@ -411,6 +423,8 @@ pub fn drives_within(limit: std::time::Duration) -> Vec<Drive> {
             if d.kind == "network" {
                 d.remote = mapped_remote(&d.root);
             }
+            // asks the driver only (no media access), before the slower volume questions
+            d.eject = crate::volume::eject_kind(&d.root, d.kind).as_str();
             fill_drive(&mut d);
             let _ = tx.send((i, d));
         });
@@ -473,47 +487,9 @@ pub fn server_shares(server: &str, all: bool) -> Res<Vec<String>> {
     Ok(out)
 }
 
-/// Safely eject a removable drive (USB stick, card, DVD): lock, dismount, allow removal, eject. Refuses fixed
-/// drives (including the system drive). Open files on the drive make it fail with a clear error.
+/// Eject a drive as Explorer does: dismount a mounted ISO / VHD, safely remove a USB stick or disk, eject a DVD or
+/// memory card ([`crate::volume::eject`]). Refuses internal disks, network drives and the Windows drive; open files
+/// on it make it fail with a clear "in use" error.
 pub fn eject(drive: &str) -> Res<()> {
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
-    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-    use windows::Win32::System::IO::DeviceIoControl;
-    let letter = drive.trim().trim_end_matches(['\\', ':']).to_ascii_uppercase();
-    if letter.len() != 1 || !letter.chars().all(|c| c.is_ascii_alphabetic()) {
-        return Err(format!("not a drive letter: {drive}"));
-    }
-    let root = format!("{letter}:\\");
-    let kind = drive_kind(&root);
-    let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_ascii_uppercase();
-    if sys.starts_with(&letter) || !matches!(kind, "removable" | "cdrom") {
-        return Err(format!("{root} is not removable ({kind}); only USB sticks, cards and DVD drives can be ejected"));
-    }
-    let dev = wide(format!(r"\\.\{letter}:"));
-    unsafe {
-        let h = CreateFileW(PCWSTR(dev.as_ptr()), GENERIC_READ.0 | GENERIC_WRITE.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), None)
-            .map_err(|e| win_err(&format!("cannot open {root}"), &e))?;
-        let io = |code: u32, input: Option<&[u8]>| -> windows::core::Result<()> {
-            let mut n = 0u32;
-            DeviceIoControl(h, code, input.map(|b| b.as_ptr() as *const _), input.map(|b| b.len() as u32).unwrap_or(0), None, 0, Some(&mut n), None)
-        };
-        // FSCTL_LOCK_VOLUME: retry a little (the indexer or AV may hold it for a moment).
-        let mut locked = false;
-        for _ in 0..10 {
-            if io(0x0009_0018, None).is_ok() {
-                locked = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        if !locked {
-            let _ = CloseHandle(h);
-            return Err(format!("{root} is in use (close the files and windows open on it, then try again)"));
-        }
-        let r = io(0x0009_0020, None) // FSCTL_DISMOUNT_VOLUME
-            .and_then(|_| io(0x002D_4804, Some(&[0u8]))) // IOCTL_STORAGE_MEDIA_REMOVAL (PreventMediaRemoval = FALSE)
-            .and_then(|_| io(0x002D_4808, None)); // IOCTL_STORAGE_EJECT_MEDIA
-        let _ = CloseHandle(h);
-        r.map_err(|e| win_err(&format!("cannot eject {root}"), &e))
-    }
+    crate::volume::eject(drive).map(|_| ())
 }

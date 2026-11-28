@@ -156,6 +156,7 @@ pub fn watch_blocking(dir: &Path, recursive: bool, timeout: Option<Duration>, mu
 pub struct Watcher {
     stop: isize,
     thread: Option<std::thread::JoinHandle<()>>,
+    dir: isize,
 }
 
 impl Watcher {
@@ -174,7 +175,13 @@ impl Watcher {
                 let _ = CloseHandle(h);
             }
         });
-        Ok(Watcher { stop, thread: Some(thread) })
+        Ok(Watcher { stop, thread: Some(thread), dir: h })
+    }
+
+    /// The open handle of the watched folder (valid until the Watcher is dropped). A window registers it for
+    /// device notices (DBT_DEVTYP_HANDLE) so it can let go of a USB stick or disc image that is being removed.
+    pub fn handle(&self) -> isize {
+        self.dir
     }
 
     /// Stop and wait for the watch thread.

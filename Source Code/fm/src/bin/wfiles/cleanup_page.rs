@@ -24,7 +24,7 @@ const GROUPS: [(&str, &str, u32); 6] = [
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Target {
-    Entry, Drive(usize), Scan, Stop, Scope, Rescan, Ai,
+    Entry, Drive(char), Scan, Stop, Scope, Rescan, Ai,
     Tile(usize), Segment(usize), Items(usize), All, Row(usize), PanelClose,
     Move, Bin, Undo, Empty, Confirm, Cancel, Hidden,
 }
@@ -338,7 +338,7 @@ impl Page {
     }
 
     fn scope(&self, drives: &[fmcore::shell::Drive]) -> Vec<String> {
-        self.scope.clone().unwrap_or_else(|| drives.iter().filter(|d| d.kind == "fixed").map(|d| d.root.clone()).collect())
+        self.scope.clone().unwrap_or_else(|| drives.iter().filter(|d| d.kind == "fixed" && !d.read_only).map(|d| d.root.clone()).collect())
     }
 
     fn selected_snapshot(&self) -> ConfirmData {
@@ -507,6 +507,41 @@ impl App {
     pub fn cleanup_tabs_changed(&mut self) {
         if !self.cleanup.moving() && self.tabs.iter().all(|t| t.pane().loc != Loc::Cleanup) {
             self.close_cleanup();
+        }
+    }
+
+    /// The drives Cleanup can scan: ready and writable (never a DVD, a mounted ISO or a write-protected card).
+    pub fn scan_drives(&self) -> Vec<fmcore::shell::Drive> {
+        self.drives.iter().filter(|d| d.ready && !d.read_only).cloned().collect()
+    }
+
+    /// The drive list changed: drives that went away (or became read-only) leave the chosen scope, and an open
+    /// "Drives" menu is rebuilt from the new list (its rows are drives by letter, never by position).
+    pub fn cleanup_drives_changed(&mut self) {
+        let scan = self.scan_drives();
+        let keep = |v: &mut Vec<String>| v.retain(|r| scan.iter().any(|d| d.root.eq_ignore_ascii_case(r)));
+        if let Some(s) = &mut self.cleanup.scope {
+            keep(s);
+            if s.is_empty() {
+                self.cleanup.scope = None;
+            }
+        }
+        let fallback = self.cleanup.scope(&scan);
+        if let Some(s) = &mut self.cleanup.scope_draft {
+            keep(s);
+            if s.is_empty() {
+                *s = fallback;
+            }
+        }
+        if self.drop.as_ref().is_some_and(|d| d.kind == DropKind::CleanupScope) {
+            let items = self.cleanup_drop_items(DropKind::CleanupScope);
+            let n = items.len();
+            if let Some(drop) = &mut self.drop {
+                drop.items = items;
+            }
+            if let Some(f) = &mut self.cleanup.scope_focus {
+                *f = (*f).min(n.saturating_sub(1));
+            }
         }
     }
 
@@ -859,7 +894,8 @@ impl App {
                         }
                         self.toast("The Recycle Bin is empty", "", false);
                         self.refresh_all();
-                        self.spawn(|| Msg::Drives(fmcore::shell::drives_fast()));
+                        // free space changed (a full read: drives_fast has no labels or sizes, and This PC lost them)
+                        self.refresh_drives();
                     }
                     Err(e) => self.toast_err(&e),
                 }
@@ -915,11 +951,14 @@ impl App {
         self.cleanup.keyboard = false;
         match target {
             Entry => self.open_cleanup(None),
-            Drive(i) if self.cleanup.phase == Phase::Idle => self.cleanup_pick_drive(i),
+            Drive(l) if self.cleanup.phase == Phase::Idle => self.cleanup_pick_drive(l),
             Scan | Rescan => self.start_cleanup_scan(false),
             Stop => self.cleanup_stop(),
             Scope => {
-                self.cleanup.scope_draft = Some(self.cleanup.scope(&self.drives));
+                let scan = self.scan_drives();
+                let mut draft = self.cleanup.scope(&scan);
+                draft.retain(|r| scan.iter().any(|d| &d.root == r));
+                self.cleanup.scope_draft = Some(draft);
                 self.cleanup.scope_focus = None;
                 self.open_drop(DropKind::CleanupScope, r, 240.0);
             }
@@ -948,9 +987,10 @@ impl App {
         }
     }
 
-    fn cleanup_pick_drive(&mut self, i: usize) {
-        let Some(d) = self.drives.get(i) else { return };
-        let mut scope = self.cleanup.scope(&self.drives);
+    fn cleanup_pick_drive(&mut self, letter: char) {
+        let scan = self.scan_drives();
+        let Some(d) = scan.iter().find(|d| d.root.starts_with(letter)) else { return };
+        let mut scope = self.cleanup.scope(&scan);
         if let Some(i) = scope.iter().position(|r| r == &d.root) {
             scope.remove(i);
         } else {
@@ -1050,13 +1090,15 @@ impl App {
         match kind {
             DropKind::CleanupScope => {
                 let scope = self.cleanup.scope_draft.as_deref().unwrap_or_default();
+                let scan = self.scan_drives();
                 let mut all = MItem::new("All drives", 0, Act::None);
-                all.checked = self.drives.iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
+                all.checked = scan.iter().all(|d| (d.kind == "fixed") == scope.contains(&d.root));
                 let mut items = vec![all];
-                for (i, d) in self.drives.iter().enumerate() {
+                // each row carries its drive's root: a click picks that drive even if the list changed meanwhile
+                for (i, d) in scan.iter().enumerate() {
                     let mut item = MItem::new(&drive_name(d), 0xEDA2, Act::None);
                     item.checked = scope.contains(&d.root);
-                    item.value = (i + 1) as i64;
+                    item.shell = Some(d.root.clone());
                     item.sep = i == 0;
                     items.push(item);
                 }
@@ -1070,10 +1112,12 @@ impl App {
         }
     }
 
-    pub fn cleanup_toggle_scope(&mut self, row: usize) {
+    /// A row of the open "Drives" menu was clicked (or Enter / Space on it): None = "All drives", else that drive.
+    pub fn cleanup_toggle_scope(&mut self, root: Option<String>) {
+        let scan = self.scan_drives();
         let Some(scope) = &mut self.cleanup.scope_draft else { return };
-        if row == 0 {
-            let all: Vec<_> = self.drives.iter().filter(|d| d.kind == "fixed").map(|d| d.root.clone()).collect();
+        if root.is_none() {
+            let all: Vec<_> = scan.iter().filter(|d| d.kind == "fixed").map(|d| d.root.clone()).collect();
             if !all.is_empty() {
                 if all.len() == scope.len() && all.iter().all(|d| scope.contains(d)) {
                     scope.truncate(1);
@@ -1081,7 +1125,7 @@ impl App {
                     *scope = all;
                 }
             }
-        } else if let Some(d) = self.drives.get(row - 1) {
+        } else if let Some(d) = scan.iter().find(|d| root.as_ref().is_some_and(|r| r.eq_ignore_ascii_case(&d.root))) {
             if let Some(i) = scope.iter().position(|r| r == &d.root) {
                 if scope.len() > 1 {
                     scope.remove(i);
@@ -1100,7 +1144,7 @@ impl App {
     pub fn cleanup_finish_scope(&mut self) -> bool {
         self.cleanup.scope_focus = None;
         let Some(scope) = self.cleanup.scope_draft.take() else { return false };
-        let before = self.cleanup.scope(&self.drives);
+        let before = self.cleanup.scope(&self.scan_drives());
         if scope.len() != before.len() || !scope.iter().all(|d| before.contains(d)) {
             self.cleanup.scope = Some(scope);
             self.start_cleanup_scan(false);
@@ -1118,7 +1162,8 @@ impl App {
             0x28 => self.cleanup.scope_focus = Some(self.cleanup.scope_focus.map_or(0, |i| (i + 1) % n)),
             0x0D | 0x20 => {
                 let i = *self.cleanup.scope_focus.get_or_insert(0);
-                self.cleanup_toggle_scope(i);
+                let root = drop.items.get(i).and_then(|it| it.shell.clone());
+                self.cleanup_toggle_scope(root);
             }
             _ => {}
         }
@@ -1277,9 +1322,9 @@ fn reveal(scroll: f32, height: f32, top: f32, bottom: f32) -> f32 {
     if top < scroll { top } else if bottom > scroll + height { bottom - height } else { scroll }
 }
 
+/// Explorer's name of a drive ("Main (D:)", "USB Drive (E:)", a share's name), the same as everywhere else.
 fn drive_name(d: &fmcore::shell::Drive) -> String {
-    let letter = d.root.trim_end_matches('\\');
-    format!("{} ({letter})", if d.label.is_empty() { "Local Disk" } else { &d.label })
+    crate::drives::drive_name(d)
 }
 
 #[cfg(test)]
